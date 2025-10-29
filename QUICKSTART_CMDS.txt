@@ -1,0 +1,22 @@
+:: 0) Siirry projektiin
+cd C:\Users\OMISTAJA\seasonality_project
+
+:: 1) Asenna paketit
+py -m pip install --upgrade yfinance pandas numpy lxml
+
+:: 2) Hinnat funda-snapshottiin
+py build_prices_from_constituents.py ^
+  --const "seasonality_reports\Constituents_raw.csv" ^
+  --outdir "seasonality_reports\price_cache" ^
+  --years 20
+
+:: 3) Vintage kaikille cache-CSV:ille (tulevaisuusviiva mukana)
+py build_vintage_from_price_cache.py ^
+  --price-dir "seasonality_reports\price_cache" ^
+  --out-dir   "seasonality_reports\vintage" ^
+  --lookback 10 ^
+  --ks 10 21 63
+
+:: 4) (Tarvittaessa) Indeksipohjainen haku kun nettilistat toimivat
+:: py build_prices_from_indexes.py --nasdaq-scope all
+:: py build_prices_from_indexes.py --from-locals --skip-mcap

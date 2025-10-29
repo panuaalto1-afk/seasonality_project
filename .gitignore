@@ -1,0 +1,48 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.log
+
+# Virtual environments
+.env
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific - data and reports
+logs/
+seasonality_reports/
+*.cache
+
+# Junk/temporary files - specific to this project
+Dict[str
+List[str]
+Optional[*
+Tuple[*
+pd.DataFrame
+dt.date
+"Nimet*
+*nul*
+upper.iloc*
+threshold)
+MIN_OPT_OI]
+0
+1.10
+bool
+int
+float

@@ -1,0 +1,31 @@
+
+---
+
+# 2) `project_config.yaml`
+
+**Tallenna:**  
+`C:\Users\OMISTAJA\seasonality_project\project_config.yaml`
+
+```yaml
+root: "C:\\Users\\OMISTAJA\\seasonality_project"
+reports_root: "seasonality_reports"
+
+paths:
+  constituents: "seasonality_reports\\Constituents_raw.csv"
+  price_cache:  "seasonality_reports\\price_cache"
+  vintage_out:  "seasonality_reports\\vintage"
+  week_root:    "seasonality_reports\\Seasonality_up_down_week"
+  intraday_root:"seasonality_reports\\intraday"
+  aggregates:   "seasonality_reports\\aggregates"
+
+vintage:
+  lookback_years: 10
+  ks: [10, 21, 63]
+
+conventions:
+  lowercase_reports_root: true
+  week_subfolder: "timestamp"   # esim. 2025-10-02_1830
+
+preferences:
+  shell: "cmd"
+  language: "fi"

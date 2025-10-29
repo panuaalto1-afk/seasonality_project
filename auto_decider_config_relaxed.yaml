@@ -1,0 +1,15 @@
+# super-relaxed, vain jotta saadaan listat ulos
+min_dollar_vol: 0
+min_price: 0
+max_price: 1000000
+min_atr_pct: 0
+max_atr_pct: 100
+min_score_long: -1e9
+min_score_short: -1e9
+block_days_after_earnings: 0
+require_optio_enrich: false
+allow_missing_beta: true
+# jos skripti tukee näitä nimeämisiä:
+reports_filenames:
+  top_long:  "top_long_candidates_GATED_{date}.csv"
+  top_short: "top_short_candidates_GATED_{date}.csv"
