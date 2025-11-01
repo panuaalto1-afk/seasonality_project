@@ -1,203 +1,423 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+auto_decider.py - Automaattinen kauppapäätösten tekijä
+
+Lukee:
+- ML-signaalit (ml_unified_pipeline output)
+- Hintadata (price_cache)
+- Seasonality-data
+
+Tuottaa:
+- trade_candidates.csv (kaikki potentiaaliset kaupat)
+- portfolio_after_sim.csv (simuloitu portfolio, top N signaaleja)
+
+Tallentaa:
+1. runs/LATEST_RUN/actions/YYYYMMDD/ (arkisto)
+2. seasonality_reports/trade_decisions/ (viimeisimmät)
+"""
 
 import os
 import sys
-import json
 import argparse
-from datetime import datetime
 from pathlib import Path
-
+from datetime import datetime
+from typing import Optional, Dict, List, Tuple
 import pandas as pd
 import numpy as np
 
-# ------------------------------------------------------------
-# Argparse + polkujen varmistus
-# ------------------------------------------------------------
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 def parse_args():
-    ap = argparse.ArgumentParser(
-        description="Auto Decider – muodostaa action-planin, trade- & sell-listat sekä portfolio_after_sim.csv:n."
-    )
-    ap.add_argument("--project_root", required=True, help="Projektin juuripolku (C:\\...\\seasonality_project)")
-    ap.add_argument("--universe_csv", required=True, help="Universumi CSV (esim. seasonality_reports\\constituents_raw.csv)")
-    ap.add_argument("--run_root", required=True, help="Käytettävä RUN-kansio (älä muuta jos käytät vakiota)")
-    ap.add_argument("--price_cache_dir", required=True, help="Käytettävä price_cache-kansio")
-    ap.add_argument("--today", required=True, help="Päivä YYYY-MM-DD")
-    # >>> MUUTOS: ei enää required=True
-    ap.add_argument(
-        "--portfolio_state",
-        default=None,
-        help="Salkun tilan JSON (oletus: <project_root>\\seasonality_reports\\portfolio_state.json)"
-    )
-    ap.add_argument("--commit", type=int, default=0, help="1 = kirjoita portfolio_state.json; 0 = dry-run")
-    ap.add_argument("--config", default=None, help="(valinn.) polku asetustiedostolle")
-    ap.add_argument("--no_new_positions", action="store_true", help="Estä uudet positiot (vain myyntejä/kevennyksiä)")
-    ap.add_argument("--vintage_cutoff", default=None, help="(valinn.) aikaraja datalle")
-
-    args = ap.parse_args()
-
-    # >>> MUUTOS: oletuspolku portfolio_state:lle jos sitä ei annettu
-    if not args.portfolio_state:
-        args.portfolio_state = os.path.join(
-            os.path.abspath(args.project_root),
-            "seasonality_reports",
-            "portfolio_state.json",
-        )
-
-    # Peruspolut ja validoinnit
-    args.project_root = os.path.abspath(args.project_root)
-    args.run_root = os.path.abspath(args.run_root)
-    args.price_cache_dir = os.path.abspath(args.price_cache_dir)
-    args.universe_csv = os.path.abspath(args.universe_csv)
-    args.portfolio_state = os.path.abspath(args.portfolio_state)
-
-    if not os.path.isdir(args.run_root):
-        raise FileNotFoundError(f"run_root puuttuu: {args.run_root}")
-    if not os.path.isdir(args.price_cache_dir):
-        raise FileNotFoundError(f"price_cache_dir puuttuu: {args.price_cache_dir}")
-    if not os.path.isfile(args.universe_csv):
-        raise FileNotFoundError(f"universe_csv puuttuu: {args.universe_csv}")
-
-    # actions/YYYMMDD
-    ymd = args.today.replace("-", "")
-    args.actions_dir = os.path.join(args.run_root, "actions", ymd)
-    os.makedirs(args.actions_dir, exist_ok=True)
-
-    print(f"[INFO] Using RUN_ROOT : {args.run_root}")
-    print(f"[INFO] Using PRICES  : {args.price_cache_dir}")
-    print(f"[INFO] Using UNIVERSE: {args.universe_csv}")
-    print(f"[INFO] PortfolioState: {args.portfolio_state}")
-    print(f"[INFO] Actions dir   : {args.actions_dir}")
-
-    return args
+    parser = argparse.ArgumentParser(description="Auto Trade Decider")
+    parser.add_argument("--runs_dir", type=str, default="seasonality_reports/runs",
+                        help="Runs directory")
+    parser.add_argument("--seasonality_dir", type=str, default="seasonality_reports",
+                        help="Seasonality data directory")
+    parser.add_argument("--price_cache_dir", type=str, default="seasonality_reports/runs/2025-10-04_0903/price_cache",
+                        help="Price cache directory (overwrite version)")
+    parser.add_argument("--top_n", type=int, default=15,
+                        help="Top N signals to include in portfolio (default: 15)")
+    parser.add_argument("--stop_mult", type=float, default=1.5,
+                        help="Stop loss multiplier (default: 1.5)")
+    parser.add_argument("--min_ml_score", type=float, default=0.75,
+                        help="Minimum ML score to consider (default: 0.75)")
+    return parser.parse_args()
 
 
-# ------------------------------------------------------------
-# Alla on yksinkertaiset apurutiinit. Varsinainen valintalogiikka
-# on jätetty ennalleen; jos sinulla on aiemmassa versiossa omat
-# funktiot (esim. build_trade_candidates), ne voidaan käyttää tässä.
-# ------------------------------------------------------------
-
-def _safe_read_csv(path: str) -> pd.DataFrame:
-    """Lukee CSV:n yrittäen automaattisesti erotinta (,/;)."""
-    if not os.path.exists(path):
-        return pd.DataFrame()
-    try:
-        return pd.read_csv(path)
-    except Exception:
-        return pd.read_csv(path, sep=";")
-
-def _write_csv(df: pd.DataFrame, path: str):
-    if df is None:
-        return
-    df.to_csv(path, index=False)
-
-def _load_portfolio_state(path_json: str) -> dict:
-    if os.path.isfile(path_json):
+class PriceDataLoader:
+    """Lataa hintadataa price_cache:sta"""
+    
+    def __init__(self, price_cache_dir: Path):
+        self.price_cache_dir = Path(price_cache_dir)
+        if not self.price_cache_dir.exists():
+            print(f"⚠️  Price cache ei löydy: {self.price_cache_dir}")
+    
+    def load_ticker(self, ticker: str) -> Optional[pd.DataFrame]:
+        price_file = self.price_cache_dir / f"{ticker}.csv"
+        if not price_file.exists():
+            return None
         try:
-            with open(path_json, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"positions": []}
+            df = pd.read_csv(price_file, parse_dates=['Date'])
+            
+            # Muunna hintasarakkeet numeerisiksi
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            df = df.dropna(subset=['High', 'Low', 'Close'])
+            return df.sort_values('Date')
+        except Exception as e:
+            return None
+    
+    def calculate_atr(self, df: pd.DataFrame, period: int = 20) -> float:
+        """Laske Average True Range"""
+        if len(df) < period:
+            return 0.0
+        
+        try:
+            high = df['High'].astype(float)
+            low = df['Low'].astype(float)
+            close = df['Close'].astype(float).shift(1)
+            
+            tr1 = high - low
+            tr2 = (high - close).abs()
+            tr3 = (low - close).abs()
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(period).mean().iloc[-1]
+            
+            return atr if not pd.isna(atr) else 0.0
+        except Exception as e:
+            return 0.0
 
-def _save_portfolio_state(state: dict, path_json: str):
-    Path(os.path.dirname(path_json)).mkdir(parents=True, exist_ok=True)
-    with open(path_json, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
 
-# ------------------------------------------------------------
-# Paikanpitäjälogiikka: säilytetään nykyinen käyttäytyminen.
-# Jos sinulla on jo projektissa omat funktiot, ne voivat korvata
-# nämä helposti – tämä runko vain varmistaa tiedostojen syntymisen.
-# ------------------------------------------------------------
+class SeasonalityDataLoader:
+    """Lataa seasonality-dataa"""
+    
+    def __init__(self, seasonality_dir: Path):
+        self.seasonality_dir = Path(seasonality_dir)
+    
+    def load_ticker_seasonality(self, ticker: str) -> Dict:
+        """Lataa tickerin seasonality-data (week, segments_up, segments_down)"""
+        result = {
+            'week': None,
+            'segments_up': None,
+            'segments_down': None,
+            'current_week_score': 0.0
+        }
+        
+        # Viikkodata
+        week_file = self.seasonality_dir / f"{ticker}_seasonality_week.csv"
+        if week_file.exists():
+            try:
+                result['week'] = pd.read_csv(week_file)
+            except:
+                pass
+        
+        # Segments up
+        segments_up_file = self.seasonality_dir / f"{ticker}_segments_up.csv"
+        if segments_up_file.exists():
+            try:
+                result['segments_up'] = pd.read_csv(segments_up_file)
+            except:
+                pass
+        
+        # Segments down
+        segments_down_file = self.seasonality_dir / f"{ticker}_segments_down.csv"
+        if segments_down_file.exists():
+            try:
+                result['segments_down'] = pd.read_csv(segments_down_file)
+            except:
+                pass
+        
+        # Laske nykyisen viikon score
+        current_week = datetime.now().isocalendar()[1]
+        if result['week'] is not None:
+            week_data = result['week'][result['week']['week_number'] == current_week]
+            if not week_data.empty:
+                result['current_week_score'] = float(week_data['AvgRet_WOY'].values[0])
+        
+        return result
 
-def build_trade_candidates(args) -> pd.DataFrame:
+
+def find_latest_run(runs_dir: Path) -> Optional[Path]:
+    """Etsi viimeisin run-kansio"""
+    if not runs_dir.exists():
+        return None
+    
+    run_dirs = sorted([d for d in runs_dir.glob("*") if d.is_dir()], 
+                     key=lambda x: x.stat().st_mtime, reverse=True)
+    
+    return run_dirs[0] if run_dirs else None
+
+
+def find_latest_ml_signals(reports_dir: Path) -> Optional[Path]:
+    """Etsi viimeisin ML-signaali-tiedosto (GATED long candidates)"""
+    if not reports_dir.exists():
+        return None
+    
+    signal_files = list(reports_dir.glob("top_long_candidates_GATED_*.csv"))
+    if not signal_files:
+        return None
+    
+    # Järjestä päivämäärän mukaan (uusin ensin)
+    signal_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    return signal_files[0]
+
+
+def determine_setup_type(ticker: str, ml_score: float, seasonality_score: float,
+                        mom5: float, mom20: float) -> str:
     """
-    Tässä kohtaa kutsutaan yleensä ML/overlay -putkea ja filtteröintiä.
-    Säilytetään sarakenimet aiempaan tapaan ('Ticker', 'Side', ...).
-    Jos sinulla on jo valmis toteutus, korvaa tämä funktio sillä.
+    Määritä setup-tyyppi ML-scoren ja seasonalityn perusteella
+    
+    Logiikka:
+    - ML_Seasonality_Combo: Korkea ML + vahva seasonality
+    - ML_Momentum_Strong: Korkea ML + korkea momentum
+    - ML_Momentum_Moderate: Keskitaso ML
+    - Seasonality_Pure: Vahva seasonality, matala ML
     """
-    # Esimerkkirunko: tyhjä df jos data puuttuu
-    cols = ["Ticker", "Side", "Score", "Note"]
-    return pd.DataFrame([], columns=cols)
+    # ML_Seasonality_Combo: ML > 0.9 JA seasonality > 1.5%
+    if ml_score > 0.9 and seasonality_score > 0.015:
+        return 'ML_Seasonality_Combo'
+    
+    # ML_Momentum_Strong: ML > 0.9
+    if ml_score > 0.9:
+        return 'ML_Momentum_Strong'
+    
+    # ML_Seasonality_Combo: ML > 0.8 JA seasonality > 1.0%
+    if ml_score > 0.8 and seasonality_score > 0.010:
+        return 'ML_Seasonality_Combo'
+    
+    # ML_Momentum_Moderate: ML > 0.8
+    if ml_score > 0.8:
+        return 'ML_Momentum_Moderate'
+    
+    # Seasonality_Pure: Seasonality > 1.5%
+    if seasonality_score > 0.015:
+        return 'Seasonality_Pure'
+    
+    # Default
+    return 'ML_Momentum_Moderate'
 
-def build_sell_candidates(args, portfolio_state) -> pd.DataFrame:
-    cols = ["Ticker", "Reason"]
-    return pd.DataFrame([], columns=cols)
 
-def simulate_portfolio_after_trades(portfolio_state, buys_df, sells_df) -> pd.DataFrame:
+def calculate_entry_stop_tp(entry: float, atr: float, stop_mult: float = 1.5) -> Dict:
     """
-    Muodosta taulukko, joka tallennetaan portfolio_after_sim.csv:ksi.
-    Oikeassa toteutuksessa tämä päivittää positioita, kappalemääriä jne.
+    Laske entry/stop/TP-tasot ATR-pohjaisesti
+    
+    Logiikka:
+    - Entry = current price
+    - Stop = entry - (stop_mult × ATR)
+    - TP1 = entry + (1.5 × risk)
+    - TP2 = entry + (3.0 × risk)
+    - TP3 = entry + (5.0 × risk)
     """
-    cols = ["Ticker", "Side", "Qty", "Comment"]
-    return pd.DataFrame([], columns=cols)
+    risk = stop_mult * atr
+    stop = entry - risk
+    tp1 = entry + (1.5 * risk)
+    tp2 = entry + (3.0 * risk)
+    tp3 = entry + (5.0 * risk)
+    
+    return {
+        'entry': round(entry, 2),
+        'stop': round(stop, 2),
+        'tp1': round(tp1, 2),
+        'tp2': round(tp2, 2),
+        'tp3': round(tp3, 2),
+        'atr': round(atr, 4)
+    }
 
-def write_action_plan(args, buys_df, sells_df):
-    plan = []
-    plan.append(f"Date: {args.today}")
-    plan.append(f"Universe: {os.path.basename(args.universe_csv)}")
-    plan.append(f"Run root: {args.run_root}")
-    plan.append("")
-    plan.append("=== Buys ===")
-    if buys_df is not None and len(buys_df):
-        for _, r in buys_df.iterrows():
-            plan.append(f"- {r.get('Ticker','?')} (Score={r.get('Score','')})")
-    else:
-        plan.append("(none)")
-    plan.append("")
-    plan.append("=== Sells ===")
-    if sells_df is not None and len(sells_df):
-        for _, r in sells_df.iterrows():
-            plan.append(f"- {r.get('Ticker','?')} ({r.get('Reason','')})")
-    else:
-        plan.append("(none)")
 
-    out = os.path.join(args.actions_dir, "action_plan.txt")
-    with open(out, "w", encoding="utf-8") as f:
-        f.write("\n".join(plan))
-    print(f"[OK] Action Plan : {out}")
+def process_ml_signals(args):
+    """Prosessoi ML-signaalit ja luo trade candidates + portfolio"""
+    
+    print("="*80)
+    print("🤖 AUTO DECIDER - Kauppapäätösten automaatio")
+    print("="*80)
+    print(f"Päivämäärä:     {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Min ML Score:   {args.min_ml_score}")
+    print(f"Portfolio size: Top {args.top_n}")
+    print(f"Stop mult:      {args.stop_mult} × ATR")
+    print("="*80 + "\n")
+    
+    # Etsi viimeisin run
+    runs_dir = Path(args.runs_dir)
+    latest_run = find_latest_run(runs_dir)
+    
+    if not latest_run:
+        print("❌ Ei löytynyt run-kansioita")
+        return
+    
+    print(f"📂 Viimeisin run: {latest_run.name}")
+    
+    # Etsi ML-signaalit
+    reports_dir = latest_run / "reports"
+    ml_signals_file = find_latest_ml_signals(reports_dir)
+    
+    if not ml_signals_file:
+        print(f"❌ ML-signaaleja ei löydy: {reports_dir}")
+        return
+    
+    print(f"📊 ML-signaalit: {ml_signals_file.name}")
+    
+    # Lue ML-signaalit
+    try:
+        ml_signals = pd.read_csv(ml_signals_file)
+        print(f"📊 Luettu {len(ml_signals)} ML-signaalia\n")
+    except Exception as e:
+        print(f"❌ Virhe lukiessa ML-signaaleja: {e}")
+        return
+    
+    # Suodata ML-scoren mukaan
+    ml_signals = ml_signals[ml_signals['score_long'] >= args.min_ml_score]
+    print(f"📊 Suodatettu: {len(ml_signals)} signaalia (ML score >= {args.min_ml_score})\n")
+    
+    if ml_signals.empty:
+        print("⚠️  Ei signaaleja suodatuksen jälkeen")
+        return
+    
+    # Lataa data
+    price_loader = PriceDataLoader(Path(args.price_cache_dir))
+    seasonality_loader = SeasonalityDataLoader(Path(args.seasonality_dir))
+    
+    # Prosessoi signaalit
+    trade_candidates = []
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    
+    print("🔄 Prosessoidaan signaalit...\n")
+    
+    for idx, row in ml_signals.iterrows():
+        ticker = row['ticker']
+        ml_score = row['score_long']
+        mom5 = row.get('mom5', 0.0)
+        mom20 = row.get('mom20', 0.0)
+        vol20 = row.get('vol20', 0.0)
+        
+        # Lataa hintadata
+        price_df = price_loader.load_ticker(ticker)
+        if price_df is None or price_df.empty:
+            print(f"  ⚠️  {ticker}: Ei hintadataa")
+            continue
+        
+        current_price = float(price_df['Close'].iloc[-1])
+        atr = price_loader.calculate_atr(price_df)
+        
+        if atr == 0:
+            print(f"  ⚠️  {ticker}: ATR=0")
+            continue
+        
+        # Lataa seasonality-data
+        seasonality = seasonality_loader.load_ticker_seasonality(ticker)
+        seasonality_score = seasonality['current_week_score']
+        
+        # Määritä setup-tyyppi
+        setup_type = determine_setup_type(ticker, ml_score, seasonality_score, mom5, mom20)
+        
+        # Laske entry/stop/TP
+        levels = calculate_entry_stop_tp(current_price, atr, args.stop_mult)
+        
+        # Lisää kandidaatti
+        trade_candidates.append({
+            'Ticker': ticker,
+            'Entry': levels['entry'],
+            'Stop': levels['stop'],
+            'TP1': levels['tp1'],
+            'TP2': levels['tp2'],
+            'TP3': levels['tp3'],
+            'Setup_Type': setup_type,
+            'ML_Score': round(ml_score, 4),
+            'Mom5': round(mom5, 4),
+            'Mom20': round(mom20, 4),
+            'Vol20': round(vol20, 4),
+            'Seasonality_Score': round(seasonality_score, 4),
+            'Entry_Date': today_str,
+            'ATR': levels['atr']
+        })
+        
+        print(f"  ✅ {ticker}: ML={ml_score:.3f}, Season={seasonality_score:.3f}, Setup={setup_type}")
+    
+    if not trade_candidates:
+        print("\n⚠️  Ei kauppakandidaatteja")
+        return
+    
+    candidates_df = pd.DataFrame(trade_candidates)
+    
+    print(f"\n📊 Yhteensä {len(candidates_df)} kauppakandidaattia")
+    
+    # Simuloi portfolio: Ota top N ML-scoren mukaan
+    portfolio_df = candidates_df.nlargest(args.top_n, 'ML_Score').copy()
+    
+    # Lisää Side ja Comment
+    portfolio_df['Side'] = 'LONG'
+    portfolio_df['Comment'] = portfolio_df.apply(
+        lambda x: f"ML={x['ML_Score']:.3f}, {x['Setup_Type']}", axis=1
+    )
+    
+    print(f"📊 Portfolio: Top {len(portfolio_df)} signaalia\n")
+    
+    # ==================== TALLENNA ====================
+    today_yyyymmdd = datetime.now().strftime("%Y%m%d")
+    
+    # 1. Tallenna actions-kansioon (arkisto)
+    actions_dir = latest_run / "actions" / today_yyyymmdd
+    actions_dir.mkdir(parents=True, exist_ok=True)
+    
+    candidates_output = actions_dir / f"trade_candidates_{today_yyyymmdd}.csv"
+    portfolio_output = actions_dir / "portfolio_after_sim.csv"
+    
+    try:
+        candidates_df.to_csv(candidates_output, index=False)
+        print(f"✅ Arkisto (candidates): {candidates_output}")
+    except Exception as e:
+        print(f"⚠️  Tallennusvirhe: {e}")
+    
+    try:
+        portfolio_df.to_csv(portfolio_output, index=False)
+        print(f"✅ Arkisto (portfolio):  {portfolio_output}")
+    except Exception as e:
+        print(f"⚠️  Tallennusvirhe: {e}")
+    
+    # 2. Tallenna trade_decisions-kansioon (viimeisimmät)
+    decisions_dir = Path("seasonality_reports/trade_decisions")
+    decisions_dir.mkdir(parents=True, exist_ok=True)
+    
+    latest_candidates = decisions_dir / "latest_trade_candidates.csv"
+    latest_portfolio = decisions_dir / "latest_portfolio.csv"
+    
+    try:
+        candidates_df.to_csv(latest_candidates, index=False)
+        print(f"✅ Viimeisin (candidates): {latest_candidates}")
+    except Exception as e:
+        print(f"⚠️  Tallennusvirhe: {e}")
+    
+    try:
+        portfolio_df.to_csv(latest_portfolio, index=False)
+        print(f"✅ Viimeisin (portfolio):  {latest_portfolio}")
+    except Exception as e:
+        print(f"⚠️  Tallennusvirhe: {e}")
+    
+    # Tulosta yhteenveto
+    print("\n" + "="*80)
+    print("📈 PORTFOLIO YHTEENVETO (TOP SIGNALS):")
+    print("="*80)
+    print(portfolio_df[['Ticker', 'Entry', 'Stop', 'TP1', 'Setup_Type', 'ML_Score', 'Seasonality_Score']].to_string(index=False))
+    print("="*80)
+    
+    # Setup-tyyppi-jakauma
+    print("\n📊 SETUP-TYYPIT:")
+    setup_counts = candidates_df['Setup_Type'].value_counts()
+    for setup, count in setup_counts.items():
+        print(f"  {setup}: {count}")
+    
+    print("\n✅ Valmis!")
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
 
 def main():
     args = parse_args()
-
-    # Lataa/valmistele salkun tila
-    state = _load_portfolio_state(args.portfolio_state)
-
-    # Rakenna listat (tässä pidetään kiinni aiemmista tiedostonimistä)
-    buys_df  = build_trade_candidates(args)
-    sells_df = build_sell_candidates(args, state)
-    port_df  = simulate_portfolio_after_trades(state, buys_df, sells_df)
-
-    # Kirjoitukset
-    trade_path = os.path.join(args.actions_dir, "trade_candidates.csv")
-    sell_path  = os.path.join(args.actions_dir, "sell_candidates.csv")
-    port_path  = os.path.join(args.actions_dir, "portfolio_after_sim.csv")
-
-    _write_csv(buys_df, trade_path)
-    print(f"[OK] Candidates : {trade_path}")
-
-    _write_csv(sells_df, sell_path)
-    print(f"[OK] Sells      : {sell_path}")
-
-    _write_csv(port_df, port_path)
-    print(f"[OK] Portfolio  : {port_path}")
-
-    # Action plan
-    write_action_plan(args, buys_df, sells_df)
-
-    # Tallennetaanko portfolio_state.json?
-    if int(args.commit) == 1:
-        _save_portfolio_state(state, args.portfolio_state)
-        print(f"[OK] Portfolio state COMMITTED: {args.portfolio_state}")
-    else:
-        print("[INFO] Dry-run: portfolio_state.json ei päivitetty (commit=0).")
+    process_ml_signals(args)
 
 
 if __name__ == "__main__":

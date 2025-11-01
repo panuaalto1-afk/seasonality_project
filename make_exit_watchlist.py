@@ -6,6 +6,10 @@ make_exit_watchlist.py - Exit watchlist todennäköisyyspohjaisilla TP-tasoilla
 Tallentaa:
 1. runs/LATEST_RUN/actions/YYYYMMDD/exit_watchlist_YYYYMMDD.csv (arkisto)
 2. seasonality_reports/exit_watchlists/latest_exit_watchlist.csv (viimeisin)
+
+Päivitetty versio:
+- Auto-löytää price_cache:n viimeisimmästä run-kansiosta
+- Yhdenmukainen auto_deciderin kanssa
 """
 
 import os
@@ -90,8 +94,8 @@ ESTIMATED_SETUP_STATS = {
 def parse_args():
     parser = argparse.ArgumentParser(description="Exit watchlist builder")
     parser.add_argument("--portfolio", type=str, help="Portfolio CSV file path")
-    parser.add_argument("--price_cache", type=str, default="seasonality_reports/price_cache", 
-                        help="Price cache directory")
+    parser.add_argument("--price_cache", type=str, default=None,
+                        help="Price cache directory (auto-detected if not specified)")
     parser.add_argument("--stop_mult", type=float, default=1.5, help="Stop loss multiplier")
     parser.add_argument("--stats_file", type=str, default=None, help="Historical stats CSV")
     parser.add_argument("--runs_dir", type=str, default="seasonality_reports/runs")
@@ -109,7 +113,6 @@ class PriceDataLoader:
     def load_ticker(self, ticker: str) -> Optional[pd.DataFrame]:
         price_file = self.price_cache_dir / f"{ticker}.csv"
         if not price_file.exists():
-            print(f"⚠️  Hintadata puuttuu: {ticker}")
             return None
         try:
             df = pd.read_csv(price_file, parse_dates=['Date'])
@@ -119,12 +122,9 @@ class PriceDataLoader:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
             
-            # Poista rivit joissa on NaN-arvoja
             df = df.dropna(subset=['High', 'Low', 'Close'])
-            
             return df.sort_values('Date')
         except Exception as e:
-            print(f"⚠️  Virhe ladattaessa {ticker}: {e}")
             return None
     
     def calculate_atr(self, df: pd.DataFrame, period: int = 20) -> float:
@@ -145,7 +145,6 @@ class PriceDataLoader:
             
             return atr if not pd.isna(atr) else 0.0
         except Exception as e:
-            print(f"⚠️  ATR-laskentavirhe: {e}")
             return 0.0
 
 
@@ -180,17 +179,22 @@ def find_latest_price_cache(runs_dir: Path) -> Optional[Path]:
     if not runs_dir.exists():
         return None
     
+    # Etsi kaikki price_cache-kansiot
     caches = []
     for run_dir in runs_dir.glob("*"):
         if not run_dir.is_dir():
             continue
         cache_dir = run_dir / "price_cache"
         if cache_dir.exists():
-            caches.append((cache_dir, cache_dir.stat().st_mtime))
+            # Tarkista että siellä on tiedostoja
+            csv_files = list(cache_dir.glob("*.csv"))
+            if csv_files:
+                caches.append((cache_dir, cache_dir.stat().st_mtime))
     
     if not caches:
         return None
     
+    # Järjestä viimeisimmän mukaan
     caches.sort(key=lambda x: x[1], reverse=True)
     return caches[0][0]
 
@@ -242,19 +246,27 @@ def calculate_trailing_stop(entry: float, current: float, original_stop: float, 
 def build_exit_watchlist(args):
     """Rakentaa exit-watchlistin"""
     
-    # Määritä price_cache
-    if args.price_cache == "seasonality_reports/price_cache":
+    # ==================== PRICE CACHE AUTO-LÖYTÖ ====================
+    if args.price_cache:
+        # Käyttäjä määritteli polun
         price_cache_dir = Path(args.price_cache)
-        if not price_cache_dir.exists():
-            print("📂 Price cache ei löydy juuresta, etsitään runs-kansiosta...")
-            price_cache_dir = find_latest_price_cache(Path(args.runs_dir))
-            if price_cache_dir:
-                print(f"📂 Löytyi: {price_cache_dir}")
-            else:
-                print("❌ Price cache ei löydy")
-                return
+        print(f"📂 Käytetään määriteltyä price_cache: {price_cache_dir}")
     else:
-        price_cache_dir = Path(args.price_cache)
+        # Auto-löytö
+        print("📂 Etsitään price_cache automaattisesti...")
+        runs_dir = Path(args.runs_dir)
+        price_cache_dir = find_latest_price_cache(runs_dir)
+        
+        if price_cache_dir:
+            print(f"📂 Löytyi: {price_cache_dir}")
+        else:
+            print("❌ Price cache ei löydy automaattisesti")
+            print(f"💡 Määritä polku: --price_cache <polku>")
+            return
+    
+    if not price_cache_dir.exists():
+        print(f"❌ Price cache ei löydy: {price_cache_dir}")
+        return
     
     # Määritä portfolio
     if args.portfolio:
@@ -368,7 +380,7 @@ def build_exit_watchlist(args):
     exit_df = pd.DataFrame(exit_data)
     
     # ==================== TALLENNUSLOGIIKKA ====================
-    today_str = datetime.now().strftime("%Y%m%d")  # 20251101
+    today_yyyymmdd = datetime.now().strftime("%Y%m%d")
     
     # 1. Tallenna päiväkohtaisesti runs/actions-kansioon (ARKISTO)
     runs_dir = Path(args.runs_dir)
@@ -378,16 +390,11 @@ def build_exit_watchlist(args):
         
         if run_dirs:
             latest_run = run_dirs[0]
-            actions_dir = latest_run / "actions"
+            actions_dir = latest_run / "actions" / today_yyyymmdd
             actions_dir.mkdir(parents=True, exist_ok=True)
             
-            # Luo tämän päivän kansio
-            today_dir = actions_dir / today_str
-            today_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Tallenna päiväkohtaisella nimellä
-            dated_filename = f"exit_watchlist_{today_str}.csv"
-            actions_output = today_dir / dated_filename
+            dated_filename = f"exit_watchlist_{today_yyyymmdd}.csv"
+            actions_output = actions_dir / dated_filename
             
             try:
                 exit_df.to_csv(actions_output, index=False)
@@ -428,10 +435,9 @@ def main():
     print("🎯 EXIT WATCHLIST BUILDER")
     print("="*80)
     print(f"Päivämäärä:   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Arkisto:      runs/.../actions/{datetime.now().strftime('%Y%m%d')}/")
-    print(f"Viimeisin:    seasonality_reports/exit_watchlists/latest_exit_watchlist.csv")
     print(f"Stop mult:    {args.stop_mult} × ATR")
     print(f"Stats file:   {args.stats_file or 'Estimoidut tilastot'}")
+    print(f"Price cache:  {'Auto-detect' if not args.price_cache else args.price_cache}")
     print("="*80 + "\n")
     
     build_exit_watchlist(args)
