@@ -15,6 +15,7 @@ Tuottaa:
 Tallentaa:
 1. runs/LATEST_RUN/actions/YYYYMMDD/ (arkisto)
 2. seasonality_reports/trade_decisions/ (viimeisimmät)
+3. seasonality_reports/trades.db (TradeLogger - UUSI!)
 """
 
 import os
@@ -25,6 +26,10 @@ from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 import pandas as pd
 import numpy as np
+
+# ============= UUSI: TradeLogger import =============
+from trades_logger import TradeLogger
+# ===================================================
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -243,6 +248,11 @@ def process_ml_signals(args):
     print(f"Stop mult:      {args.stop_mult} × ATR")
     print("="*80 + "\n")
     
+    # ============= UUSI: Alusta TradeLogger =============
+    logger = TradeLogger(db_path="seasonality_reports/trades.db")
+    print("📊 TradeLogger initialisoitu\n")
+    # ===================================================
+    
     # Etsi viimeisin run
     runs_dir = Path(args.runs_dir)
     latest_run = find_latest_run(runs_dir)
@@ -320,7 +330,7 @@ def process_ml_signals(args):
         levels = calculate_entry_stop_tp(current_price, atr, args.stop_mult)
         
         # Lisää kandidaatti
-        trade_candidates.append({
+        trade_data = {
             'Ticker': ticker,
             'Entry': levels['entry'],
             'Stop': levels['stop'],
@@ -335,7 +345,27 @@ def process_ml_signals(args):
             'Seasonality_Score': round(seasonality_score, 4),
             'Entry_Date': today_str,
             'ATR': levels['atr']
-        })
+        }
+        
+        trade_candidates.append(trade_data)
+        
+        # ============= UUSI: Logita TradeLoggeriin =============
+        logger.log_entry(
+            ticker=ticker,
+            entry_date=today_str,
+            entry_price=levels['entry'],
+            stop=levels['stop'],
+            tp1=levels['tp1'],
+            tp2=levels['tp2'],
+            tp3=levels['tp3'],
+            setup_type=setup_type,
+            ml_score=ml_score,
+            seasonality_score=seasonality_score,
+            mom5=mom5,
+            mom20=mom20,
+            vol20=vol20
+        )
+        # ======================================================
         
         print(f"  ✅ {ticker}: ML={ml_score:.3f}, Season={seasonality_score:.3f}, Setup={setup_type}")
     
@@ -398,6 +428,19 @@ def process_ml_signals(args):
         print(f"✅ Viimeisin (portfolio):  {latest_portfolio}")
     except Exception as e:
         print(f"⚠️  Tallennusvirhe: {e}")
+    
+    # ============= UUSI: Näytä TradeLogger tilastot =============
+    print("\n" + "="*80)
+    print("📊 TRADELOGGER - Avoimet positiot:")
+    print("="*80)
+    open_trades = logger.get_open_trades()
+    if not open_trades.empty:
+        print(f"Avoimia kauppoja: {len(open_trades)}")
+        print(open_trades[['ticker', 'entry_date', 'entry_price', 'setup_type', 'ml_score']].to_string(index=False))
+    else:
+        print("Ei avoimia kauppoja")
+    print("="*80)
+    # ===========================================================
     
     # Tulosta yhteenveto
     print("\n" + "="*80)

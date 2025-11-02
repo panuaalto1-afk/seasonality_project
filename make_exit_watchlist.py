@@ -6,10 +6,12 @@ make_exit_watchlist.py - Exit watchlist todennäköisyyspohjaisilla TP-tasoilla
 Tallentaa:
 1. runs/LATEST_RUN/actions/YYYYMMDD/exit_watchlist_YYYYMMDD.csv (arkisto)
 2. seasonality_reports/exit_watchlists/latest_exit_watchlist.csv (viimeisin)
+3. seasonality_reports/trades.db (TradeLogger - UUSI!)
 
 Päivitetty versio:
 - Auto-löytää price_cache:n viimeisimmästä run-kansiosta
 - Yhdenmukainen auto_deciderin kanssa
+- UUSI: Logittaa exitit TradeLoggeriin
 """
 
 import os
@@ -20,6 +22,10 @@ from datetime import datetime
 from typing import Optional, Dict
 import pandas as pd
 import numpy as np
+
+# ============= UUSI: TradeLogger import =============
+from trades_logger import TradeLogger
+# ===================================================
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -243,8 +249,79 @@ def calculate_trailing_stop(entry: float, current: float, original_stop: float, 
     return max(original_stop, new_stop)
 
 
+def check_exit_conditions(ticker: str, entry_date: str, current: float, 
+                         stop: float, tp1: float, tp2: float, tp3: float,
+                         trail_stop: float, logger: TradeLogger, today_str: str) -> Optional[str]:
+    """
+    Tarkista pitääkö positio sulkea
+    
+    Returns:
+        exit_reason jos pitää sulkea, None jos pidetään auki
+    """
+    # Tarkista exit-ehdot (järjestyksessä)
+    
+    # 1. TP3 osuma (paras)
+    if current >= tp3:
+        logger.log_exit(
+            trade_id=f"{ticker}_{entry_date}",
+            exit_date=today_str,
+            exit_price=current,
+            exit_reason="TP3_HIT"
+        )
+        return "TP3_HIT"
+    
+    # 2. TP2 osuma
+    if current >= tp2:
+        logger.log_exit(
+            trade_id=f"{ticker}_{entry_date}",
+            exit_date=today_str,
+            exit_price=current,
+            exit_reason="TP2_HIT"
+        )
+        return "TP2_HIT"
+    
+    # 3. TP1 osuma
+    if current >= tp1:
+        logger.log_exit(
+            trade_id=f"{ticker}_{entry_date}",
+            exit_date=today_str,
+            exit_price=current,
+            exit_reason="TP1_HIT"
+        )
+        return "TP1_HIT"
+    
+    # 4. Trailing stop osuma
+    if current <= trail_stop:
+        logger.log_exit(
+            trade_id=f"{ticker}_{entry_date}",
+            exit_date=today_str,
+            exit_price=current,
+            exit_reason="TRAILING_STOP"
+        )
+        return "TRAILING_STOP"
+    
+    # 5. Alkuperäinen stop osuma
+    if current <= stop:
+        logger.log_exit(
+            trade_id=f"{ticker}_{entry_date}",
+            exit_date=today_str,
+            exit_price=current,
+            exit_reason="STOP_HIT"
+        )
+        return "STOP_HIT"
+    
+    # Ei exit-ehtoja
+    return None
+
+
 def build_exit_watchlist(args):
     """Rakentaa exit-watchlistin"""
+    
+    # ============= UUSI: Alusta TradeLogger =============
+    logger = TradeLogger(db_path="seasonality_reports/trades.db")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    print("📊 TradeLogger initialisoitu\n")
+    # ===================================================
     
     # ==================== PRICE CACHE AUTO-LÖYTÖ ====================
     if args.price_cache:
@@ -309,6 +386,10 @@ def build_exit_watchlist(args):
     price_loader = PriceDataLoader(price_cache_dir)
     exit_data = []
     
+    # ============= UUSI: Tilastoi exitit =============
+    exits_logged = 0
+    # ================================================
+    
     for idx, pos in portfolio.iterrows():
         ticker = pos.get('Ticker') or pos.get('ticker') or pos.get('Symbol')
         entry = pos.get('Entry')
@@ -354,6 +435,27 @@ def build_exit_watchlist(args):
         
         trail_stop = calculate_trailing_stop(entry, current, stop, days_held)
         
+        # ============= UUSI: Tarkista exit-ehdot =============
+        exit_reason = check_exit_conditions(
+            ticker=ticker,
+            entry_date=entry_date,
+            current=current,
+            stop=stop,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
+            trail_stop=trail_stop,
+            logger=logger,
+            today_str=today_str
+        )
+        
+        if exit_reason:
+            exits_logged += 1
+            print(f"    🚪 EXIT: {exit_reason}")
+            # Älä lisää watchlistiin (positio suljettu)
+            continue
+        # ===================================================
+        
         profit_pct = ((current - entry) / entry) * 100
         note = f"{'Voitolla' if profit_pct > 0 else 'Tappiolla'} {profit_pct:.1f}%"
         if stats['win_rate'] > 0.65:
@@ -375,9 +477,18 @@ def build_exit_watchlist(args):
             'Note': note
         })
         
-        print(f"    ✅ Lisätty watchlistiin")
+        print(f"    ✅ Lisätty watchlistiin (positio auki)")
     
     exit_df = pd.DataFrame(exit_data)
+    
+    # ============= UUSI: Näytä exit-tilastot =============
+    if exits_logged > 0:
+        print(f"\n📊 Suljettu {exits_logged} positiota tänään")
+        closed_today = logger.get_closed_trades(days=1)
+        if not closed_today.empty:
+            print("\n🚪 SULJETUT POSITIOT:")
+            print(closed_today[['ticker', 'entry_price', 'exit_price', 'pnl_pct', 'r_multiple', 'exit_reason']].to_string(index=False))
+    # ===================================================
     
     # ==================== TALLENNUSLOGIIKKA ====================
     today_yyyymmdd = datetime.now().strftime("%Y%m%d")
@@ -413,10 +524,23 @@ def build_exit_watchlist(args):
     except Exception as e:
         print(f"⚠️  Tallennusvirhe: {e}")
     
-    print(f"\n📊 {len(exit_df)} positiota watchlistissä\n")
+    print(f"\n📊 {len(exit_df)} positiota watchlistissä (avoimena)")
+    
+    # ============= UUSI: Näytä TradeLogger yhteenveto =============
+    print("\n" + "="*80)
+    print("📊 TRADELOGGER - Yhteenveto:")
+    print("="*80)
+    stats = logger.get_summary_stats(days=90)
+    print(f"Kauppoja yhteensä:  {stats['total_trades']}")
+    print(f"Avoimia positioita: {stats['open_trades']}")
+    print(f"Win rate:           {stats['win_rate']:.1%}")
+    print(f"Avg R-multiple:     {stats['avg_r_multiple']:.2f}R")
+    print(f"Profit Factor:      {stats['profit_factor']:.2f}")
+    print("="*80)
+    # ===========================================================
     
     if not exit_df.empty:
-        print("="*80)
+        print("\n" + "="*80)
         print("📈 EXIT WATCHLIST YHTEENVETO:")
         print("="*80)
         print(exit_df.to_string(index=False))
