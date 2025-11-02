@@ -13,6 +13,10 @@ from typing import Optional, Tuple, List
 import pandas as pd
 import numpy as np
 
+# ==================== LISÄYS: RegimeDetector import ====================
+from regime_detector import RegimeDetector
+# =======================================================================
+
 # ----------------------------- CLI ---------------------------------
 
 def parse_args():
@@ -170,18 +174,9 @@ def _daily_features_from_prices(p: pd.DataFrame) -> Optional[pd.Series]:
     })
     return feat
 
-def _regime_from_breadth(feats: pd.DataFrame) -> str:
-    """Very lightweight regime: median mom20 across universe."""
-    if feats is None or feats.empty or "mom20" not in feats:
-        return "Neutral"
-    m = feats["mom20"].median(skipna=True)
-    if pd.isna(m):
-        return "Neutral"
-    if m > 0.02:
-        return "Bull"
-    if m < -0.02:
-        return "Bear"
-    return "Neutral"
+# ==================== POISTETTU: Vanha _regime_from_breadth ====================
+# Nyt käytetään RegimeDetectorin monipuolista regime-tunnistusta
+# ===============================================================================
 
 # ------------------------ Robust writers ----------------------------
 
@@ -211,7 +206,7 @@ def write_reports(run_root: str, today: date,
                   labels_df: Optional[pd.DataFrame],
                   preds_df: Optional[pd.DataFrame],
                   metrics: dict,
-                  regime_now: str,
+                  regime_data: dict,  # ← MUUTETTU: regime_now → regime_data
                   gate_alpha: float):
     """
     Writes the standard reports ALWAYS (empty files if needed):
@@ -252,11 +247,19 @@ def write_reports(run_root: str, today: date,
     _write_csv(gated_long.head(200),   os.path.join(reports, f"top_long_candidates_GATED_{tag}.csv"))
     _write_csv(gated_short.head(200),  os.path.join(reports, f"top_short_candidates_GATED_{tag}.csv"))
 
+    # ==================== PÄIVITETTY: Regime-tieto summaryyn ====================
+    regime_now = regime_data.get('regime', 'Unknown')
+    regime_score = regime_data.get('composite_score', 0.0)
+    regime_confidence = regime_data.get('confidence', 0.0)
+    # ============================================================================
+
     # Summary
     summary_path = os.path.join(reports, f"summary_{tag}.txt")
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write(f"[INFO] Reports dir: {reports.replace('\\', '\\\\')}\n")
+        f.write(f"[INFO] Reports dir: {reports.replace(os.sep, os.sep * 2)}\n")
         f.write(f"[INFO] Regime today: {regime_now}\n")
+        f.write(f"[INFO] Regime score: {regime_score:.4f}\n")
+        f.write(f"[INFO] Regime confidence: {regime_confidence:.2%}\n")
         f.write(f"[INFO] Gate alpha: {gate_alpha}\n")
         try:
             n_long = 0 if longs is None else len(longs)
@@ -293,15 +296,20 @@ def build_today_features(universe: List[str], price_cache_dir: str) -> pd.DataFr
                 df[c] = df[c].clip(-1.0, 1.0)
     return df
 
-def predict_from_features(feats_df: pd.DataFrame, gate_alpha: float) -> Tuple[pd.DataFrame, dict, str]:
+def predict_from_features(feats_df: pd.DataFrame, gate_alpha: float, regime_data: dict) -> Tuple[pd.DataFrame, dict]:
     """
     Create simple ranking scores (0..1) based on momentum mix.
-    Returns (preds_df, metrics, regime).
+    Returns (preds_df, metrics).
+    
+    ==================== MUUTETTU: regime_data parametrina ====================
+    Regime tulee nyt RegimeDetectorilta, ei lasketa täällä
+    ===========================================================================
     """
     if feats_df is None or feats_df.empty:
-        return pd.DataFrame(columns=["ticker","score_long","score_short"]), {}, "Neutral"
+        return pd.DataFrame(columns=["ticker","score_long","score_short","regime","regime_score"]), {}
 
-    regime = _regime_from_breadth(feats_df)
+    regime = regime_data.get('regime', 'Neutral')
+    regime_score = regime_data.get('composite_score', 0.0)
 
     # Scoring: blend mom5 & mom20; scale to 0..1 via rank percentile
     z = 0.6 * feats_df["mom5"].astype(float) + 0.4 * feats_df["mom20"].astype(float)
@@ -315,14 +323,22 @@ def predict_from_features(feats_df: pd.DataFrame, gate_alpha: float) -> Tuple[pd
     preds["mom5"] = feats_df["mom5"].values
     preds["mom20"] = feats_df["mom20"].values
     preds["vol20"] = feats_df["vol20"].values
+    
+    # ==================== LISÄYS: Regime-tieto signaaleihin ====================
+    preds["regime"] = regime
+    preds["regime_score"] = regime_score
+    preds["regime_confidence"] = regime_data.get('confidence', 0.0)
+    # ===========================================================================
 
     # Simple metrics just for summary/debug
     metrics = {
         "n": int(len(preds)),
+        "regime": regime,
+        "regime_score": float(regime_score),
         "regime_median_mom20": float(np.median(feats_df["mom20"])) if "mom20" in feats_df else np.nan,
         "gate_alpha": float(gate_alpha),
     }
-    return preds, metrics, regime
+    return preds, metrics
 
 # --------------------------- Main -----------------------------------
 
@@ -358,16 +374,52 @@ def main():
         feats_df = build_today_features(tickers, pc_dir)
 
     print("[STEP] Build features…")
+    
+    # ==================== LISÄYS: REGIME DETECTION ====================
+    print("\n" + "="*80)
+    print("[STEP] REGIME DETECTION")
+    print("="*80)
+    
+    try:
+        # Luo RegimeDetector
+        regime_cache = os.path.join(reports_root, "price_cache")
+        detector = RegimeDetector(
+            macro_price_cache_dir=regime_cache,
+            equity_price_cache_dir=regime_cache
+        )
+        
+        # Tunnista regime
+        regime_data = detector.detect_regime(date=d_today.strftime("%Y-%m-%d"))
+        
+        print(f"[INFO] Regime: {regime_data['regime']}")
+        print(f"[INFO] Score:  {regime_data['composite_score']:.4f}")
+        print(f"[INFO] Confidence: {regime_data['confidence']:.2%}")
+        
+        # Tallenna regime-historia
+        detector.save_regime_history(regime_data, reports_root)
+        
+    except Exception as e:
+        print(f"[WARN] Regime detection failed: {e}")
+        # Fallback: käytä neutraalia regimeä
+        regime_data = {
+            'regime': 'Neutral',
+            'composite_score': 0.0,
+            'confidence': 0.0,
+            'components': {}
+        }
+    
+    print("="*80 + "\n")
+    # ==================================================================
+
     # Labels (optional in this lightweight version) – write empty header
     labels_df = pd.DataFrame(columns=["ticker","target"])
 
-    print("[STEP] Regime today:", _regime_from_breadth(feats_df))
     print("[STEP] Train per-regime models… (lightweight ranking)")
-    preds_df, metrics, regime = predict_from_features(feats_df, args.gate_alpha)
+    preds_df, metrics = predict_from_features(feats_df, args.gate_alpha, regime_data)
 
     print("[STEP] Predict today…")
     print("[STEP] Write reports…")
-    write_reports(run_root, d_today, feats_df, labels_df, preds_df, metrics, regime, args.gate_alpha)
+    write_reports(run_root, d_today, feats_df, labels_df, preds_df, metrics, regime_data, args.gate_alpha)
 
     print("[DONE] ml_unified_pipeline complete.")
 
