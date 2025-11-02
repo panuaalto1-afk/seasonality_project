@@ -1,6 +1,6 @@
 # ml_unified_pipeline.py
 # Seasonality project — unified daily ML pipeline (robust writer edition)
-# Keeps the same CLI you already use. Produces the expected 6 report files, always.
+# VERSION 5.0: Added Sector Rotation by Regime
 
 import argparse
 import os
@@ -13,9 +13,13 @@ from typing import Optional, Tuple, List
 import pandas as pd
 import numpy as np
 
-# ==================== LISÄYS: RegimeDetector import ====================
+# ==================== LISÄYKSET: Regime system ====================
 from regime_detector import RegimeDetector
-# =======================================================================
+from regime_predictor import RegimePredictor
+from regime_strategies import RegimeStrategy
+from multi_timeframe_regime import MultiTimeframeRegime
+from sector_rotation import SectorRotation
+# ==================================================================
 
 # ----------------------------- CLI ---------------------------------
 
@@ -57,11 +61,9 @@ def _reports_dir(run_root: str) -> str:
 
 def _run_root_default(reports_root: str, d: date) -> str:
     tag = d.strftime("%Y-%m-%d_%H%M")
-    # If hour/min not desired, still ok; we keep full tag to avoid clashes
     return os.path.join(reports_root, "runs", tag)
 
 def _find_reports_root() -> str:
-    # Project root = cwd; reports root under it by convention
     return os.path.join(os.getcwd(), "seasonality_reports")
 
 def _find_price_cache_dir(reports_root: str) -> Optional[str]:
@@ -70,7 +72,7 @@ def _find_price_cache_dir(reports_root: str) -> Optional[str]:
     if env and os.path.isdir(env):
         return env
 
-    # 2) Canonical cache mentioned in your notes
+    # 2) Canonical cache
     canonical = os.path.join(
         reports_root, "runs", "2025-10-04_0903", "price_cache"
     )
@@ -88,13 +90,11 @@ def _find_price_cache_dir(reports_root: str) -> Optional[str]:
             candidates.append(pc)
     if not candidates:
         return None
-    # Sort by folder name descending (timestamped names)
     candidates.sort(reverse=True)
     return candidates[0]
 
 def _read_universe(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
-    # Normalize ticker column
     cols = {c.lower(): c for c in df.columns}
     cand = None
     for k in ["ticker", "symbol", "ric", "isin"]:
@@ -102,7 +102,6 @@ def _read_universe(path: str) -> pd.DataFrame:
             cand = cols[k]
             break
     if cand is None:
-        # try first column
         df.columns = ["ticker"] + list(df.columns[1:])
         cand = "ticker"
     df["ticker"] = df[cand].astype(str).str.strip().str.upper()
@@ -110,7 +109,6 @@ def _read_universe(path: str) -> pd.DataFrame:
     return df[["ticker"]]
 
 def _read_price_csv(pc_dir: str, ticker: str) -> Optional[pd.DataFrame]:
-    # Try common filename patterns
     patterns = [
         os.path.join(pc_dir, f"{ticker}.csv"),
         os.path.join(pc_dir, f"{ticker.upper()}.csv"),
@@ -125,11 +123,9 @@ def _read_price_csv(pc_dir: str, ticker: str) -> Optional[pd.DataFrame]:
         return None
     try:
         df = pd.read_csv(path)
-        # Normalize columns
         cols = {c.lower(): c for c in df.columns}
         date_col = cols.get("date", None)
         if date_col is None:
-            # common alternatives
             for k in ["time", "datetime"]:
                 if k in cols:
                     date_col = cols[k]
@@ -158,7 +154,7 @@ def _daily_features_from_prices(p: pd.DataFrame) -> Optional[pd.Series]:
     if p is None or len(p) < 60:
         return None
     s = p["close"].astype(float)
-    ret = s.pct_change()
+    ret = s.pct_change(fill_method=None)
     mom5  = s.pct_change(5)
     mom20 = s.pct_change(20)
     mom60 = s.pct_change(60)
@@ -173,10 +169,6 @@ def _daily_features_from_prices(p: pd.DataFrame) -> Optional[pd.Series]:
         "vol20": float(vol20.iloc[-1]) if not pd.isna(vol20.iloc[-1]) else np.nan,
     })
     return feat
-
-# ==================== POISTETTU: Vanha _regime_from_breadth ====================
-# Nyt käytetään RegimeDetectorin monipuolista regime-tunnistusta
-# ===============================================================================
 
 # ------------------------ Robust writers ----------------------------
 
@@ -206,7 +198,7 @@ def write_reports(run_root: str, today: date,
                   labels_df: Optional[pd.DataFrame],
                   preds_df: Optional[pd.DataFrame],
                   metrics: dict,
-                  regime_data: dict,  # ← MUUTETTU: regime_now → regime_data
+                  regime_data: dict,
                   gate_alpha: float):
     """
     Writes the standard reports ALWAYS (empty files if needed):
@@ -226,8 +218,14 @@ def write_reports(run_root: str, today: date,
     gated_short = pd.DataFrame()
 
     if preds_df is not None and not preds_df.empty:
-        # Expect 'score_long' / 'score_short' but fall back gracefully
-        sc_long = "score_long" if "score_long" in preds_df.columns else None
+        # Use sector_adjusted_score if available (highest priority)
+        if 'sector_adjusted_score' in preds_df.columns:
+            sc_long = 'sector_adjusted_score'
+        elif 'composite_score' in preds_df.columns:
+            sc_long = 'composite_score'
+        else:
+            sc_long = "score_long" if "score_long" in preds_df.columns else None
+        
         sc_short = "score_short" if "score_short" in preds_df.columns else None
 
         if sc_long:
@@ -247,20 +245,61 @@ def write_reports(run_root: str, today: date,
     _write_csv(gated_long.head(200),   os.path.join(reports, f"top_long_candidates_GATED_{tag}.csv"))
     _write_csv(gated_short.head(200),  os.path.join(reports, f"top_short_candidates_GATED_{tag}.csv"))
 
-    # ==================== PÄIVITETTY: Regime-tieto summaryyn ====================
+    # Summary
     regime_now = regime_data.get('regime', 'Unknown')
     regime_score = regime_data.get('composite_score', 0.0)
     regime_confidence = regime_data.get('confidence', 0.0)
-    # ============================================================================
-
-    # Summary
+    
     summary_path = os.path.join(reports, f"summary_{tag}.txt")
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write(f"[INFO] Reports dir: {reports.replace(os.sep, os.sep * 2)}\n")
+        f.write(f"[INFO] Reports dir: {reports.replace(os.sep, os.sep*2)}\n")
+        f.write(f"\n=== REGIME STATUS ===\n")
         f.write(f"[INFO] Regime today: {regime_now}\n")
         f.write(f"[INFO] Regime score: {regime_score:.4f}\n")
         f.write(f"[INFO] Regime confidence: {regime_confidence:.2%}\n")
+        f.write(f"[INFO] Regime duration: {regime_data.get('regime_duration_days', 0)} days\n")
+        
+        # Multi-timeframe info
+        if 'multi_timeframe' in regime_data and regime_data['multi_timeframe']:
+            mtf = regime_data['multi_timeframe']
+            f.write(f"\n=== MULTI-TIMEFRAME ANALYSIS ===\n")
+            f.write(f"[INFO] Daily regime:   {mtf['daily']}\n")
+            f.write(f"[INFO] Weekly regime:  {mtf['weekly']}\n")
+            f.write(f"[INFO] Monthly regime: {mtf['monthly']}\n")
+            f.write(f"[INFO] Composite:      {mtf['composite']} ({mtf['alignment']} alignment)\n")
+            f.write(f"[INFO] Trading bias:   {mtf['bias'].upper()} ({mtf['bias_strength']:.1%})\n")
+            f.write(f"[INFO] Recommendation: {mtf['recommendation'].upper()}\n")
+        
+        if 'regime_strategy' in metrics:
+            f.write(f"\n=== STRATEGY ===\n")
+            f.write(f"[INFO] Strategy type: {metrics['regime_strategy']}\n")
+        
+        # ==================== Sector rotation info ====================
+        if metrics.get('sector_rotation_applied', False):
+            f.write(f"\n=== SECTOR ROTATION ===\n")
+            f.write(f"[INFO] Sector rotation: ENABLED\n")
+            
+            # Show top sectors (if we have sector column in preds_df)
+            if preds_df is not None and not preds_df.empty and 'sector' in preds_df.columns:
+                top_sectors = preds_df['sector'].value_counts().head(5)
+                f.write(f"[INFO] Top sectors in signals:\n")
+                for sector, count in top_sectors.items():
+                    if pd.notna(sector):
+                        f.write(f"  - {sector}: {count} signals\n")
+        # ==============================================================
+        
+        if 'prediction_1d' in regime_data:
+            f.write(f"\n=== REGIME FORECAST ===\n")
+            f.write(f"[INFO] 1-day forecast: {regime_data['prediction_1d']} ({regime_data.get('prediction_1d_prob', 0):.1%})\n")
+            f.write(f"[INFO] 5-day forecast: {regime_data['prediction_5d']} ({regime_data.get('prediction_5d_prob', 0):.1%})\n")
+            f.write(f"[INFO] Transition probability (5d): {regime_data.get('transition_prob_5d', 0):.1%}\n")
+            
+            if regime_data.get('transition_prob_5d', 0) > 0.70:
+                f.write(f"[WARNING] High regime change probability - consider defensive positioning\n")
+        
+        f.write(f"\n=== TRADING PARAMETERS ===\n")
         f.write(f"[INFO] Gate alpha: {gate_alpha}\n")
+        
         try:
             n_long = 0 if longs is None else len(longs)
             n_short = 0 if shorts is None else len(shorts)
@@ -289,27 +328,30 @@ def build_today_features(universe: List[str], price_cache_dir: str) -> pd.DataFr
         rows.append(feat)
     df = pd.DataFrame(rows)
     if not df.empty:
-        # Clip insane values, fillna
         for c in ["mom5", "mom20", "mom60", "vol20"]:
             if c in df:
                 df[c] = df[c].replace([np.inf, -np.inf], np.nan).fillna(0.0)
                 df[c] = df[c].clip(-1.0, 1.0)
     return df
 
-def predict_from_features(feats_df: pd.DataFrame, gate_alpha: float, regime_data: dict) -> Tuple[pd.DataFrame, dict]:
+def predict_from_features(feats_df: pd.DataFrame, regime_data: dict, gate_alpha: float) -> Tuple[pd.DataFrame, dict]:
     """
     Create simple ranking scores (0..1) based on momentum mix.
+    Now includes regime-specific filtering, composite scoring, AND sector rotation.
     Returns (preds_df, metrics).
-    
-    ==================== MUUTETTU: regime_data parametrina ====================
-    Regime tulee nyt RegimeDetectorilta, ei lasketa täällä
-    ===========================================================================
     """
     if feats_df is None or feats_df.empty:
-        return pd.DataFrame(columns=["ticker","score_long","score_short","regime","regime_score"]), {}
+        return pd.DataFrame(columns=["ticker","score_long","score_short"]), {}
 
-    regime = regime_data.get('regime', 'Neutral')
-    regime_score = regime_data.get('composite_score', 0.0)
+    regime = regime_data.get('regime', 'Unknown')
+
+    # Load regime strategy
+    strategy = RegimeStrategy(regime)
+    
+    print(f"\n[INFO] Applying {regime} strategy ({strategy.config['strategy_type']})...")
+    print(f"  Signal weights: momentum={strategy.config['signal_weights']['momentum']:.0%}, "
+          f"quality={strategy.config['signal_weights']['quality']:.0%}, "
+          f"value={strategy.config['signal_weights']['value']:.0%}")
 
     # Scoring: blend mom5 & mom20; scale to 0..1 via rank percentile
     z = 0.6 * feats_df["mom5"].astype(float) + 0.4 * feats_df["mom20"].astype(float)
@@ -324,20 +366,55 @@ def predict_from_features(feats_df: pd.DataFrame, gate_alpha: float, regime_data
     preds["mom20"] = feats_df["mom20"].values
     preds["vol20"] = feats_df["vol20"].values
     
-    # ==================== LISÄYS: Regime-tieto signaaleihin ====================
+    # Regime info
     preds["regime"] = regime
-    preds["regime_score"] = regime_score
+    preds["regime_score"] = regime_data.get('composite_score', 0.0)
     preds["regime_confidence"] = regime_data.get('confidence', 0.0)
-    # ===========================================================================
+    
+    # Add ml_score (use score_long as proxy)
+    preds["ml_score"] = preds["score_long"]
+    
+    # Apply regime composite scoring
+    print(f"  Calculating regime-aware composite scores...")
+    
+    preds = strategy.calculate_composite_score(preds)
+    
+    print(f"  Signals ranked by composite score: {len(preds)}")
+    if len(preds) > 0:
+        print(f"  Top 5 composite scores: {preds['composite_score'].head(5).tolist()}")
+    
+    # ==================== Apply sector rotation ====================
+    print(f"  Applying sector rotation for {regime}...")
+    
+    rotator = SectorRotation()
+    
+    # Show sector allocation (compact version for pipeline)
+    weights = rotator.regime_sector_weights.get(regime, {})
+    sorted_sectors = sorted(weights.items(), key=lambda x: x[1], reverse=True)
+    preferred = [s for s, w in sorted_sectors if w >= 0.20]
+    print(f"  Preferred sectors (≥20%): {', '.join(preferred) if preferred else 'None'}")
+    
+    # Apply sector rotation (don't limit top_n here, keep all for gating later)
+    preds = rotator.apply_sector_rotation(preds, regime, top_n=None)
+    
+    print(f"  Signals after sector rotation: {len(preds)}")
+    if len(preds) > 0:
+        print(f"  Top 5 sector-adjusted scores: {preds['sector_adjusted_score'].head(5).tolist()}")
+    # ===============================================================
+    
+    # Sort by sector_adjusted_score
+    preds = preds.sort_values('sector_adjusted_score', ascending=False)
 
-    # Simple metrics just for summary/debug
+    # Simple metrics
     metrics = {
         "n": int(len(preds)),
-        "regime": regime,
-        "regime_score": float(regime_score),
         "regime_median_mom20": float(np.median(feats_df["mom20"])) if "mom20" in feats_df else np.nan,
         "gate_alpha": float(gate_alpha),
+        "regime_strategy": strategy.config['strategy_type'],
+        "strategy_max_positions": strategy.config['max_positions'],
+        "sector_rotation_applied": True
     }
+    
     return preds, metrics
 
 # --------------------------- Main -----------------------------------
@@ -375,47 +452,128 @@ def main():
 
     print("[STEP] Build features…")
     
-    # ==================== LISÄYS: REGIME DETECTION ====================
+    # ==================== REGIME DETECTION ====================
     print("\n" + "="*80)
     print("[STEP] REGIME DETECTION")
-    print("="*80)
+    print("="*80 + "\n")
     
     try:
-        # Luo RegimeDetector
-        regime_cache = os.path.join(reports_root, "price_cache")
         detector = RegimeDetector(
-            macro_price_cache_dir=regime_cache,
-            equity_price_cache_dir=regime_cache
+            macro_price_cache_dir=os.path.join(reports_root, "price_cache"),
+            equity_price_cache_dir=pc_dir
         )
-        
-        # Tunnista regime
         regime_data = detector.detect_regime(date=d_today.strftime("%Y-%m-%d"))
         
         print(f"[INFO] Regime: {regime_data['regime']}")
         print(f"[INFO] Score:  {regime_data['composite_score']:.4f}")
         print(f"[INFO] Confidence: {regime_data['confidence']:.2%}")
         
-        # Tallenna regime-historia
-        detector.save_regime_history(regime_data, reports_root)
-        
     except Exception as e:
         print(f"[WARN] Regime detection failed: {e}")
-        # Fallback: käytä neutraalia regimeä
         regime_data = {
-            'regime': 'Neutral',
+            'regime': 'Unknown',
             'composite_score': 0.0,
             'confidence': 0.0,
             'components': {}
         }
     
     print("="*80 + "\n")
-    # ==================================================================
+    # ==========================================================
+    
+    # ==================== REGIME PREDICTION ====================
+    print("\n" + "="*80)
+    print("[STEP] REGIME PREDICTION")
+    print("="*80 + "\n")
+    
+    try:
+        predictor = RegimePredictor()
+        
+        pred_1d = predictor.predict(d_today.strftime("%Y-%m-%d"), horizon_days=1)
+        pred_5d = predictor.predict(d_today.strftime("%Y-%m-%d"), horizon_days=5)
+        
+        regime_duration = pred_1d.get('regime_duration_days', 0)
+        
+        print(f"📈 1-DAY FORECAST:")
+        print(f"  Most likely: {pred_1d['most_likely']} ({pred_1d['predictions'][pred_1d['most_likely']]:.1%})")
+        print(f"  Transition probability: {pred_1d['transition_probability']:.1%}")
+        
+        print(f"\n📈 5-DAY FORECAST:")
+        print(f"  Most likely: {pred_5d['most_likely']} ({pred_5d['predictions'][pred_5d['most_likely']]:.1%})")
+        print(f"  Transition probability: {pred_5d['transition_probability']:.1%}")
+        
+        if pred_5d['transition_probability'] > 0.70:
+            print(f"\n⚠️  WARNING: High regime change probability ({pred_5d['transition_probability']:.1%})")
+            print(f"  Current regime has persisted for {regime_duration} days")
+            print(f"  Consider adjusting position sizes or risk limits")
+        
+        regime_data['regime_duration_days'] = regime_duration
+        regime_data['prediction_1d'] = pred_1d['most_likely']
+        regime_data['prediction_1d_prob'] = pred_1d['predictions'][pred_1d['most_likely']]
+        regime_data['prediction_5d'] = pred_5d['most_likely']
+        regime_data['prediction_5d_prob'] = pred_5d['predictions'][pred_5d['most_likely']]
+        regime_data['transition_prob_5d'] = pred_5d['transition_probability']
+        
+    except Exception as e:
+        print(f"[WARN] Regime prediction failed: {e}")
+        regime_data['regime_duration_days'] = 0
+        regime_data['prediction_1d'] = regime_data.get('regime', 'Unknown')
+        regime_data['prediction_5d'] = regime_data.get('regime', 'Unknown')
+        regime_data['prediction_1d_prob'] = 0.0
+        regime_data['prediction_5d_prob'] = 0.0
+        regime_data['transition_prob_5d'] = 0.0
+    
+    print("="*80 + "\n")
+    # ===========================================================
+    
+    # ==================== MULTI-TIMEFRAME REGIME ====================
+    print("\n" + "="*80)
+    print("[STEP] MULTI-TIMEFRAME REGIME ANALYSIS")
+    print("="*80 + "\n")
+    
+    try:
+        mtf = MultiTimeframeRegime(
+            macro_price_cache_dir=os.path.join(reports_root, "price_cache"),
+            equity_price_cache_dir=pc_dir
+        )
+        
+        mtf_result = mtf.detect_multi_timeframe(d_today.strftime("%Y-%m-%d"))
+        
+        # Trading bias
+        bias = mtf.get_trading_bias(mtf_result)
+        
+        print(f"\n📊 MULTI-TIMEFRAME SUMMARY:")
+        print(f"  Daily:   {mtf_result['daily']['regime']}")
+        print(f"  Weekly:  {mtf_result['weekly']['regime']}")
+        print(f"  Monthly: {mtf_result['monthly']['regime']}")
+        print(f"\n  Composite: {mtf_result['composite']['regime']} ({mtf_result['composite']['alignment']} alignment)")
+        print(f"  Trading Bias: {bias['bias'].upper()} ({bias['strength']:.1%} strength)")
+        print(f"  Recommendation: {bias['recommendation'].upper()}")
+        print(f"\n  → {mtf_result['interpretation']}")
+        
+        # Add mtf_result to regime_data
+        regime_data['multi_timeframe'] = {
+            'daily': mtf_result['daily']['regime'],
+            'weekly': mtf_result['weekly']['regime'],
+            'monthly': mtf_result['monthly']['regime'],
+            'composite': mtf_result['composite']['regime'],
+            'alignment': mtf_result['composite']['alignment'],
+            'bias': bias['bias'],
+            'bias_strength': bias['strength'],
+            'recommendation': bias['recommendation']
+        }
+        
+    except Exception as e:
+        print(f"[WARN] Multi-timeframe analysis failed: {e}")
+        regime_data['multi_timeframe'] = None
+    
+    print("="*80 + "\n")
+    # ================================================================
 
-    # Labels (optional in this lightweight version) – write empty header
+    # Labels (optional)
     labels_df = pd.DataFrame(columns=["ticker","target"])
 
-    print("[STEP] Train per-regime models… (lightweight ranking)")
-    preds_df, metrics = predict_from_features(feats_df, args.gate_alpha, regime_data)
+    print("[STEP] Train per-regime models… (regime + sector aware ranking)")
+    preds_df, metrics = predict_from_features(feats_df, regime_data, args.gate_alpha)
 
     print("[STEP] Predict today…")
     print("[STEP] Write reports…")

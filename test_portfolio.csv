@@ -1,0 +1,6 @@
+﻿Ticker,Entry,Setup_Type,Entry_Date
+AAPL,245.50,ML_Momentum_Strong,2025-10-25
+MSFT,420.30,ML_Seasonality_Combo,2025-10-26
+GOOGL,175.80,Optio_Breakout,2025-10-27
+META,580.20,ML_Momentum_Moderate,2025-10-28
+NVDA,495.30,ML_Seasonality_Combo,2025-10-29
