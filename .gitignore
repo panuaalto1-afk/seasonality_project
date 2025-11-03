@@ -1,6 +1,17 @@
-﻿# Python
+﻿# ================================================================
+# SEASONALITY PROJECT - .gitignore
+# ================================================================
+
+# ==================== SECRETS ====================
+.gmail_app_password
+*.env
+*.key
+
+# ==================== PYTHON ====================
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
 *.so
 *.egg
 *.egg-info/
@@ -14,35 +25,26 @@ build/
 venv/
 ENV/
 
-# IDE
+# ==================== DATA (TOO LARGE) ====================
+# Ei pushata isoja data-kansioita
+seasonality_reports/runs/
+seasonality_reports/price_cache/
+seasonality_reports/logs/
+
+# Salli exit_watchlist_archive (pieni, tärkeä backtestingille)
+!seasonality_reports/exit_watchlist_archive/
+
+# ==================== IDEs ====================
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# OS
+# ==================== OS ====================
 .DS_Store
 Thumbs.db
 
-# Project specific - data and reports
-logs/
-seasonality_reports/
+# ==================== TEMPORARY ====================
 *.cache
-
-# Junk/temporary files - specific to this project
-Dict[str
-List[str]
-Optional[*
-Tuple[*
-pd.DataFrame
-dt.date
-"Nimet*
-*nul*
-upper.iloc*
-threshold)
-MIN_OPT_OI]
-0
-1.10
-bool
-int
-float
+*.tmp
+~*
