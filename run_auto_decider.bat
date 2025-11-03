@@ -29,7 +29,7 @@ echo [INFO] Price cache:  %PRICE_CACHE%
 echo [INFO] Today:        %TODAY%
 echo ========================================
 
-python auto_decider.py --project_root "." --universe_csv "seasonality_reports/constituents_raw.csv" --run_root "%RUN_ROOT%" --price_cache_dir "%PRICE_CACHE%" --today "%TODAY%" --commit 0
+python auto_decider.py --project_root "." --universe_csv "seasonality_reports/constituents_raw.csv" --run_root "%RUN_ROOT%" --price_cache_dir "%PRICE_CACHE%" --today "%TODAY%" --commit 1
 
 echo ========================================
 echo [INFO] Auto decider valmis: %ERRORLEVEL%
