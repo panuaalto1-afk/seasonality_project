@@ -1,50 +1,23 @@
-﻿# ================================================================
-# SEASONALITY PROJECT - .gitignore
-# ================================================================
-
-# ==================== SECRETS ====================
+﻿# SECRETS
 .gmail_app_password
-*.env
-*.key
 
-# ==================== PYTHON ====================
+# PYTHON
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-*.so
-*.egg
-*.egg-info/
-dist/
-build/
 *.log
 
-# Virtual environments
-.env
-.venv/
-venv/
-ENV/
-
-# ==================== DATA (TOO LARGE) ====================
-# Ei pushata isoja data-kansioita
+# DATA (TOO LARGE)
 seasonality_reports/runs/
 seasonality_reports/price_cache/
 seasonality_reports/logs/
 
-# Salli exit_watchlist_archive (pieni, tärkeä backtestingille)
+# Salli exit_watchlist_archive
 !seasonality_reports/exit_watchlist_archive/
 
-# ==================== IDEs ====================
+# IDEs
 .vscode/
 .idea/
-*.swp
-*.swo
 
-# ==================== OS ====================
+# OS
 .DS_Store
 Thumbs.db
-
-# ==================== TEMPORARY ====================
-*.cache
-*.tmp
-~*
