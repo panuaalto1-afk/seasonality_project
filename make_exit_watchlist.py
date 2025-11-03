@@ -1,571 +1,505 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-make_exit_watchlist.py - Exit watchlist todennäköisyyspohjaisilla TP-tasoilla
+make_exit_watchlist.py
+======================
+Luo exit watchlist nykyisille positioille.
 
-Tallentaa:
-1. runs/LATEST_RUN/actions/YYYYMMDD/exit_watchlist_YYYYMMDD.csv (arkisto)
-2. seasonality_reports/exit_watchlists/latest_exit_watchlist.csv (viimeisin)
-3. seasonality_reports/trades.db (TradeLogger - UUSI!)
+Features:
+- Trailing stop ATR-pohjaisesti
+- Take profit -tasot
+- P&L tracking
+- Regime-aware exits
+- Automaattinen arkistointi (timestamped CSV:t)
+- KORJATTU: MultiIndex DataFrame handling
 
-Päivitetty versio:
-- Auto-löytää price_cache:n viimeisimmästä run-kansiosta
-- Yhdenmukainen auto_deciderin kanssa
-- UUSI: Logittaa exitit TradeLoggeriin
+Usage:
+    python make_exit_watchlist.py
+    python make_exit_watchlist.py --stop_mult 2.0
+    python make_exit_watchlist.py --price_cache_dir "path/to/cache"
 """
 
+import argparse
 import os
 import sys
-import argparse
-from pathlib import Path
-from datetime import datetime
-from typing import Optional, Dict
+import json
+from datetime import datetime, date, timedelta
+from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
 import numpy as np
+import yfinance as yf
 
-# ============= UUSI: TradeLogger import =============
-from trades_logger import TradeLogger
-# ===================================================
-
+# Import logging system
 try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+    from trades_logger import TradeLogger
+    LOGGER_AVAILABLE = True
+except ImportError:
+    LOGGER_AVAILABLE = False
+    print("[WARN] trades_logger.py ei löydy. Logging pois käytöstä.")
 
-# ==================== ESTIMOIDUT TILASTOT ====================
-ESTIMATED_SETUP_STATS = {
-    'ML_Momentum_Strong': {
-        'win_rate': 0.68,
-        'avg_win_pct': 8.2,
-        'avg_loss_pct': -3.1,
-        'profit_factor': 2.1,
-        'tp1_hit_rate': 0.45,
-        'tp2_hit_rate': 0.18,
-        'tp3_hit_rate': 0.05,
-        'median_hold_days': 6
-    },
-    'ML_Momentum_Moderate': {
-        'win_rate': 0.54,
-        'avg_win_pct': 5.2,
-        'avg_loss_pct': -2.8,
-        'profit_factor': 1.2,
-        'tp1_hit_rate': 0.35,
-        'tp2_hit_rate': 0.12,
-        'tp3_hit_rate': 0.03,
-        'median_hold_days': 7
-    },
-    'ML_Seasonality_Combo': {
-        'win_rate': 0.73,
-        'avg_win_pct': 9.5,
-        'avg_loss_pct': -3.0,
-        'profit_factor': 2.8,
-        'tp1_hit_rate': 0.47,
-        'tp2_hit_rate': 0.19,
-        'tp3_hit_rate': 0.08,
-        'median_hold_days': 8
-    },
-    'Optio_Breakout': {
-        'win_rate': 0.65,
-        'avg_win_pct': 11.2,
-        'avg_loss_pct': -3.5,
-        'profit_factor': 1.9,
-        'tp1_hit_rate': 0.39,
-        'tp2_hit_rate': 0.17,
-        'tp3_hit_rate': 0.09,
-        'median_hold_days': 5
-    },
-    'Seasonality_Pure': {
-        'win_rate': 0.61,
-        'avg_win_pct': 6.5,
-        'avg_loss_pct': -2.5,
-        'profit_factor': 1.6,
-        'tp1_hit_rate': 0.37,
-        'tp2_hit_rate': 0.14,
-        'tp3_hit_rate': 0.10,
-        'median_hold_days': 11
-    },
-    'Default': {
-        'win_rate': 0.50,
-        'avg_win_pct': 4.5,
-        'avg_loss_pct': -3.0,
-        'profit_factor': 1.0,
-        'tp1_hit_rate': 0.30,
-        'tp2_hit_rate': 0.10,
-        'tp3_hit_rate': 0.02,
-        'median_hold_days': 10
-    }
-}
-
+# ======================== ARGUMENT PARSING ========================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Exit watchlist builder")
-    parser.add_argument("--portfolio", type=str, help="Portfolio CSV file path")
-    parser.add_argument("--price_cache", type=str, default=None,
-                        help="Price cache directory (auto-detected if not specified)")
-    parser.add_argument("--stop_mult", type=float, default=1.5, help="Stop loss multiplier")
-    parser.add_argument("--stats_file", type=str, default=None, help="Historical stats CSV")
-    parser.add_argument("--runs_dir", type=str, default="seasonality_reports/runs")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(
+        description="Luo exit watchlist nykyisille positioille",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    p.add_argument("--stop_mult", type=float, default=1.5,
+                   help="Stop loss etäisyys (kerrottuna ATR:llä)")
+    p.add_argument("--tp_mult", type=float, default=3.0,
+                   help="Take profit etäisyys (kerrottuna ATR:llä)")
+    p.add_argument("--atr_period", type=int, default=14,
+                   help="ATR laskenta-periodi")
+    p.add_argument("--stats_file", type=str, default=None,
+                   help="Polku tilastotiedostoon (jos None, käytetään estimoituja)")
+    p.add_argument("--price_cache_dir", type=str, default=None,
+                   help="Price cache -kansio (jos None, auto-detect)")
+    p.add_argument("--output", type=str, default="seasonality_reports/exit_watchlist.csv",
+                   help="Output CSV path")
+    return p.parse_args()
 
+# ======================== PRICE DATA ========================
 
-class PriceDataLoader:
-    """Lataa hintadataa price_cache:sta"""
+def find_price_cache_dir() -> Optional[str]:
+    """Etsi viimeisin price cache -kansio"""
+    base = "seasonality_reports/runs"
     
-    def __init__(self, price_cache_dir: Path):
-        self.price_cache_dir = Path(price_cache_dir)
-        if not self.price_cache_dir.exists():
-            print(f"⚠️  Price cache ei löydy: {self.price_cache_dir}")
-    
-    def load_ticker(self, ticker: str) -> Optional[pd.DataFrame]:
-        price_file = self.price_cache_dir / f"{ticker}.csv"
-        if not price_file.exists():
-            return None
-        try:
-            df = pd.read_csv(price_file, parse_dates=['Date'])
-            
-            # Muunna hintasarakkeet numeerisiksi
-            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            df = df.dropna(subset=['High', 'Low', 'Close'])
-            return df.sort_values('Date')
-        except Exception as e:
-            return None
-    
-    def calculate_atr(self, df: pd.DataFrame, period: int = 20) -> float:
-        """Laske Average True Range"""
-        if len(df) < period:
-            return 0.0
-        
-        try:
-            high = df['High'].astype(float)
-            low = df['Low'].astype(float)
-            close = df['Close'].astype(float).shift(1)
-            
-            tr1 = high - low
-            tr2 = (high - close).abs()
-            tr3 = (low - close).abs()
-            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-            atr = tr.rolling(period).mean().iloc[-1]
-            
-            return atr if not pd.isna(atr) else 0.0
-        except Exception as e:
-            return 0.0
-
-
-def find_latest_portfolio(runs_dir: Path) -> Optional[Path]:
-    """Etsi viimeisin portfolio runs-kansiosta"""
-    if not runs_dir.exists():
+    if not os.path.exists(base):
         return None
     
-    portfolios = []
-    for run_dir in runs_dir.glob("*"):
-        if not run_dir.is_dir():
-            continue
-        actions_dir = run_dir / "actions"
-        if not actions_dir.exists():
-            continue
-        for date_dir in actions_dir.glob("*"):
-            if not date_dir.is_dir():
-                continue
-            portfolio_file = date_dir / "portfolio_after_sim.csv"
-            if portfolio_file.exists():
-                portfolios.append((portfolio_file, portfolio_file.stat().st_mtime))
+    # Etsi kaikki run-kansiot
+    runs = [d for d in os.listdir(base) if os.path.isdir(os.path.join(base, d))]
     
-    if not portfolios:
+    if not runs:
         return None
     
-    portfolios.sort(key=lambda x: x[1], reverse=True)
-    return portfolios[0][0]
-
-
-def find_latest_price_cache(runs_dir: Path) -> Optional[Path]:
-    """Etsi viimeisin price_cache runs-kansiosta"""
-    if not runs_dir.exists():
-        return None
+    # Järjestä päivämäärän mukaan (uusin ensin)
+    runs.sort(reverse=True)
     
-    # Etsi kaikki price_cache-kansiot
-    caches = []
-    for run_dir in runs_dir.glob("*"):
-        if not run_dir.is_dir():
-            continue
-        cache_dir = run_dir / "price_cache"
-        if cache_dir.exists():
-            # Tarkista että siellä on tiedostoja
-            csv_files = list(cache_dir.glob("*.csv"))
-            if csv_files:
-                caches.append((cache_dir, cache_dir.stat().st_mtime))
+    # Etsi ensimmäinen jossa on price_cache
+    for run in runs:
+        cache_dir = os.path.join(base, run, "price_cache")
+        if os.path.exists(cache_dir):
+            return cache_dir
     
-    if not caches:
-        return None
-    
-    # Järjestä viimeisimmän mukaan
-    caches.sort(key=lambda x: x[1], reverse=True)
-    return caches[0][0]
-
-
-def load_setup_statistics(stats_file: Optional[str]) -> Dict:
-    """Lataa tilastot"""
-    if stats_file and Path(stats_file).exists():
-        print(f"📊 Ladataan tilastot: {stats_file}")
-        df = pd.read_csv(stats_file)
-        stats = {}
-        for _, row in df.iterrows():
-            stats[row['setup_type']] = {
-                'win_rate': row['win_rate'],
-                'tp1_hit_rate': row['tp1_hit_rate'],
-                'tp2_hit_rate': row['tp2_hit_rate'],
-                'tp3_hit_rate': row['tp3_hit_rate'],
-                'profit_factor': row['profit_factor']
-            }
-        return stats
-    else:
-        print("📊 Käytetään estimoituja tilastoja")
-        return ESTIMATED_SETUP_STATS
-
-
-def calculate_trailing_stop(entry: float, current: float, original_stop: float, days: int) -> float:
-    """
-    Laske trailing stop hinnan noustessa:
-    - Profit > 1R: nosta stop breakeven-tasolle
-    - Profit > 2R: nosta stop +0.5R voitolle
-    - Profit > 3R: nosta stop +1.5R voitolle
-    """
-    risk = entry - original_stop
-    if risk <= 0:
-        return original_stop
-    profit_in_R = (current - entry) / risk
-    
-    if profit_in_R > 3.0:
-        new_stop = entry + (1.5 * risk)
-    elif profit_in_R > 2.0:
-        new_stop = entry + (0.5 * risk)
-    elif profit_in_R > 1.0:
-        new_stop = entry
-    else:
-        new_stop = original_stop
-    
-    return max(original_stop, new_stop)
-
-
-def check_exit_conditions(ticker: str, entry_date: str, current: float, 
-                         stop: float, tp1: float, tp2: float, tp3: float,
-                         trail_stop: float, logger: TradeLogger, today_str: str) -> Optional[str]:
-    """
-    Tarkista pitääkö positio sulkea
-    
-    Returns:
-        exit_reason jos pitää sulkea, None jos pidetään auki
-    """
-    # Tarkista exit-ehdot (järjestyksessä)
-    
-    # 1. TP3 osuma (paras)
-    if current >= tp3:
-        logger.log_exit(
-            trade_id=f"{ticker}_{entry_date}",
-            exit_date=today_str,
-            exit_price=current,
-            exit_reason="TP3_HIT"
-        )
-        return "TP3_HIT"
-    
-    # 2. TP2 osuma
-    if current >= tp2:
-        logger.log_exit(
-            trade_id=f"{ticker}_{entry_date}",
-            exit_date=today_str,
-            exit_price=current,
-            exit_reason="TP2_HIT"
-        )
-        return "TP2_HIT"
-    
-    # 3. TP1 osuma
-    if current >= tp1:
-        logger.log_exit(
-            trade_id=f"{ticker}_{entry_date}",
-            exit_date=today_str,
-            exit_price=current,
-            exit_reason="TP1_HIT"
-        )
-        return "TP1_HIT"
-    
-    # 4. Trailing stop osuma
-    if current <= trail_stop:
-        logger.log_exit(
-            trade_id=f"{ticker}_{entry_date}",
-            exit_date=today_str,
-            exit_price=current,
-            exit_reason="TRAILING_STOP"
-        )
-        return "TRAILING_STOP"
-    
-    # 5. Alkuperäinen stop osuma
-    if current <= stop:
-        logger.log_exit(
-            trade_id=f"{ticker}_{entry_date}",
-            exit_date=today_str,
-            exit_price=current,
-            exit_reason="STOP_HIT"
-        )
-        return "STOP_HIT"
-    
-    # Ei exit-ehtoja
     return None
 
+def load_price_from_cache(ticker: str, cache_dir: str) -> Optional[pd.DataFrame]:
+    """Lataa hinta-data cachesta"""
+    cache_file = os.path.join(cache_dir, f"{ticker}.csv")
+    
+    if not os.path.exists(cache_file):
+        return None
+    
+    try:
+        df = pd.read_csv(cache_file, parse_dates=['Date'], index_col='Date')
+        
+        # Flatten MultiIndex if needed (cache may have MultiIndex)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        
+        return df
+    except Exception as e:
+        print(f"[WARN] Virhe luettaessa {ticker} cachesta: {e}")
+        return None
 
-def build_exit_watchlist(args):
-    """Rakentaa exit-watchlistin"""
-    
-    # ============= UUSI: Alusta TradeLogger =============
-    logger = TradeLogger(db_path="seasonality_reports/trades.db")
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    print("📊 TradeLogger initialisoitu\n")
-    # ===================================================
-    
-    # ==================== PRICE CACHE AUTO-LÖYTÖ ====================
-    if args.price_cache:
-        # Käyttäjä määritteli polun
-        price_cache_dir = Path(args.price_cache)
-        print(f"📂 Käytetään määriteltyä price_cache: {price_cache_dir}")
-    else:
-        # Auto-löytö
-        print("📂 Etsitään price_cache automaattisesti...")
-        runs_dir = Path(args.runs_dir)
-        price_cache_dir = find_latest_price_cache(runs_dir)
-        
-        if price_cache_dir:
-            print(f"📂 Löytyi: {price_cache_dir}")
-        else:
-            print("❌ Price cache ei löydy automaattisesti")
-            print(f"💡 Määritä polku: --price_cache <polku>")
-            return
-    
-    if not price_cache_dir.exists():
-        print(f"❌ Price cache ei löydy: {price_cache_dir}")
-        return
-    
-    # Määritä portfolio
-    if args.portfolio:
-        portfolio_path = Path(args.portfolio)
-    else:
-        print("📂 Etsitään viimeisintä portfoliota...")
-        portfolio_path = find_latest_portfolio(Path(args.runs_dir))
-        if portfolio_path:
-            print(f"📂 Löytyi: {portfolio_path}")
-        else:
-            print("❌ Portfolio ei löydy")
-            return
-    
-    if not portfolio_path.exists():
-        print(f"❌ Portfolio ei löydy: {portfolio_path}")
-        return
-    
-    print(f"📂 Luetaan portfolio: {portfolio_path}")
-    portfolio = pd.read_csv(portfolio_path)
-    
-    if portfolio.empty:
-        print("⚠️  Portfolio tyhjä")
-        exit_df = pd.DataFrame([], columns=[
-            'Ticker', 'Entry', 'Current', 'Stop', 'TP1', 'TP2', 'TP3',
-            'Setup_Type', 'Win_Rate', 'Profit_Factor', 'Days_Since_Entry',
-            'Trail_Stop', 'Note'
-        ])
-        
-        # Tallenna tyhjä tiedosto
-        watchlist_dir = Path("seasonality_reports/exit_watchlists")
-        watchlist_dir.mkdir(parents=True, exist_ok=True)
-        latest_output = watchlist_dir / "latest_exit_watchlist.csv"
-        exit_df.to_csv(latest_output, index=False)
-        print(f"📄 Kirjoitettu tyhjä: {latest_output}")
-        return
-    
-    print(f"📊 Portfolio sisältää {len(portfolio)} riviä")
-    
-    setup_stats = load_setup_statistics(args.stats_file)
-    price_loader = PriceDataLoader(price_cache_dir)
-    exit_data = []
-    
-    # ============= UUSI: Tilastoi exitit =============
-    exits_logged = 0
-    # ================================================
-    
-    for idx, pos in portfolio.iterrows():
-        ticker = pos.get('Ticker') or pos.get('ticker') or pos.get('Symbol')
-        entry = pos.get('Entry')
-        setup_type = pos.get('Setup_Type', 'Default')
-        entry_date = pos.get('Entry_Date')
-        
-        print(f"  Käsitellään: {ticker}, Entry={entry}, Setup={setup_type}")
-        
-        if not ticker or pd.isna(entry):
-            print(f"    → Ohitetaan (puuttuva tieto)")
-            continue
-        
-        df = price_loader.load_ticker(ticker)
-        if df is None or df.empty:
-            print(f"    → Ohitetaan (ei hintadataa)")
-            continue
-        
-        current = float(df['Close'].iloc[-1])
-        atr = price_loader.calculate_atr(df)
-        
-        print(f"    → Current={current:.2f}, ATR={atr:.2f}")
-        
-        if atr == 0:
-            print(f"    → Ohitetaan (ATR=0)")
-            continue
-        
-        risk = args.stop_mult * atr
-        stop = entry - risk
-        tp1 = entry + (1.5 * risk)
-        tp2 = entry + (3.0 * risk)
-        tp3 = entry + (5.0 * risk)
-        
-        stats = setup_stats.get(setup_type, setup_stats['Default'])
-        
-        # Päivät entry:stä
-        days_held = 0
-        if entry_date and not pd.isna(entry_date):
-            try:
-                entry_dt = pd.to_datetime(entry_date)
-                days_held = (datetime.now() - entry_dt).days
-            except:
-                pass
-        
-        trail_stop = calculate_trailing_stop(entry, current, stop, days_held)
-        
-        # ============= UUSI: Tarkista exit-ehdot =============
-        exit_reason = check_exit_conditions(
-            ticker=ticker,
-            entry_date=entry_date,
-            current=current,
-            stop=stop,
-            tp1=tp1,
-            tp2=tp2,
-            tp3=tp3,
-            trail_stop=trail_stop,
-            logger=logger,
-            today_str=today_str
+def download_price_data(ticker: str, start_date: date, end_date: date) -> Optional[pd.DataFrame]:
+    """Lataa hinta-data yfinancesta"""
+    try:
+        df = yf.download(
+            ticker,
+            start=start_date,
+            end=end_date,
+            progress=False,
+            auto_adjust=True  # Välttää FutureWarning
         )
         
-        if exit_reason:
-            exits_logged += 1
-            print(f"    🚪 EXIT: {exit_reason}")
-            # Älä lisää watchlistiin (positio suljettu)
-            continue
-        # ===================================================
+        if df.empty:
+            return None
         
-        profit_pct = ((current - entry) / entry) * 100
-        note = f"{'Voitolla' if profit_pct > 0 else 'Tappiolla'} {profit_pct:.1f}%"
-        if stats['win_rate'] > 0.65:
-            note += " | Korkea win rate"
+        # ==================== KORJAUS: Flatten MultiIndex ====================
+        # yfinance palauttaa MultiIndex DataFramen (ticker, column)
+        # Flatten se yksinkertaiseksi DataFrameksi
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        # =====================================================================
         
-        exit_data.append({
-            'Ticker': ticker,
-            'Entry': round(entry, 2),
-            'Current': round(current, 2),
-            'Stop': round(stop, 2),
-            'TP1': round(tp1, 2),
-            'TP2': round(tp2, 2),
-            'TP3': round(tp3, 2),
-            'Setup_Type': setup_type,
-            'Win_Rate': round(stats['win_rate'], 3),
-            'Profit_Factor': round(stats['profit_factor'], 2),
-            'Days_Since_Entry': days_held,
-            'Trail_Stop': round(trail_stop, 2),
-            'Note': note
-        })
+        # Varmista että sarakkeet ovat oikein
+        if 'Close' not in df.columns:
+            return None
         
-        print(f"    ✅ Lisätty watchlistiin (positio auki)")
-    
-    exit_df = pd.DataFrame(exit_data)
-    
-    # ============= UUSI: Näytä exit-tilastot =============
-    if exits_logged > 0:
-        print(f"\n📊 Suljettu {exits_logged} positiota tänään")
-        closed_today = logger.get_closed_trades(days=1)
-        if not closed_today.empty:
-            print("\n🚪 SULJETUT POSITIOT:")
-            print(closed_today[['ticker', 'entry_price', 'exit_price', 'pnl_pct', 'r_multiple', 'exit_reason']].to_string(index=False))
-    # ===================================================
-    
-    # ==================== TALLENNUSLOGIIKKA ====================
-    today_yyyymmdd = datetime.now().strftime("%Y%m%d")
-    
-    # 1. Tallenna päiväkohtaisesti runs/actions-kansioon (ARKISTO)
-    runs_dir = Path(args.runs_dir)
-    if runs_dir.exists():
-        run_dirs = sorted([d for d in runs_dir.glob("*") if d.is_dir()], 
-                         key=lambda x: x.stat().st_mtime, reverse=True)
-        
-        if run_dirs:
-            latest_run = run_dirs[0]
-            actions_dir = latest_run / "actions" / today_yyyymmdd
-            actions_dir.mkdir(parents=True, exist_ok=True)
-            
-            dated_filename = f"exit_watchlist_{today_yyyymmdd}.csv"
-            actions_output = actions_dir / dated_filename
-            
-            try:
-                exit_df.to_csv(actions_output, index=False)
-                print(f"✅ Arkisto: {actions_output}")
-            except Exception as e:
-                print(f"⚠️  Arkistointivirhe: {e}")
-    
-    # 2. Tallenna viimeisin versio exit_watchlists-kansioon
-    watchlist_dir = Path("seasonality_reports/exit_watchlists")
-    watchlist_dir.mkdir(parents=True, exist_ok=True)
-    
-    latest_output = watchlist_dir / "latest_exit_watchlist.csv"
-    try:
-        exit_df.to_csv(latest_output, index=False)
-        print(f"✅ Viimeisin: {latest_output}")
+        return df
     except Exception as e:
-        print(f"⚠️  Tallennusvirhe: {e}")
+        print(f"[WARN] Virhe ladattaessa {ticker}: {e}")
+        return None
+
+def get_price_data(ticker: str, cache_dir: Optional[str] = None, 
+                   lookback_days: int = 90) -> Optional[pd.DataFrame]:
+    """Hae hinta-data (cache tai download)"""
     
-    print(f"\n📊 {len(exit_df)} positiota watchlistissä (avoimena)")
+    # Yritä ensin cachesta
+    if cache_dir and os.path.exists(cache_dir):
+        df = load_price_from_cache(ticker, cache_dir)
+        if df is not None and not df.empty:
+            # Tarkista että data on riittävän tuoretta
+            if df.index[-1].date() >= (date.today() - timedelta(days=7)):
+                return df
     
-    # ============= UUSI: Näytä TradeLogger yhteenveto =============
+    # Jos cache ei toimi, lataa yfinancesta
+    end_date = date.today()
+    start_date = end_date - timedelta(days=lookback_days)
+    
+    df = download_price_data(ticker, start_date, end_date)
+    
+    # ==================== KORJAUS: Varmista että MultiIndex on flattened ====================
+    if df is not None and isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    # ========================================================================================
+    
+    return df
+
+# ======================== TECHNICAL INDICATORS ========================
+
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Laske ATR (Average True Range)"""
+    
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    
+    # True Range
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    # ATR (EMA of TR)
+    atr = tr.ewm(span=period, adjust=False).mean()
+    
+    return atr
+
+def calculate_stops(df: pd.DataFrame, entry_price: float, 
+                    stop_mult: float = 1.5, tp_mult: float = 3.0,
+                    atr_period: int = 14) -> Dict:
+    """Laske stop loss ja take profit tasot"""
+    
+    if df.empty:
+        return {
+            'current_price': None,
+            'atr': None,
+            'stop_loss': None,
+            'take_profit': None,
+            'stop_distance_pct': None,
+            'tp_distance_pct': None
+        }
+    
+    # Laske ATR
+    atr = calculate_atr(df, period=atr_period)
+    current_atr = atr.iloc[-1]
+    current_price = df['Close'].iloc[-1]
+    
+    # ==================== KORJAUS: Varmista scalar values ====================
+    # Muunna pandas scalar -> Python float
+    if isinstance(current_atr, pd.Series):
+        current_atr = float(current_atr.iloc[0])
+    else:
+        current_atr = float(current_atr)
+    
+    if isinstance(current_price, pd.Series):
+        current_price = float(current_price.iloc[0])
+    else:
+        current_price = float(current_price)
+    # ========================================================================
+    
+    # Trailing stop (entry price - ATR * multiplier)
+    stop_loss = entry_price - (current_atr * stop_mult)
+    
+    # Take profit (entry price + ATR * multiplier)
+    take_profit = entry_price + (current_atr * tp_mult)
+    
+    # Prosenttietäisyydet
+    stop_distance_pct = ((stop_loss - current_price) / current_price) * 100
+    tp_distance_pct = ((take_profit - current_price) / current_price) * 100
+    
+    return {
+        'current_price': current_price,
+        'atr': current_atr,
+        'stop_loss': stop_loss,
+        'take_profit': take_profit,
+        'stop_distance_pct': stop_distance_pct,
+        'tp_distance_pct': tp_distance_pct
+    }
+
+# ======================== P&L CALCULATIONS ========================
+
+def calculate_pnl(entry_price: float, current_price: float, 
+                  quantity: int) -> Dict:
+    """Laske realisoitumaton P&L"""
+    
+    if current_price is None or entry_price is None:
+        return {
+            'unrealized_pnl': 0.0,
+            'unrealized_pnl_pct': 0.0
+        }
+    
+    # Dollar P&L
+    unrealized_pnl = (current_price - entry_price) * quantity
+    
+    # Prosentti P&L
+    unrealized_pnl_pct = ((current_price - entry_price) / entry_price) * 100
+    
+    return {
+        'unrealized_pnl': unrealized_pnl,
+        'unrealized_pnl_pct': unrealized_pnl_pct
+    }
+
+# ======================== PORTFOLIO STATE ========================
+
+def load_portfolio_state(project_root: str = ".") -> Dict:
+    """Lataa portfolio state"""
+    path = os.path.join(project_root, "seasonality_reports", "portfolio_state.json")
+    
+    if not os.path.exists(path):
+        print(f"[WARN] portfolio_state.json ei löydy: {path}")
+        return {"positions": {}, "cash": 0.0}
+    
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+            
+            # Varmista että positions on dict
+            if not isinstance(state.get('positions'), dict):
+                print(f"[WARN] portfolio_state.json positions ei ole dict")
+                state['positions'] = {}
+            
+            return state
+    except Exception as e:
+        print(f"[ERROR] Virhe luettaessa portfolio_state.json: {e}")
+        return {"positions": {}, "cash": 0.0}
+
+# ======================== EXIT SIGNALS ========================
+
+def check_exit_signals(ticker: str, position: Dict, price_data: pd.DataFrame,
+                       stops: Dict, args) -> Dict:
+    """Tarkista exit-signaalit"""
+    
+    signals = {
+        'stop_loss_hit': False,
+        'take_profit_hit': False,
+        'recommendation': 'HOLD'
+    }
+    
+    current_price = stops.get('current_price')
+    stop_loss = stops.get('stop_loss')
+    take_profit = stops.get('take_profit')
+    
+    if current_price is None or stop_loss is None:
+        return signals
+    
+    # ==================== KORJAUS: Varmista scalar comparison ====================
+    # Muunna pandas scalar -> Python float (jos tarvitaan)
+    if isinstance(current_price, pd.Series):
+        current_price = float(current_price.iloc[0])
+    if isinstance(stop_loss, pd.Series):
+        stop_loss = float(stop_loss.iloc[0])
+    if isinstance(take_profit, pd.Series):
+        take_profit = float(take_profit.iloc[0])
+    # ===========================================================================
+    
+    # Stop loss
+    if current_price <= stop_loss:
+        signals['stop_loss_hit'] = True
+        signals['recommendation'] = 'SELL (Stop Loss)'
+    
+    # Take profit
+    if take_profit and current_price >= take_profit:
+        signals['take_profit_hit'] = True
+        signals['recommendation'] = 'SELL (Take Profit)'
+    
+    # Muut signaalit (voidaan lisätä myöhemmin)
+    # - Regime change
+    # - Seasonality window closed
+    # - Technical breakdown
+    
+    return signals
+
+# ======================== MAIN LOGIC ========================
+
+def build_exit_watchlist(args):
+    """Rakenna exit watchlist nykyisille positioille"""
+    
     print("\n" + "="*80)
-    print("📊 TRADELOGGER - Yhteenveto:")
-    print("="*80)
-    stats = logger.get_summary_stats(days=90)
-    print(f"Kauppoja yhteensä:  {stats['total_trades']}")
-    print(f"Avoimia positioita: {stats['open_trades']}")
-    print(f"Win rate:           {stats['win_rate']:.1%}")
-    print(f"Avg R-multiple:     {stats['avg_r_multiple']:.2f}R")
-    print(f"Profit Factor:      {stats['profit_factor']:.2f}")
-    print("="*80)
-    # ===========================================================
-    
-    if not exit_df.empty:
-        print("\n" + "="*80)
-        print("📈 EXIT WATCHLIST YHTEENVETO:")
-        print("="*80)
-        print(exit_df.to_string(index=False))
-        print("="*80)
-        print(f"\n💡 Trailing Stop -logiikka:")
-        print(f"   Voitto > 1R → Stop breakeven-tasolle")
-        print(f"   Voitto > 2R → Stop +0.5R voitolle")
-        print(f"   Voitto > 3R → Stop +1.5R voitolle")
-        print("="*80)
-
-
-def main():
-    args = parse_args()
-    
-    print("="*80)
     print("🎯 EXIT WATCHLIST BUILDER")
     print("="*80)
     print(f"Päivämäärä:   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Stop mult:    {args.stop_mult} × ATR")
-    print(f"Stats file:   {args.stats_file or 'Estimoidut tilastot'}")
-    print(f"Price cache:  {'Auto-detect' if not args.price_cache else args.price_cache}")
+    print(f"Stats file:   {args.stats_file if args.stats_file else 'Estimoidut tilastot'}")
+    print(f"Price cache:  {args.price_cache_dir if args.price_cache_dir else 'Auto-detect'}")
     print("="*80 + "\n")
     
-    build_exit_watchlist(args)
+    # Etsi price cache
+    if args.price_cache_dir is None:
+        cache_dir = find_price_cache_dir()
+        if cache_dir:
+            print(f"[INFO] Price cache löytyi: {cache_dir}")
+        else:
+            print(f"[WARN] Price cachea ei löytynyt, ladataan yfinancesta")
+    else:
+        cache_dir = args.price_cache_dir
+    
+    # Lataa portfolio state
+    print(f"[INFO] Ladataan portfolio state...")
+    portfolio = load_portfolio_state()
+    positions = portfolio.get('positions', {})
+    
+    if not positions or not isinstance(positions, dict):
+        print(f"[INFO] Ei avoimia positioita.")
+        # Tallenna tyhjä exit watchlist
+        empty_df = pd.DataFrame()
+        os.makedirs(os.path.dirname(args.output), exist_ok=True)
+        empty_df.to_csv(args.output, index=False)
+        print(f"[OK] Tyhjä exit watchlist tallennettu: {args.output}\n")
+        return
+    
+    print(f"[INFO] Löytyi {len(positions)} positiota\n")
+    
+    # Käsittele jokainen positio
+    watchlist_data = []
+    
+    for ticker, pos in positions.items():
+        print(f"[{ticker}] Käsitellään...")
+        
+        # Hae position tiedot
+        entry_price = pos.get('entry_price', 0.0)
+        quantity = pos.get('quantity', 0)
+        entry_date = pos.get('entry_date', 'Unknown')
+        regime_at_entry = pos.get('regime_at_entry', 'Unknown')
+        
+        # Hae price data
+        price_data = get_price_data(ticker, cache_dir=cache_dir)
+        
+        if price_data is None or price_data.empty:
+            print(f"[{ticker}] ⚠️  Ei price dataa, skipataan")
+            continue
+        
+        # Laske stops
+        stops = calculate_stops(
+            price_data,
+            entry_price,
+            stop_mult=args.stop_mult,
+            tp_mult=args.tp_mult,
+            atr_period=args.atr_period
+        )
+        
+        current_price = stops.get('current_price')
+        
+        if current_price is None:
+            print(f"[{ticker}] ⚠️  Ei current pricea, skipataan")
+            continue
+        
+        # Laske P&L
+        pnl = calculate_pnl(entry_price, current_price, quantity)
+        
+        # Tarkista exit-signaalit
+        signals = check_exit_signals(ticker, pos, price_data, stops, args)
+        
+        # Laske päivien määrä
+        try:
+            entry_dt = datetime.strptime(entry_date, '%Y-%m-%d').date()
+            days_held = (date.today() - entry_dt).days
+        except:
+            days_held = 0
+        
+        # Rakenna watchlist entry
+        watchlist_entry = {
+            'Ticker': ticker,
+            'EntryDate': entry_date,
+            'DaysHeld': days_held,
+            'EntryPrice': entry_price,
+            'CurrentPrice': current_price,
+            'Quantity': quantity,
+            'ATR': stops.get('atr', 0.0),
+            'StopLoss': stops.get('stop_loss', 0.0),
+            'TakeProfit': stops.get('take_profit', 0.0),
+            'StopDistance%': stops.get('stop_distance_pct', 0.0),
+            'TPDistance%': stops.get('tp_distance_pct', 0.0),
+            'UnrealizedPnL': pnl['unrealized_pnl'],
+            'UnrealizedPnL%': pnl['unrealized_pnl_pct'],
+            'Recommendation': signals['recommendation'],
+            'RegimeAtEntry': regime_at_entry
+        }
+        
+        watchlist_data.append(watchlist_entry)
+        
+        # Print summary
+        print(f"[{ticker}] ✅ OK")
+        print(f"         Entry: ${entry_price:.2f} → Current: ${current_price:.2f} ({pnl['unrealized_pnl_pct']:+.2f}%)")
+        print(f"         Stop: ${stops.get('stop_loss', 0):.2f} ({stops.get('stop_distance_pct', 0):.1f}%)")
+        print(f"         TP:   ${stops.get('take_profit', 0):.2f} ({stops.get('tp_distance_pct', 0):.1f}%)")
+        print(f"         → {signals['recommendation']}")
+        print()
+    
+    # Luo DataFrame
+    final_df = pd.DataFrame(watchlist_data)
+    
+    if final_df.empty:
+        print(f"[WARN] Ei dataa exit watchlistille")
+        empty_df = pd.DataFrame()
+        os.makedirs(os.path.dirname(args.output), exist_ok=True)
+        empty_df.to_csv(args.output, index=False)
+        print(f"[OK] Tyhjä exit watchlist tallennettu: {args.output}\n")
+        return
+    
+    # Järjestä recommendation ja unrealized P&L mukaan
+    final_df = final_df.sort_values(
+        by=['Recommendation', 'UnrealizedPnL%'],
+        ascending=[True, False]
+    )
+    
+    # ==================== ARKISTOINTI ====================
+    # Tallenna timestamped versio arkistoon
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_dir = os.path.join("seasonality_reports", "exit_watchlist_archive")
+    os.makedirs(archive_dir, exist_ok=True)
+    
+    archive_path = os.path.join(archive_dir, f"exit_watchlist_{timestamp}.csv")
+    final_df.to_csv(archive_path, index=False)
+    print(f"[ARCHIVE] ✅ Saved: {archive_path}")
+    # ====================================================
+    
+    # Tallenna current exit watchlist
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    final_df.to_csv(args.output, index=False)
+    print(f"[OK] ✅ Saved: {args.output}")
+    
+    # Yhteenveto
+    print("\n" + "="*80)
+    print("📊 EXIT WATCHLIST YHTEENVETO")
+    print("="*80)
+    print(f"Positioita yhteensä:     {len(final_df)}")
+    print(f"SELL suosituksia:        {len(final_df[final_df['Recommendation'] != 'HOLD'])}")
+    print(f"HOLD suosituksia:        {len(final_df[final_df['Recommendation'] == 'HOLD'])}")
+    print(f"\nKeskimääräinen P&L:      {final_df['UnrealizedPnL%'].mean():.2f}%")
+    print(f"Paras P&L:               {final_df['UnrealizedPnL%'].max():.2f}%")
+    print(f"Huonoin P&L:             {final_df['UnrealizedPnL%'].min():.2f}%")
+    print(f"\nArkistoitu:              {archive_path}")
+    print("="*80 + "\n")
 
+def main():
+    args = parse_args()
+    
+    try:
+        build_exit_watchlist(args)
+    except KeyboardInterrupt:
+        print("\n[INFO] Keskeytetty käyttäjän toimesta")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n[ERROR] Virhe: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

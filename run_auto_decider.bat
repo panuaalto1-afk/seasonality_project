@@ -1,27 +1,38 @@
 @echo off
-REM Auto Decider - Kauppapäätösten automaatio
-REM Ajetaan päivittäin klo 15:55
-
 cd /d C:\Users\panua\seasonality_project
-call .venv\Scripts\activate.bat
 
-echo ============================================================
-echo AUTO DECIDER - %date% %time%
-echo ============================================================
+for /f %%i in ('powershell -Command "Get-Date -Format yyyy-MM-dd"') do set TODAY=%%i
 
-python auto_decider.py
+echo ========================================
+echo AUTO DECIDER - %TODAY%
+echo ========================================
 
-if %ERRORLEVEL% EQU 0 (
-    echo [SUCCESS] Auto decider completed successfully
-) else (
-    echo [ERROR] Auto decider failed with error code %ERRORLEVEL%
+set "RUNS_DIR=seasonality_reports\runs"
+set "LATEST_RUN="
+
+for /f "delims=" %%D in ('dir /b /ad /o-n "%RUNS_DIR%"') do (
+    set "LATEST_RUN=%%D"
+    goto :found_run
 )
 
-echo ============================================================
-echo Completed at %time%
-echo ============================================================
+:found_run
+if "%LATEST_RUN%"=="" (
+    echo [ERROR] Ei loytynyt run-kansiota!
+    exit /b 1
+)
 
-REM Tallenna loki
-echo [%date% %time%] Auto decider completed >> logs\auto_decider.log
+set "RUN_ROOT=%RUNS_DIR%\%LATEST_RUN%"
+set "PRICE_CACHE=%RUN_ROOT%\price_cache"
 
-pause
+echo [INFO] Run root:     %RUN_ROOT%
+echo [INFO] Price cache:  %PRICE_CACHE%
+echo [INFO] Today:        %TODAY%
+echo ========================================
+
+python auto_decider.py --project_root "." --universe_csv "seasonality_reports/constituents_raw.csv" --run_root "%RUN_ROOT%" --price_cache_dir "%PRICE_CACHE%" --today "%TODAY%" --commit 0
+
+echo ========================================
+echo [INFO] Auto decider valmis: %ERRORLEVEL%
+echo ========================================
+
+exit /b %ERRORLEVEL%

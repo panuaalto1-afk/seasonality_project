@@ -1,498 +1,597 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-auto_decider.py - Regime-Adaptive Automated Trading Decision System
+auto_decider.py
+===============
+Automated trade decision maker for seasonality project.
 
-Muodostaa action-planin, trade- & sell-listat sekä portfolio_after_sim.csv:n
-käyttäen regime-spesifisiä strategioita.
+Analyzes ML-generated signals, applies regime-specific strategies,
+and generates actionable trade recommendations.
 
-VERSION 2.0:
-- Regime detection integration
-- Regime-specific strategies
-- Adaptive position sizing
-- Dynamic filtering based on market regime
+Usage:
+    python auto_decider.py --project_root "." --universe_csv "..." --run_root "..." --price_cache_dir "..." --today "2025-11-02" --commit 0
+
+Features:
+- Regime-aware strategy selection
+- Sector rotation filtering
+- Position sizing based on regime
+- Automatic email notifications
 """
 
+import argparse
 import os
 import sys
 import json
-import argparse
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime, timedelta, date
+from typing import List, Dict, Optional
 
 import pandas as pd
 import numpy as np
 
-# ==================== LISÄYKSET: Regime system ====================
-from regime_detector import RegimeDetector
-from regime_predictor import RegimePredictor
-from regime_strategies import RegimeStrategy
-# ==================================================================
+# Regime system imports
+try:
+    from regime_detector import RegimeDetector
+    from regime_strategies import RegimeStrategy
+    REGIME_AVAILABLE = True
+except ImportError:
+    REGIME_AVAILABLE = False
+    print("[WARN] Regime modules not available. Running in basic mode.")
 
-# ------------------------------------------------------------
-# Argparse + polkujen varmistus
-# ------------------------------------------------------------
+# ======================== ARGUMENT PARSING ========================
 
 def parse_args():
-    ap = argparse.ArgumentParser(
-        description="Auto Decider – regime-adaptive trading decisions."
+    p = argparse.ArgumentParser(
+        description="Automated trade decision maker.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    ap.add_argument("--project_root", required=True, help="Projektin juuripolku")
-    ap.add_argument("--universe_csv", required=True, help="Universumi CSV")
-    ap.add_argument("--run_root", required=True, help="Käytettävä RUN-kansio")
-    ap.add_argument("--price_cache_dir", required=True, help="Käytettävä price_cache-kansio")
-    ap.add_argument("--today", required=True, help="Päivä YYYY-MM-DD")
-    ap.add_argument(
-        "--portfolio_state",
-        default=None,
-        help="Salkun tilan JSON"
-    )
-    ap.add_argument("--commit", type=int, default=0, help="1 = kirjoita portfolio_state.json; 0 = dry-run")
-    ap.add_argument("--config", default=None, help="(valinn.) polku asetustiedostolle")
-    ap.add_argument("--no_new_positions", action="store_true", help="Estä uudet positiot")
-    ap.add_argument("--vintage_cutoff", default=None, help="(valinn.) aikaraja datalle")
-    
-    # ==================== UUSI: Base position size ====================
-    ap.add_argument("--base_position_size", type=float, default=1000.0, 
-                   help="Base position size in $ (default: 1000)")
-    # ==================================================================
+    p.add_argument("--project_root", type=str, required=True,
+                   help="Project root directory")
+    p.add_argument("--universe_csv", type=str, required=True,
+                   help="Path to universe CSV (constituents)")
+    p.add_argument("--run_root", type=str, required=True,
+                   help="Run root directory (contains reports/)")
+    p.add_argument("--price_cache_dir", type=str, required=True,
+                   help="Price cache directory")
+    p.add_argument("--today", type=str, default=None,
+                   help="Date YYYY-MM-DD (defaults to today)")
+    p.add_argument("--commit", type=int, default=0, choices=[0, 1],
+                   help="0=dry-run, 1=commit changes to portfolio_state.json")
+    p.add_argument("--max_positions", type=int, default=8,
+                   help="Maximum number of open positions")
+    p.add_argument("--position_size", type=float, default=1000.0,
+                   help="Base position size in dollars")
+    p.add_argument("--no_new_positions", action="store_true",
+                   help="Prevent opening new positions (exit-only mode)")
+    return p.parse_args()
 
-    args = ap.parse_args()
+# ======================== HELPER FUNCTIONS ========================
 
-    # Oletuspolku portfolio_state:lle
-    if not args.portfolio_state:
-        args.portfolio_state = os.path.join(
-            os.path.abspath(args.project_root),
-            "seasonality_reports",
-            "portfolio_state.json",
-        )
+def _as_date(s: Optional[str]) -> date:
+    if s is None:
+        return date.today()
+    return datetime.strptime(s, "%Y-%m-%d").date()
 
-    # Peruspolut ja validoinnit
-    args.project_root = os.path.abspath(args.project_root)
-    args.run_root = os.path.abspath(args.run_root)
-    args.price_cache_dir = os.path.abspath(args.price_cache_dir)
-    args.universe_csv = os.path.abspath(args.universe_csv)
-    args.portfolio_state = os.path.abspath(args.portfolio_state)
+def _ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
 
-    if not os.path.isdir(args.run_root):
-        raise FileNotFoundError(f"run_root puuttuu: {args.run_root}")
-    if not os.path.isdir(args.price_cache_dir):
-        raise FileNotFoundError(f"price_cache_dir puuttuu: {args.price_cache_dir}")
-    if not os.path.isfile(args.universe_csv):
-        raise FileNotFoundError(f"universe_csv puuttuu: {args.universe_csv}")
-
-    # actions/YYYMMDD
-    ymd = args.today.replace("-", "")
-    args.actions_dir = os.path.join(args.run_root, "actions", ymd)
-    os.makedirs(args.actions_dir, exist_ok=True)
-
-    print(f"[INFO] Using RUN_ROOT : {args.run_root}")
-    print(f"[INFO] Using PRICES  : {args.price_cache_dir}")
-    print(f"[INFO] Using UNIVERSE: {args.universe_csv}")
-    print(f"[INFO] PortfolioState: {args.portfolio_state}")
-    print(f"[INFO] Actions dir   : {args.actions_dir}")
-
-    return args
-
-
-# ------------------------------------------------------------
-# Helper functions
-# ------------------------------------------------------------
-
-def _safe_read_csv(path: str) -> pd.DataFrame:
-    """Lukee CSV:n yrittäen automaattisesti erotinta (,/;)."""
-    if not os.path.exists(path):
-        return pd.DataFrame()
-    try:
-        return pd.read_csv(path)
-    except Exception:
-        return pd.read_csv(path, sep=";")
-
-def _write_csv(df: pd.DataFrame, path: str):
-    if df is None:
-        return
-    df.to_csv(path, index=False)
-
-def _load_portfolio_state(path_json: str) -> dict:
-    if os.path.isfile(path_json):
-        try:
-            with open(path_json, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"positions": [], "cash": 100000.0}
-
-def _save_portfolio_state(state: dict, path_json: str):
-    Path(os.path.dirname(path_json)).mkdir(parents=True, exist_ok=True)
-    with open(path_json, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-
-def _find_latest_signals_file(run_root: str, today: str) -> str:
-    """
-    Etsi viimeisin top_long_candidates_GATED_{date}.csv
-    """
+def _find_latest_gated_csv(run_root: str, d: date) -> Optional[str]:
+    """Find latest top_long_candidates_GATED_*.csv"""
+    tag = d.strftime("%Y-%m-%d")
     reports_dir = os.path.join(run_root, "reports")
-    if not os.path.isdir(reports_dir):
-        return None
     
-    # Etsi today:n tiedosto
-    pattern = f"top_long_candidates_GATED_{today}.csv"
+    pattern = f"top_long_candidates_GATED_{tag}.csv"
     path = os.path.join(reports_dir, pattern)
     
     if os.path.isfile(path):
         return path
     
-    # Jos ei löydy, etsi viimeisin
-    import glob
-    files = glob.glob(os.path.join(reports_dir, "top_long_candidates_GATED_*.csv"))
-    if files:
-        return max(files, key=os.path.getmtime)
+    # Fallback: try without GATED
+    pattern2 = f"top_long_candidates_RAW_{tag}.csv"
+    path2 = os.path.join(reports_dir, pattern2)
+    
+    if os.path.isfile(path2):
+        print(f"[WARN] Using RAW candidates (GATED not found)")
+        return path2
     
     return None
 
-# ------------------------------------------------------------
-# Trading logic with regime adaptation
-# ------------------------------------------------------------
-
-def build_trade_candidates(args, regime_strategy: RegimeStrategy, regime_data: dict) -> pd.DataFrame:
-    """
-    Rakenna kaupankäyntiehdotukset regime-strategian mukaan
+def load_portfolio_state(project_root: str) -> Dict:
+    """Load current portfolio state"""
+    path = os.path.join(project_root, "seasonality_reports", "portfolio_state.json")
     
-    Args:
-        args: Command line arguments
-        regime_strategy: RegimeStrategy instance
-        regime_data: Regime detection results
-    
-    Returns:
-        DataFrame with columns: Ticker, Side, Score, Note, PositionSize
-    """
-    # Etsi signaalitiedosto
-    signals_path = _find_latest_signals_file(args.run_root, args.today)
-    
-    if signals_path is None:
-        print("[WARN] No signals file found!")
-        return pd.DataFrame(columns=["Ticker", "Side", "Score", "Note", "PositionSize"])
-    
-    print(f"[INFO] Loading signals from: {signals_path}")
-    signals_df = _safe_read_csv(signals_path)
-    
-    if signals_df.empty:
-        print("[WARN] Signals file is empty!")
-        return pd.DataFrame(columns=["Ticker", "Side", "Score", "Note", "PositionSize"])
-    
-    print(f"[INFO] Loaded {len(signals_df)} signals")
-    
-    # Varmista sarakkeet
-    if 'ticker' not in signals_df.columns and 'Ticker' in signals_df.columns:
-        signals_df['ticker'] = signals_df['Ticker']
-    
-    if 'mom20' not in signals_df.columns:
-        signals_df['mom20'] = signals_df.get('mom20', 0.1)
-    
-    if 'vol20' not in signals_df.columns:
-        signals_df['vol20'] = signals_df.get('vol20', 0.2)
-    
-    if 'ml_score' not in signals_df.columns:
-        # Käytä score_long proxy:na
-        signals_df['ml_score'] = signals_df.get('score_long', 0.75)
-    
-    # ==================== REGIME FILTERING ====================
-    print(f"\n[INFO] Applying {regime_data['regime']} strategy filters...")
-    print(f"  Signals before filtering: {len(signals_df)}")
-    
-    # Hae strategy parametrit
-    strategy_params = regime_strategy.get_position_parameters(args.base_position_size)
-    
-    # Rankingoi ja filtteriä
-    filtered_df = regime_strategy.rank_signals(
-        signals_df,
-        top_n=strategy_params['max_positions']
-    )
-    
-    print(f"  Signals after filtering: {len(filtered_df)}")
-    # ==========================================================
-    
-    if filtered_df.empty:
-        print("[INFO] No signals passed regime filters")
-        return pd.DataFrame(columns=["Ticker", "Side", "Score", "Note", "PositionSize"])
-    
-    # Muodosta trade candidates
-    candidates = []
-    
-    for idx, row in filtered_df.iterrows():
-        ticker = row.get('ticker', row.get('Ticker', ''))
-        score = row.get('composite_score', row.get('score_long', 0.0))
-        
-        candidates.append({
-            'Ticker': ticker,
-            'Side': 'LONG',
-            'Score': float(score),
-            'Note': f"Regime: {regime_data['regime']}, Strategy: {regime_strategy.config['strategy_type']}",
-            'PositionSize': strategy_params['position_size'],
-            'StopMultiplier': strategy_params['stop_multiplier'],
-            'TPMultiplier': strategy_params['tp_multiplier']
-        })
-    
-    result_df = pd.DataFrame(candidates)
-    
-    print(f"\n[INFO] Generated {len(result_df)} trade candidates:")
-    print(f"  Position size: ${strategy_params['position_size']:.0f}")
-    print(f"  Stop mult: {strategy_params['stop_multiplier']:.2f}x")
-    print(f"  TP mult: {strategy_params['tp_multiplier']:.2f}x")
-    
-    return result_df
-
-def build_sell_candidates(args, portfolio_state: dict, regime_data: dict) -> pd.DataFrame:
-    """
-    Rakenna myyntiehdotukset salkun positioista
-    
-    CRISIS regime → Sulje kaikki
-    Muut regimes → Normaali exit-logiikka
-    """
-    positions = portfolio_state.get('positions', [])
-    
-    if not positions:
-        return pd.DataFrame(columns=["Ticker", "Reason"])
-    
-    sells = []
-    
-    # CRISIS: Sulje kaikki
-    if regime_data['regime'] == 'CRISIS':
-        print("[WARN] CRISIS regime detected - suggesting to close all positions")
-        for pos in positions:
-            sells.append({
-                'Ticker': pos.get('ticker', ''),
-                'Reason': 'CRISIS regime - capital preservation'
-            })
-    
-    else:
-        # Normaali exit-logiikka (placeholder)
-        # Tässä voisi olla stop-loss / take-profit / trailing stop logiikka
-        pass
-    
-    return pd.DataFrame(sells)
-
-def simulate_portfolio_after_trades(portfolio_state: dict, buys_df: pd.DataFrame, sells_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Simuloi salkun tila kauppojen jälkeen
-    """
-    positions = portfolio_state.get('positions', []).copy()
-    
-    # Poista myydyt
-    if not sells_df.empty:
-        sold_tickers = set(sells_df['Ticker'].values)
-        positions = [p for p in positions if p.get('ticker', '') not in sold_tickers]
-    
-    # Lisää ostetut
-    if not buys_df.empty:
-        for idx, row in buys_df.iterrows():
-            positions.append({
-                'ticker': row['Ticker'],
-                'side': row['Side'],
-                'size': row.get('PositionSize', 1000.0),
-                'entry_date': datetime.now().strftime('%Y-%m-%d'),
-                'score': float(row.get('Score', 0.0))
-            })
-    
-    # Muunna DataFrame:ksi
-    if positions:
-        result = pd.DataFrame(positions)
-    else:
-        result = pd.DataFrame(columns=["ticker", "side", "size", "entry_date", "score"])
-    
-    return result
-
-def write_action_plan(args, buys_df: pd.DataFrame, sells_df: pd.DataFrame, regime_data: dict):
-    """Kirjoita action plan tekstitiedostoon"""
-    plan = []
-    plan.append("="*80)
-    plan.append("AUTOMATED TRADING DECISION PLAN")
-    plan.append("="*80)
-    plan.append(f"Date: {args.today}")
-    plan.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    plan.append(f"Universe: {os.path.basename(args.universe_csv)}")
-    plan.append("")
-    
-    # ==================== REGIME INFO ====================
-    plan.append("="*80)
-    plan.append("MARKET REGIME")
-    plan.append("="*80)
-    plan.append(f"Regime:     {regime_data['regime']}")
-    plan.append(f"Score:      {regime_data['composite_score']:.4f}")
-    plan.append(f"Confidence: {regime_data['confidence']:.2%}")
-    
-    if 'prediction_5d' in regime_data:
-        plan.append(f"\n5-day forecast: {regime_data['prediction_5d']} ({regime_data.get('prediction_5d_prob', 0):.1%})")
-        plan.append(f"Transition prob: {regime_data.get('transition_prob_5d', 0):.1%}")
-    
-    plan.append("")
-    # =====================================================
-    
-    plan.append("="*80)
-    plan.append("BUY CANDIDATES")
-    plan.append("="*80)
-    if buys_df is not None and len(buys_df):
-        for idx, r in buys_df.iterrows():
-            plan.append(f"{idx+1}. {r.get('Ticker','?')} - Score: {r.get('Score', 0):.3f} - Size: ${r.get('PositionSize', 0):.0f}")
-            plan.append(f"   Note: {r.get('Note', '')}")
-    else:
-        plan.append("(none)")
-    
-    plan.append("")
-    plan.append("="*80)
-    plan.append("SELL CANDIDATES")
-    plan.append("="*80)
-    if sells_df is not None and len(sells_df):
-        for idx, r in sells_df.iterrows():
-            plan.append(f"{idx+1}. {r.get('Ticker','?')} - Reason: {r.get('Reason','')}")
-    else:
-        plan.append("(none)")
-    
-    plan.append("")
-    plan.append("="*80)
-
-    out = os.path.join(args.actions_dir, "action_plan.txt")
-    with open(out, "w", encoding="utf-8") as f:
-        f.write("\n".join(plan))
-    print(f"[OK] Action Plan : {out}")
-
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
-
-def main():
-    args = parse_args()
-    
-    print("\n" + "="*80)
-    print("AUTO DECIDER - REGIME-ADAPTIVE TRADING DECISIONS")
-    print("="*80)
-    print(f"Date: {args.today}")
-    print(f"Base position size: ${args.base_position_size:.0f}")
-    print("="*80 + "\n")
-
-    # ==================== REGIME DETECTION ====================
-    print("\n" + "="*80)
-    print("[STEP] REGIME DETECTION")
-    print("="*80 + "\n")
+    if not os.path.exists(path):
+        print(f"[INFO] No existing portfolio_state.json, starting fresh")
+        return {"positions": {}, "cash": 100000.0, "last_updated": None}
     
     try:
-        # Makro cache
-        macro_cache_dir = os.path.join(
-            args.project_root,
-            "seasonality_reports",
-            "price_cache"
-        )
-        
-        detector = RegimeDetector(
-            macro_price_cache_dir=macro_cache_dir,
-            equity_price_cache_dir=args.price_cache_dir
-        )
-        
-        regime_data = detector.detect_regime(date=args.today)
-        
-        print(f"[INFO] Regime: {regime_data['regime']}")
-        print(f"[INFO] Score: {regime_data['composite_score']:.4f}")
-        print(f"[INFO] Confidence: {regime_data['confidence']:.2%}")
-        
+        with open(path, 'r') as f:
+            state = json.load(f)
+            
+            # Varmista että positions on dict
+            if not isinstance(state.get('positions'), dict):
+                print(f"[WARN] portfolio_state.json positions was not a dict, resetting to empty dict")
+                state['positions'] = {}
+            
+            return state
     except Exception as e:
-        print(f"[ERROR] Regime detection failed: {e}")
-        regime_data = {
+        print(f"[WARN] Failed to load portfolio_state.json: {e}")
+        return {"positions": {}, "cash": 100000.0, "last_updated": None}
+
+def save_portfolio_state(project_root: str, state: Dict):
+    """Save portfolio state"""
+    path = os.path.join(project_root, "seasonality_reports", "portfolio_state.json")
+    
+    try:
+        with open(path, 'w') as f:
+            json.dump(state, f, indent=2)
+        print(f"[OK] Saved portfolio_state.json")
+    except Exception as e:
+        print(f"[ERROR] Failed to save portfolio_state.json: {e}")
+
+def read_candidates(csv_path: str) -> pd.DataFrame:
+    """Read candidate signals from CSV"""
+    try:
+        df = pd.read_csv(csv_path)
+        
+        # Ensure required columns
+        required = ["ticker"]
+        for col in required:
+            if col not in df.columns:
+                print(f"[ERROR] Missing required column: {col}")
+                return pd.DataFrame()
+        
+        return df
+    except Exception as e:
+        print(f"[ERROR] Failed to read {csv_path}: {e}")
+        return pd.DataFrame()
+
+# ======================== REGIME INTEGRATION ========================
+
+def detect_current_regime(project_root: str, today: date) -> Dict:
+    """Detect current market regime"""
+    
+    if not REGIME_AVAILABLE:
+        return {
             'regime': 'NEUTRAL_BULLISH',
             'composite_score': 0.0,
             'confidence': 0.0
         }
     
-    print("="*80 + "\n")
-    # ==========================================================
-    
-    # ==================== REGIME PREDICTION ====================
-    print("\n" + "="*80)
-    print("[STEP] REGIME PREDICTION")
-    print("="*80 + "\n")
-    
     try:
-        predictor = RegimePredictor()
-        pred_5d = predictor.predict(args.today, horizon_days=5)
+        detector = RegimeDetector(
+            macro_price_cache_dir=os.path.join(project_root, "seasonality_reports", "price_cache")
+        )
         
-        print(f"[INFO] 5-day forecast: {pred_5d['most_likely']} ({pred_5d['predictions'][pred_5d['most_likely']]:.1%})")
-        print(f"[INFO] Transition prob: {pred_5d['transition_probability']:.1%}")
+        regime_data = detector.detect_regime(date=today.strftime("%Y-%m-%d"))
         
-        # Lisää ennusteet regime_data:an
-        regime_data['prediction_5d'] = pred_5d['most_likely']
-        regime_data['prediction_5d_prob'] = pred_5d['predictions'][pred_5d['most_likely']]
-        regime_data['transition_prob_5d'] = pred_5d['transition_probability']
+        print(f"\n[REGIME] Current: {regime_data['regime']}")
+        print(f"[REGIME] Score: {regime_data['composite_score']:.4f}")
+        print(f"[REGIME] Confidence: {regime_data['confidence']:.1%}")
         
-        if pred_5d['transition_probability'] > 0.70:
-            print(f"[WARN] High transition probability - consider defensive positioning")
+        return regime_data
         
     except Exception as e:
-        print(f"[WARN] Regime prediction failed: {e}")
+        print(f"[WARN] Regime detection failed: {e}")
+        return {
+            'regime': 'NEUTRAL_BULLISH',
+            'composite_score': 0.0,
+            'confidence': 0.0
+        }
+
+def apply_regime_strategy(candidates_df: pd.DataFrame, regime_data: Dict, max_positions: int, position_size: float) -> pd.DataFrame:
+    """Apply regime-specific strategy to filter and rank candidates"""
     
-    print("="*80 + "\n")
-    # ===========================================================
+    if candidates_df.empty or not REGIME_AVAILABLE:
+        return candidates_df
     
-    # ==================== REGIME STRATEGY ====================
-    print("\n" + "="*80)
-    print("[STEP] LOAD REGIME STRATEGY")
-    print("="*80 + "\n")
+    regime = regime_data.get('regime', 'NEUTRAL_BULLISH')
     
-    regime_strategy = RegimeStrategy(regime_data['regime'])
-    regime_strategy.print_strategy()
-    
-    # Override no_new_positions if CRISIS
-    if regime_data['regime'] == 'CRISIS':
-        args.no_new_positions = True
-        print("[WARN] CRISIS regime - no_new_positions enabled automatically")
-    
-    print("="*80 + "\n")
-    # =========================================================
-
-    # Lataa salkun tila
-    state = _load_portfolio_state(args.portfolio_state)
-
-    # Rakenna listat
-    if args.no_new_positions:
-        print("[INFO] No new positions mode - skipping trade candidate generation")
-        buys_df = pd.DataFrame(columns=["Ticker", "Side", "Score", "Note", "PositionSize"])
-    else:
-        buys_df = build_trade_candidates(args, regime_strategy, regime_data)
-    
-    sells_df = build_sell_candidates(args, state, regime_data)
-    port_df = simulate_portfolio_after_trades(state, buys_df, sells_df)
-
-    # Kirjoitukset
-    trade_path = os.path.join(args.actions_dir, "trade_candidates.csv")
-    sell_path = os.path.join(args.actions_dir, "sell_candidates.csv")
-    port_path = os.path.join(args.actions_dir, "portfolio_after_sim.csv")
-
-    _write_csv(buys_df, trade_path)
-    print(f"[OK] Candidates : {trade_path}")
-
-    _write_csv(sells_df, sell_path)
-    print(f"[OK] Sells      : {sell_path}")
-
-    _write_csv(port_df, port_path)
-    print(f"[OK] Portfolio  : {port_path}")
-
-    # Action plan
-    write_action_plan(args, buys_df, sells_df, regime_data)
-
-    # Tallennetaanko portfolio_state.json?
-    if int(args.commit) == 1:
-        # Päivitä state
-        state['positions'] = port_df.to_dict('records') if not port_df.empty else []
-        state['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        state['regime'] = regime_data['regime']
+    try:
+        strategy = RegimeStrategy(regime)
         
-        _save_portfolio_state(state, args.portfolio_state)
-        print(f"[OK] Portfolio state COMMITTED: {args.portfolio_state}")
+        print(f"\n[STRATEGY] Applying {regime} strategy ({strategy.config['strategy_type']})")
+        print(f"[STRATEGY] Max positions: {strategy.config['max_positions']}")
+        
+        # Position sizing can be either a dict or a float
+        position_sizing = strategy.config.get('position_sizing', 1.0)
+        if isinstance(position_sizing, dict):
+            position_multiplier = position_sizing.get('base_multiplier', 1.0)
+        else:
+            position_multiplier = float(position_sizing)
+        
+        print(f"[STRATEGY] Position size multiplier: {position_multiplier:.1f}x")
+        
+        # ==================== FIX: No filter_candidates method ====================
+        # Kandidaatit on jo filtteröity ml_unified_pipeline:ssa
+        # (sector rotation + composite scoring + regime-aware ranking)
+        # Käytämme niitä suoraan
+        filtered = candidates_df.copy()
+        # ==========================================================================
+        
+        print(f"[STRATEGY] Using {len(filtered)} pre-filtered candidates")
+        
+        # Adjust position size based on regime
+        adjusted_size = position_size * position_multiplier
+        filtered['adjusted_position_size'] = adjusted_size
+        
+        # Use regime's max positions if lower than user's setting
+        regime_max = strategy.config['max_positions']
+        if regime_max < max_positions:
+            print(f"[STRATEGY] Reducing max positions: {max_positions} → {regime_max} (regime constraint)")
+            filtered = filtered.head(regime_max)
+        else:
+            # Limit to max_positions
+            filtered = filtered.head(max_positions)
+        
+        return filtered
+        
+    except Exception as e:
+        print(f"[WARN] Regime strategy application failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return candidates_df.head(max_positions)
+
+# ======================== DECISION LOGIC ========================
+
+def decide_trades(
+    candidates_df: pd.DataFrame,
+    portfolio_state: Dict,
+    regime_data: Dict,
+    max_positions: int,
+    position_size: float,
+    no_new_positions: bool
+) -> Dict:
+    """
+    Main decision logic: determine which trades to make
+    
+    Returns:
+        {
+            'buy': [...],      # List of tickers to buy
+            'sell': [...],     # List of tickers to sell
+            'hold': [...],     # List of tickers to hold
+            'reason': {...}    # Reasons for decisions
+        }
+    """
+    
+    decisions = {
+        'buy': [],
+        'sell': [],
+        'hold': [],
+        'reason': {}
+    }
+    
+    # Varmista että positions on dict
+    current_positions = portfolio_state.get('positions', {})
+    if not isinstance(current_positions, dict):
+        print(f"[WARN] portfolio_state['positions'] was not a dict, treating as empty")
+        current_positions = {}
+    
+    current_tickers = set(current_positions.keys())
+    
+    # If CRISIS or no_new_positions → exit all
+    regime = regime_data.get('regime', 'NEUTRAL_BULLISH')
+    if regime == 'CRISIS' or no_new_positions:
+        print(f"\n[DECISION] {'CRISIS MODE' if regime == 'CRISIS' else 'NO NEW POSITIONS MODE'}")
+        print(f"[DECISION] Exiting all {len(current_tickers)} positions")
+        
+        decisions['sell'] = list(current_tickers)
+        for ticker in current_tickers:
+            decisions['reason'][ticker] = 'CRISIS' if regime == 'CRISIS' else 'NO_NEW_POSITIONS'
+        
+        return decisions
+    
+    # Get candidate tickers (sector-adjusted, regime-filtered)
+    if candidates_df.empty:
+        print(f"\n[DECISION] No candidates available")
+        # Hold existing positions
+        decisions['hold'] = list(current_tickers)
+        return decisions
+    
+    candidate_tickers = set(candidates_df['ticker'].tolist()[:max_positions])
+    
+    # Decide sells (positions not in top candidates)
+    to_sell = current_tickers - candidate_tickers
+    decisions['sell'] = list(to_sell)
+    
+    for ticker in to_sell:
+        decisions['reason'][ticker] = 'NOT_IN_TOP_CANDIDATES'
+    
+    # Decide holds (positions still in top candidates)
+    to_hold = current_tickers & candidate_tickers
+    decisions['hold'] = list(to_hold)
+    
+    # Decide buys (new candidates, up to max_positions)
+    open_slots = max_positions - len(to_hold)
+    
+    potential_buys = candidate_tickers - current_tickers
+    to_buy = list(potential_buys)[:open_slots]
+    
+    decisions['buy'] = to_buy
+    
+    for ticker in to_buy:
+        decisions['reason'][ticker] = 'NEW_CANDIDATE'
+    
+    print(f"\n[DECISION] Summary:")
+    print(f"  Buy:  {len(decisions['buy'])} positions")
+    print(f"  Sell: {len(decisions['sell'])} positions")
+    print(f"  Hold: {len(decisions['hold'])} positions")
+    
+    return decisions
+
+# ======================== OUTPUT GENERATION ========================
+
+def generate_outputs(
+    decisions: Dict,
+    candidates_df: pd.DataFrame,
+    portfolio_state: Dict,
+    regime_data: Dict,
+    run_root: str,
+    today: date,
+    position_size: float
+):
+    """Generate output files: trade_candidates.csv, sell_candidates.csv, action_plan.txt"""
+    
+    tag = today.strftime("%Y%m%d")
+    actions_dir = os.path.join(run_root, "actions", tag)
+    _ensure_dir(actions_dir)
+    
+    # 1. Trade candidates (BUY)
+    buy_tickers = decisions['buy']
+    
+    if buy_tickers and not candidates_df.empty:
+        buy_df = candidates_df[candidates_df['ticker'].isin(buy_tickers)].copy()
+        
+        # Add metadata
+        buy_df['Side'] = 'LONG'
+        buy_df['Note'] = buy_df['ticker'].map(decisions['reason'])
+        
+        # Position size
+        if 'adjusted_position_size' in buy_df.columns:
+            buy_df['PositionSize'] = buy_df['adjusted_position_size']
+        else:
+            buy_df['PositionSize'] = position_size
+        
+        # Regime info
+        buy_df['Regime'] = regime_data.get('regime', 'Unknown')
+        buy_df['RegimeScore'] = regime_data.get('composite_score', 0.0)
+        
+        # Save
+        buy_path = os.path.join(actions_dir, "trade_candidates.csv")
+        buy_df.to_csv(buy_path, index=False)
+        print(f"[OK] Saved: {buy_path}")
     else:
-        print("[INFO] Dry-run: portfolio_state.json ei päivitetty (commit=0).")
+        # Empty file
+        pd.DataFrame(columns=['Ticker', 'Side', 'Note']).to_csv(
+            os.path.join(actions_dir, "trade_candidates.csv"), index=False
+        )
+        print(f"[OK] No buy candidates")
+    
+    # 2. Sell candidates
+    sell_tickers = decisions['sell']
+    
+    if sell_tickers:
+        sell_data = []
+        current_positions = portfolio_state.get('positions', {})
+        if not isinstance(current_positions, dict):
+            current_positions = {}
+        
+        for ticker in sell_tickers:
+            pos = current_positions.get(ticker, {})
+            sell_data.append({
+                'Ticker': ticker,
+                'Side': 'SELL',
+                'EntryPrice': pos.get('entry_price', 0.0),
+                'Quantity': pos.get('quantity', 0),
+                'Reason': decisions['reason'].get(ticker, 'Unknown')
+            })
+        
+        sell_df = pd.DataFrame(sell_data)
+        sell_path = os.path.join(actions_dir, "sell_candidates.csv")
+        sell_df.to_csv(sell_path, index=False)
+        print(f"[OK] Saved: {sell_path}")
+    else:
+        # Empty file
+        pd.DataFrame(columns=['Ticker', 'Side', 'Reason']).to_csv(
+            os.path.join(actions_dir, "sell_candidates.csv"), index=False
+        )
+        print(f"[OK] No sell candidates")
+    
+    # 3. Action plan (text summary)
+    action_plan_path = os.path.join(actions_dir, "action_plan.txt")
+    
+    with open(action_plan_path, 'w', encoding='utf-8') as f:
+        f.write("="*80 + "\n")
+        f.write(f"TRADE ACTION PLAN - {today.strftime('%Y-%m-%d')}\n")
+        f.write("="*80 + "\n\n")
+        
+        # Regime info
+        f.write("MARKET REGIME:\n")
+        f.write(f"  Current: {regime_data.get('regime', 'Unknown')}\n")
+        f.write(f"  Score: {regime_data.get('composite_score', 0.0):+.4f}\n")
+        f.write(f"  Confidence: {regime_data.get('confidence', 0.0):.1%}\n\n")
+        
+        # Multi-timeframe (if available)
+        if 'multi_timeframe' in regime_data:
+            mtf = regime_data['multi_timeframe']
+            f.write("MULTI-TIMEFRAME:\n")
+            f.write(f"  Daily: {mtf.get('daily', 'Unknown')}\n")
+            f.write(f"  Weekly: {mtf.get('weekly', 'Unknown')}\n")
+            f.write(f"  Monthly: {mtf.get('monthly', 'Unknown')}\n")
+            f.write(f"  Alignment: {mtf.get('alignment', 'Unknown')}\n")
+            f.write(f"  Bias: {mtf.get('bias', 'Unknown').upper()} ({mtf.get('bias_strength', 0.0):.1%})\n\n")
+        
+        # Actions
+        f.write("ACTIONS:\n")
+        f.write(f"  BUY:  {len(decisions['buy'])} positions\n")
+        f.write(f"  SELL: {len(decisions['sell'])} positions\n")
+        f.write(f"  HOLD: {len(decisions['hold'])} positions\n\n")
+        
+        # Details
+        if decisions['buy']:
+            f.write("BUY ORDERS:\n")
+            for ticker in decisions['buy']:
+                f.write(f"  - {ticker} (${position_size:.0f})\n")
+            f.write("\n")
+        
+        if decisions['sell']:
+            f.write("SELL ORDERS:\n")
+            for ticker in decisions['sell']:
+                reason = decisions['reason'].get(ticker, 'Unknown')
+                f.write(f"  - {ticker} ({reason})\n")
+            f.write("\n")
+        
+        if decisions['hold']:
+            f.write("HOLD POSITIONS:\n")
+            for ticker in decisions['hold']:
+                f.write(f"  - {ticker}\n")
+            f.write("\n")
+        
+        # Portfolio summary
+        f.write("="*80 + "\n")
+        f.write("PORTFOLIO AFTER ACTIONS:\n")
+        f.write("="*80 + "\n")
+        
+        total_positions = len(decisions['hold']) + len(decisions['buy'])
+        f.write(f"Total Positions: {total_positions}\n")
+        f.write(f"Cash: ${portfolio_state.get('cash', 0.0):.2f}\n")
+        
+        f.write("\n" + "="*80 + "\n")
+    
+    print(f"[OK] Saved: {action_plan_path}")
+    
+    return actions_dir
+
+# ======================== MAIN ========================
+
+def main():
+    args = parse_args()
+    
+    print("\n" + "="*80)
+    print("AUTO DECIDER - Regime-Aware Trade Decision System")
+    print("="*80 + "\n")
+    
+    # Parse date
+    today = _as_date(args.today)
+    print(f"[INFO] Today: {today.strftime('%Y-%m-%d')}")
+    print(f"[INFO] Commit mode: {'LIVE' if args.commit else 'DRY-RUN'}")
+    
+    # Load portfolio
+    portfolio_state = load_portfolio_state(args.project_root)
+    print(f"[INFO] Current positions: {len(portfolio_state['positions'])}")
+    print(f"[INFO] Cash: ${portfolio_state.get('cash', 0.0):.2f}")
+    
+    # Detect regime
+    regime_data = detect_current_regime(args.project_root, today)
+    
+    # Check for CRISIS or no_new_positions
+    if regime_data.get('regime') == 'CRISIS':
+        print(f"\⚠️  WARNING: CRISIS REGIME DETECTED")
+        print(f"⚠️  Enabling capital preservation mode (exit all positions)")
+        args.no_new_positions = True
+    
+    if args.no_new_positions:
+        print(f"\n[INFO] NO NEW POSITIONS mode enabled")
+    
+    # Find latest candidates
+    gated_csv = _find_latest_gated_csv(args.run_root, today)
+    
+    if gated_csv is None:
+        print(f"\n[ERROR] No candidates CSV found for {today.strftime('%Y-%m-%d')}")
+        print(f"[ERROR] Expected: {args.run_root}/reports/top_long_candidates_GATED_{today.strftime('%Y-%m-%d')}.csv")
+        sys.exit(1)
+    
+    print(f"\n[INFO] Loading candidates: {gated_csv}")
+    candidates_df = read_candidates(gated_csv)
+    
+    if candidates_df.empty:
+        print(f"[WARN] No candidates found")
+    else:
+        print(f"[INFO] Loaded {len(candidates_df)} candidates")
+    
+    # Apply regime strategy
+    filtered_candidates = apply_regime_strategy(
+        candidates_df,
+        regime_data,
+        args.max_positions,
+        args.position_size
+    )
+    
+    # Make decisions
+    decisions = decide_trades(
+        filtered_candidates,
+        portfolio_state,
+        regime_data,
+        args.max_positions,
+        args.position_size,
+        args.no_new_positions
+    )
+    
+    # Generate outputs
+    actions_dir = generate_outputs(
+        decisions,
+        filtered_candidates,
+        portfolio_state,
+        regime_data,
+        args.run_root,
+        today,
+        args.position_size
+    )
+    
+    # Simulate portfolio update
+    print(f"\n[INFO] Simulating portfolio after actions...")
+    
+    # This is a simplified simulation - real implementation would need actual prices
+    simulated_portfolio = portfolio_state.copy()
+    
+    # Ensure positions is dict
+    if not isinstance(simulated_portfolio.get('positions'), dict):
+        simulated_portfolio['positions'] = {}
+    
+    # Remove sells
+    for ticker in decisions['sell']:
+        if ticker in simulated_portfolio['positions']:
+            del simulated_portfolio['positions'][ticker]
+    
+    # Add buys (simulated)
+    for ticker in decisions['buy']:
+        simulated_portfolio['positions'][ticker] = {
+            'entry_date': today.strftime('%Y-%m-%d'),
+            'entry_price': 100.0,  # Placeholder
+            'quantity': int(args.position_size / 100.0),
+            'regime_at_entry': regime_data.get('regime', 'Unknown')
+        }
+    
+    # Save simulated portfolio
+    sim_path = os.path.join(actions_dir, "portfolio_after_sim.csv")
+    sim_df = pd.DataFrame([
+        {'Ticker': ticker, **data}
+        for ticker, data in simulated_portfolio['positions'].items()
+    ])
+    sim_df.to_csv(sim_path, index=False)
+    print(f"[OK] Saved simulated portfolio: {sim_path}")
+    
+    # Commit changes?
+    if args.commit:
+        print(f"\n[INFO] Committing changes to portfolio_state.json...")
+        simulated_portfolio['last_updated'] = today.strftime('%Y-%m-%d')
+        save_portfolio_state(args.project_root, simulated_portfolio)
+    else:
+        print(f"\n[INFO] Dry-run: portfolio_state.json ei päivitetty (commit=0).")
     
     print("\n" + "="*80)
     print("AUTO DECIDER COMPLETE")
     print("="*80 + "\n")
-
+    
+    # ==================== EMAIL INTEGRATION ====================
+    # Lähetä email automaattisesti
+    try:
+        print("[INFO] Lähetetään trade candidates emaililla...")
+        import send_trades_email
+        send_trades_email.main()
+    except Exception as e:
+        print(f"[WARN] Email-lähetys epäonnistui: {e}")
+        print("[INFO] Voit lähettää manuaalisesti: python send_trades_email.py")
+    # ===========================================================
 
 if __name__ == "__main__":
     main()
