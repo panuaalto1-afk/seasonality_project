@@ -6,15 +6,16 @@ auto_decider.py
 Automated trade decision maker for seasonality project.
 
 Analyzes ML-generated signals, applies regime-specific strategies,
-and generates actionable trade recommendations.
+and generates actionable trade recommendations with Stop Loss & Take Profit levels.
 
 Usage:
-    python auto_decider.py --project_root "." --universe_csv "..." --run_root "..." --price_cache_dir "..." --today "2025-11-02" --commit 0
+    python auto_decider.py --project_root "." --universe_csv "..." --run_root "..." --price_cache_dir "..." --today "2025-11-06" --commit 0
 
 Features:
 - Regime-aware strategy selection
 - Sector rotation filtering
 - Position sizing based on regime
+- ATR-based Stop Loss & Take Profit calculation
 - Automatic email notifications
 """
 
@@ -145,6 +146,105 @@ def read_candidates(csv_path: str) -> pd.DataFrame:
         print(f"[ERROR] Failed to read {csv_path}: {e}")
         return pd.DataFrame()
 
+# ======================== PRICE & ATR FUNCTIONS ========================
+
+def read_price_data(ticker: str, price_cache_dir: str) -> Optional[pd.DataFrame]:
+    """Read price data for a ticker from price_cache"""
+    ticker = ticker.upper().strip()
+    price_file = os.path.join(price_cache_dir, f"{ticker}.csv")
+    
+    if not os.path.exists(price_file):
+        return None
+    
+    try:
+        df = pd.read_csv(price_file)
+        df.columns = [c.lower().strip() for c in df.columns]
+        if 'adj_close' in df.columns:
+            df['close'] = df['adj_close']
+        return df
+    except Exception as e:
+        return None
+
+def calculate_atr(price_df: pd.DataFrame, period: int = 14) -> Optional[float]:
+    """Calculate Average True Range (ATR)"""
+    if price_df is None or len(price_df) < period + 1:
+        return None
+    
+    try:
+        high = price_df['high'].values
+        low = price_df['low'].values
+        close = price_df['close'].values
+        
+        prev_close = np.roll(close, 1)
+        prev_close[0] = close[0]
+        
+        tr1 = high - low
+        tr2 = np.abs(high - prev_close)
+        tr3 = np.abs(low - prev_close)
+        tr = np.maximum(tr1, np.maximum(tr2, tr3))
+        atr = np.mean(tr[-period:])
+        
+        return float(atr)
+    except Exception as e:
+        return None
+
+def enrich_with_stop_tp(df: pd.DataFrame, price_cache_dir: str, is_buy: bool = True) -> pd.DataFrame:
+    """Add Stop/TP levels to dataframe"""
+    if df.empty:
+        return df
+    
+    df = df.copy()
+    
+    # Add columns
+    if is_buy:
+        df['EntryPrice'] = np.nan
+    else:
+        df['CurrentPrice'] = np.nan
+    
+    df['ATR'] = np.nan
+    df['StopLoss'] = np.nan
+    df['TakeProfit'] = np.nan
+    
+    print(f"\n[STOP/TP] Calculating for {len(df)} {'buy' if is_buy else 'sell'} candidates...")
+    
+    for idx, row in df.iterrows():
+        ticker = str(row.get('ticker', row.get('Ticker', ''))).strip().upper()
+        if not ticker or ticker == 'NAN':
+            continue
+        
+        price_df = read_price_data(ticker, price_cache_dir)
+        if price_df is None or price_df.empty:
+            print(f"  ⚠️  {ticker}: No price data")
+            continue
+        
+        current_price = float(price_df['close'].iloc[-1])
+        atr = calculate_atr(price_df, period=14)
+        
+        if atr is None or atr == 0:
+            print(f"  ⚠️  {ticker}: ATR calculation failed")
+            continue
+        
+        # For BUY: use current price as entry
+        # For SELL: use entry_price from row (or current as fallback)
+        if is_buy:
+            entry_price = current_price
+            df.at[idx, 'EntryPrice'] = round(entry_price, 2)
+        else:
+            entry_price = row.get('EntryPrice', current_price)
+            df.at[idx, 'CurrentPrice'] = round(current_price, 2)
+        
+        stop_loss = entry_price - (1.0 * atr)
+        take_profit = entry_price + (3.0 * atr)
+        
+        df.at[idx, 'ATR'] = round(atr, 2)
+        df.at[idx, 'StopLoss'] = round(stop_loss, 2)
+        df.at[idx, 'TakeProfit'] = round(take_profit, 2)
+        
+        price_str = f"Entry=${entry_price:>7.2f}" if is_buy else f"Current=${current_price:>7.2f}"
+        print(f"  ✅ {ticker:6} {price_str}  ATR=${atr:>5.2f}  SL=${stop_loss:>7.2f}  TP=${take_profit:>7.2f}")
+    
+    return df
+
 # ======================== REGIME INTEGRATION ========================
 
 def detect_current_regime(project_root: str, today: date) -> Dict:
@@ -201,12 +301,8 @@ def apply_regime_strategy(candidates_df: pd.DataFrame, regime_data: Dict, max_po
         
         print(f"[STRATEGY] Position size multiplier: {position_multiplier:.1f}x")
         
-        # ==================== FIX: No filter_candidates method ====================
         # Kandidaatit on jo filtteröity ml_unified_pipeline:ssa
-        # (sector rotation + composite scoring + regime-aware ranking)
-        # Käytämme niitä suoraan
         filtered = candidates_df.copy()
-        # ==========================================================================
         
         print(f"[STRATEGY] Using {len(filtered)} pre-filtered candidates")
         
@@ -220,7 +316,6 @@ def apply_regime_strategy(candidates_df: pd.DataFrame, regime_data: Dict, max_po
             print(f"[STRATEGY] Reducing max positions: {max_positions} → {regime_max} (regime constraint)")
             filtered = filtered.head(regime_max)
         else:
-            # Limit to max_positions
             filtered = filtered.head(max_positions)
         
         return filtered
@@ -246,10 +341,10 @@ def decide_trades(
     
     Returns:
         {
-            'buy': [...],      # List of tickers to buy
-            'sell': [...],     # List of tickers to sell
-            'hold': [...],     # List of tickers to hold
-            'reason': {...}    # Reasons for decisions
+            'buy': [...],
+            'sell': [...],
+            'hold': [...],
+            'reason': {...}
         }
     """
     
@@ -260,7 +355,6 @@ def decide_trades(
         'reason': {}
     }
     
-    # Varmista että positions on dict
     current_positions = portfolio_state.get('positions', {})
     if not isinstance(current_positions, dict):
         print(f"[WARN] portfolio_state['positions'] was not a dict, treating as empty")
@@ -280,29 +374,27 @@ def decide_trades(
         
         return decisions
     
-    # Get candidate tickers (sector-adjusted, regime-filtered)
+    # Get candidate tickers
     if candidates_df.empty:
         print(f"\n[DECISION] No candidates available")
-        # Hold existing positions
         decisions['hold'] = list(current_tickers)
         return decisions
     
     candidate_tickers = set(candidates_df['ticker'].tolist()[:max_positions])
     
-    # Decide sells (positions not in top candidates)
+    # Decide sells
     to_sell = current_tickers - candidate_tickers
     decisions['sell'] = list(to_sell)
     
     for ticker in to_sell:
         decisions['reason'][ticker] = 'NOT_IN_TOP_CANDIDATES'
     
-    # Decide holds (positions still in top candidates)
+    # Decide holds
     to_hold = current_tickers & candidate_tickers
     decisions['hold'] = list(to_hold)
     
-    # Decide buys (new candidates, up to max_positions)
+    # Decide buys
     open_slots = max_positions - len(to_hold)
-    
     potential_buys = candidate_tickers - current_tickers
     to_buy = list(potential_buys)[:open_slots]
     
@@ -327,7 +419,8 @@ def generate_outputs(
     regime_data: Dict,
     run_root: str,
     today: date,
-    position_size: float
+    position_size: float,
+    price_cache_dir: str
 ):
     """Generate output files: trade_candidates.csv, sell_candidates.csv, action_plan.txt"""
     
@@ -340,6 +433,9 @@ def generate_outputs(
     
     if buy_tickers and not candidates_df.empty:
         buy_df = candidates_df[candidates_df['ticker'].isin(buy_tickers)].copy()
+        
+        # Enrich with Stop/TP
+        buy_df = enrich_with_stop_tp(buy_df, price_cache_dir, is_buy=True)
         
         # Add metadata
         buy_df['Side'] = 'LONG'
@@ -386,6 +482,10 @@ def generate_outputs(
             })
         
         sell_df = pd.DataFrame(sell_data)
+        
+        # Enrich with Stop/TP
+        sell_df = enrich_with_stop_tp(sell_df, price_cache_dir, is_buy=False)
+        
         sell_path = os.path.join(actions_dir, "sell_candidates.csv")
         sell_df.to_csv(sell_path, index=False)
         print(f"[OK] Saved: {sell_path}")
@@ -485,7 +585,7 @@ def main():
     
     # Check for CRISIS or no_new_positions
     if regime_data.get('regime') == 'CRISIS':
-        print(f"\⚠️  WARNING: CRISIS REGIME DETECTED")
+        print(f"\n⚠️  WARNING: CRISIS REGIME DETECTED")
         print(f"⚠️  Enabling capital preservation mode (exit all positions)")
         args.no_new_positions = True
     
@@ -534,16 +634,15 @@ def main():
         regime_data,
         args.run_root,
         today,
-        args.position_size
+        args.position_size,
+        args.price_cache_dir
     )
     
     # Simulate portfolio update
     print(f"\n[INFO] Simulating portfolio after actions...")
     
-    # This is a simplified simulation - real implementation would need actual prices
     simulated_portfolio = portfolio_state.copy()
     
-    # Ensure positions is dict
     if not isinstance(simulated_portfolio.get('positions'), dict):
         simulated_portfolio['positions'] = {}
     
@@ -582,8 +681,7 @@ def main():
     print("AUTO DECIDER COMPLETE")
     print("="*80 + "\n")
     
-    # ==================== EMAIL INTEGRATION ====================
-    # Lähetä email automaattisesti
+    # Email integration
     try:
         print("[INFO] Lähetetään trade candidates emaililla...")
         import send_trades_email
@@ -591,7 +689,6 @@ def main():
     except Exception as e:
         print(f"[WARN] Email-lähetys epäonnistui: {e}")
         print("[INFO] Voit lähettää manuaalisesti: python send_trades_email.py")
-    # ===========================================================
 
 if __name__ == "__main__":
     main()
