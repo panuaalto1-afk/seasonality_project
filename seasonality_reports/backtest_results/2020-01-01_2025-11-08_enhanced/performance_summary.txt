@@ -1,0 +1,37 @@
+================================================================================
+BACKTEST PERFORMANCE SUMMARY
+================================================================================
+
+PORTFOLIO PERFORMANCE:
+  Initial Value:     $100,437.88
+  Final Value:       $222,346.59
+  Total Return:      121.38%
+  Annual Return:     14.61%
+  Sharpe Ratio:      2.321
+  Sortino Ratio:     3.337
+  Max Drawdown:      -7.33%
+  Volatility (Ann):  5.96%
+  Calmar Ratio:      1.992
+
+TRADE STATISTICS:
+  Total Trades:      1572
+  Winning Trades:    865
+  Win Rate:          55.03%
+  Avg Win:           8.37%
+  Avg Loss:          -5.87%
+  Profit Factor:     1.745
+  Avg Hold Time:     7.2 days
+
+BENCHMARK COMPARISON:
+  vs SPY:
+    Benchmark Return:  126.15%
+    Outperformance:    -4.77%
+    Alpha:             12.92%
+    Beta:              0.112
+  vs QQQ:
+    Benchmark Return:  196.51%
+    Outperformance:    -75.13%
+    Alpha:             12.87%
+    Beta:              0.085
+
+================================================================================
