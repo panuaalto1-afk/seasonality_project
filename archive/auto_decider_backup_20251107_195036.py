@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-auto_decider.py v4.3.3
+auto_decider.py v4.3.2
 ====================
 Automated trade decision maker for seasonality project.
 
@@ -13,11 +13,12 @@ Features:
 - CRISIS mode: 80% inverse ETF allocation
 - AUTOMATIC EMAIL NOTIFICATIONS (integrated)
 
-FIX v4.3.3 (2025-11-07):
-- CRITICAL: Fixed CSV parsing - skips ticker name row, converts strings to numeric
-- Fixed ATR calculation crash: "unsupported operand type(s) for -: 'str' and 'str'"
-- Handles yfinance CSV format with ticker symbols in first data row
-- All previous fixes maintained (T-1 close, column normalization, ATR14)
+FIX v4.3.2 (2025-11-07):
+- Fixed price fetch to use previous day's close (T-1) for T morning decisions
+- Column normalization handles "Adj Close" with space properly
+- ATR calculation uses 14-day rolling average (industry standard)
+- No placeholders - uses REAL prices from static price_cache
+- Price cache updates via overwrite (single directory with 20y history)
 """
 
 import argparse
@@ -119,13 +120,11 @@ def calculate_portfolio_value(portfolio_state: Dict) -> float:
     
     return cash + position_value
 
-# ======================== PRICE & SL/TP CALCULATION (FIXED v4.3.3) ========================
+# ======================== PRICE & SL/TP CALCULATION (FIXED v4.3.2) ========================
 
 def _fetch_price_from_cache(ticker: str, price_cache_dir: str, lookback: int = 60) -> tuple:
     """
     Fetch last close price and ATR14 from price cache.
-    
-    FIXED v4.3.3: Handles CSV with ticker name in first row + converts strings to numeric
     
     Uses T-1 close for T morning decisions (previous day's close).
     Price cache contains ~20 years of history, updated daily via overwrite.
@@ -139,33 +138,19 @@ def _fetch_price_from_cache(ticker: str, price_cache_dir: str, lookback: int = 6
         (last_close, atr14) or (None, None) if not found
     """
     ticker_upper = ticker.upper()
+    
+    # Price cache contains files like: DDOG.csv, AAPL.csv, etc.
     csv_path = os.path.join(price_cache_dir, f"{ticker_upper}.csv")
     
     if not os.path.exists(csv_path):
         return (None, None)
     
     try:
-        # Read CSV
+        # Read CSV with full history
         df = pd.read_csv(csv_path)
-        
-        # CRITICAL FIX: Skip first row if it contains ticker symbols
-        # yfinance CSV format sometimes has:
-        # Date,Open,High,Low,Close,Adj Close,Volume
-        # ,DDOG,DDOG,DDOG,DDOG,DDOG,DDOG  <- Skip this row
-        # 2025-11-06,178.90,194.87,...
-        first_date = str(df.iloc[0]['Date']).strip()
-        if first_date == '' or first_date == ticker_upper or not first_date[0].isdigit():
-            df = df.iloc[1:].reset_index(drop=True)
         
         # Normalize column names: "Adj Close" -> "adj_close"
         df.columns = [c.strip().lower().replace(' ', '_') for c in df.columns]
-        
-        # CRITICAL FIX: Convert string columns to numeric
-        # Pandas reads CSV values as strings if first row contains text
-        numeric_cols = ['open', 'high', 'low', 'close', 'adj_close', 'adjclose', 'volume']
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
         
         # Find close column
         close_col = None
@@ -403,7 +388,7 @@ Action Plan Preview:
 {'...(see attachment for full plan)' if len(action_plan_text) > 1500 else ''}
 
 {'='*80}
-Automated by seasonality_project/auto_decider.py v4.3.3
+Automated by seasonality_project/auto_decider.py v4.3.2
 """
         
         # HTML body
@@ -438,7 +423,7 @@ Automated by seasonality_project/auto_decider.py v4.3.3
     {'<p><i>...(see attachment for full plan)</i></p>' if len(action_plan_text) > 1500 else ''}
     
     <div class="footer">
-        <p><b>Automated by seasonality_project/auto_decider.py v4.3.3</b></p>
+        <p><b>Automated by seasonality_project/auto_decider.py v4.3.2</b></p>
         <p>GitHub: <a href="https://github.com/panuaalto1-afk/seasonality_project">panuaalto1-afk/seasonality_project</a></p>
     </div>
 </div>
@@ -1080,7 +1065,7 @@ def main():
     args = parse_args()
     
     print("\n" + "="*80)
-    print("AUTO DECIDER - Regime-Aware Trade Decision System v4.3.3")
+    print("AUTO DECIDER - Regime-Aware Trade Decision System v4.3.2")
     print("With Inverse ETF Support + REAL Price Enrichment + Email")
     print("="*80 + "\n")
     

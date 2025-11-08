@@ -1,30 +1,23 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-auto_decider.py v4.3.3
+auto_decider.py v4.2
 ====================
 Automated trade decision maker for seasonality project.
 
 Features:
 - Regime-aware strategy selection
 - Position sizing based on regime
-- Portfolio status with REAL PRICES, SL/TP, ATR from price_cache
+- Portfolio status with current prices, SL/TP, ATR
 - Inverse ETF system (SH, PSQ, DOG, RWM)
 - CRISIS mode: 80% inverse ETF allocation
 - AUTOMATIC EMAIL NOTIFICATIONS (integrated)
-
-FIX v4.3.3 (2025-11-07):
-- CRITICAL: Fixed CSV parsing - skips ticker name row, converts strings to numeric
-- Fixed ATR calculation crash: "unsupported operand type(s) for -: 'str' and 'str'"
-- Handles yfinance CSV format with ticker symbols in first data row
-- All previous fixes maintained (T-1 close, column normalization, ATR14)
 """
 
 import argparse
 import os
 import sys
 import json
-import glob
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -119,173 +112,79 @@ def calculate_portfolio_value(portfolio_state: Dict) -> float:
     
     return cash + position_value
 
-# ======================== PRICE & SL/TP CALCULATION (FIXED v4.3.3) ========================
-
-def _fetch_price_from_cache(ticker: str, price_cache_dir: str, lookback: int = 60) -> tuple:
-    """
-    Fetch last close price and ATR14 from price cache.
-    
-    FIXED v4.3.3: Handles CSV with ticker name in first row + converts strings to numeric
-    
-    Uses T-1 close for T morning decisions (previous day's close).
-    Price cache contains ~20 years of history, updated daily via overwrite.
-    
-    Args:
-        ticker: Stock symbol
-        price_cache_dir: Static price cache directory (e.g., .../2025-10-04_0903/price_cache)
-        lookback: Number of days to load for ATR calculation
-    
-    Returns:
-        (last_close, atr14) or (None, None) if not found
-    """
-    ticker_upper = ticker.upper()
-    csv_path = os.path.join(price_cache_dir, f"{ticker_upper}.csv")
-    
-    if not os.path.exists(csv_path):
-        return (None, None)
-    
-    try:
-        # Read CSV
-        df = pd.read_csv(csv_path)
-        
-        # CRITICAL FIX: Skip first row if it contains ticker symbols
-        # yfinance CSV format sometimes has:
-        # Date,Open,High,Low,Close,Adj Close,Volume
-        # ,DDOG,DDOG,DDOG,DDOG,DDOG,DDOG  <- Skip this row
-        # 2025-11-06,178.90,194.87,...
-        first_date = str(df.iloc[0]['Date']).strip()
-        if first_date == '' or first_date == ticker_upper or not first_date[0].isdigit():
-            df = df.iloc[1:].reset_index(drop=True)
-        
-        # Normalize column names: "Adj Close" -> "adj_close"
-        df.columns = [c.strip().lower().replace(' ', '_') for c in df.columns]
-        
-        # CRITICAL FIX: Convert string columns to numeric
-        # Pandas reads CSV values as strings if first row contains text
-        numeric_cols = ['open', 'high', 'low', 'close', 'adj_close', 'adjclose', 'volume']
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        # Find close column
-        close_col = None
-        for col_name in ['adj_close', 'adjclose', 'close']:
-            if col_name in df.columns:
-                close_col = col_name
-                break
-        
-        if close_col is None:
-            return (None, None)
-        
-        # Get last N rows for ATR calculation
-        df_recent = df.tail(lookback).copy()
-        
-        if df_recent.empty or df_recent[close_col].dropna().empty:
-            return (None, None)
-        
-        # Last available close (T-1 for T morning decision)
-        last_close = float(df_recent[close_col].dropna().iloc[-1])
-        
-        # Calculate ATR(14) - industry standard
-        atr = 0.0
-        if all(col in df_recent.columns for col in ['high', 'low']) and len(df_recent) >= 14:
-            prev_close = df_recent[close_col].shift(1)
-            
-            # True Range = max(H-L, H-C_prev, C_prev-L)
-            tr1 = df_recent['high'] - df_recent['low']
-            tr2 = (df_recent['high'] - prev_close).abs()
-            tr3 = (df_recent['low'] - prev_close).abs()
-            
-            true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-            
-            # ATR(14) = 14-day rolling average of True Range
-            atr_series = true_range.rolling(window=14, min_periods=14).mean()
-            
-            if not atr_series.dropna().empty:
-                atr = float(atr_series.iloc[-1])
-        
-        return (last_close, atr)
-        
-    except Exception as e:
-        print(f"[ERROR] Failed to read {csv_path}: {e}")
-        return (None, None)
-
+# ======================== PRICE & SL/TP CALCULATION ========================
 
 def load_current_prices(price_cache_dir: str, tickers: List[str], today: date) -> Dict[str, float]:
     """
-    Lataa tämän päivän (T) aamun hinnat price_cache:sta.
-    
-    Käyttää T-1 closing prices (edellisen päivän päätöskursseja),
-    koska päätökset tehdään ennen T:n markkinoiden aukeamista.
-    
-    Args:
-        price_cache_dir: Static price cache directory
-        tickers: List of tickers
-        today: Date (T) - not used directly, but context for T-1 logic
+    Lataa tämän päivän hinnat price_cache:sta
     
     Returns:
         dict: {ticker: close_price}
     """
     prices = {}
+    today_str = today.strftime("%Y-%m-%d")
     
     for ticker in tickers:
-        last_close, _ = _fetch_price_from_cache(ticker, price_cache_dir)
+        csv_path = os.path.join(price_cache_dir, f"{ticker}.csv")
         
-        if last_close is not None:
-            prices[ticker] = last_close
-        else:
-            print(f"[WARN] No price data found for {ticker} in price_cache")
+        if not os.path.exists(csv_path):
+            continue
+        
+        try:
+            df = pd.read_csv(csv_path, parse_dates=['Date'])
+            df = df.sort_values('Date')
+            
+            today_price = df[df['Date'] <= today_str]
+            
+            if not today_price.empty:
+                prices[ticker] = float(today_price.iloc[-1]['Close'])
+        
+        except Exception as e:
+            print(f"[WARN] Failed to load price for {ticker}: {e}")
     
     return prices
 
-
-def calculate_atr(price_cache_dir: str, ticker: str, period: int = 14) -> float:
+def calculate_atr(price_cache_dir: str, ticker: str, period: int = 20) -> float:
     """
-    Laske ATR(14) - Average True Range.
-    
-    Industry standard: 14-day rolling average of True Range.
-    Used for stop-loss and position sizing.
-    
-    Args:
-        price_cache_dir: Static price cache directory
-        ticker: Stock symbol
-        period: ATR period (default 14)
+    Laske ATR (Average True Range)
     
     Returns:
         float: ATR value
     """
-    _, atr = _fetch_price_from_cache(ticker, price_cache_dir, lookback=period + 20)
+    csv_path = os.path.join(price_cache_dir, f"{ticker}.csv")
     
-    if atr is not None and atr > 0:
-        return atr
+    if not os.path.exists(csv_path):
+        return 0.0
     
-    # Fallback: return 0 if ATR calculation fails
-    return 0.0
-
+    try:
+        df = pd.read_csv(csv_path, parse_dates=['Date'])
+        df = df.sort_values('Date').tail(period + 1)
+        
+        if len(df) < 2:
+            return 0.0
+        
+        df['H-L'] = df['High'] - df['Low']
+        df['H-PC'] = abs(df['High'] - df['Close'].shift(1))
+        df['L-PC'] = abs(df['Low'] - df['Close'].shift(1))
+        
+        df['TR'] = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
+        
+        atr = df['TR'].tail(period).mean()
+        
+        return float(atr)
+    
+    except Exception as e:
+        return 0.0
 
 def calculate_sl_tp(entry_price: float, atr: float, sl_multiplier: float = 2.0, tp_multiplier: float = 3.0) -> Dict[str, float]:
     """
-    Laske Stop Loss ja Take Profit tasot ATR:n perusteella.
-    
-    Args:
-        entry_price: Entry price
-        atr: Average True Range
-        sl_multiplier: Stop loss multiplier (default 2.0x ATR)
-        tp_multiplier: Take profit multiplier (default 3.0x ATR)
-    
-    Returns:
-        dict: {'sl': stop_loss, 'tp': take_profit}
+    Laske Stop Loss ja Take Profit tasot
     """
-    if atr > 0:
-        sl = entry_price - (sl_multiplier * atr)
-        tp = entry_price + (tp_multiplier * atr)
-    else:
-        # Fallback: percentage-based if ATR not available
-        sl = entry_price * 0.95
-        tp = entry_price * 1.10
+    sl = entry_price - (sl_multiplier * atr)
+    tp = entry_price + (tp_multiplier * atr)
     
     return {
-        'sl': max(sl, 0.01),  # Ensure SL is positive
+        'sl': max(sl, 0.01),
         'tp': tp
     }
 
@@ -295,9 +194,7 @@ def enrich_portfolio_with_prices(
     today: date
 ) -> pd.DataFrame:
     """
-    Rikastuta portfolio hinnoilla, SL/TP tasoilla ja P/L%:lla.
-    
-    Uses T-1 closing prices for current valuation.
+    Rikastuta portfolio hinnoilla, SL/TP tasoilla ja P/L%:lla
     """
     positions = portfolio_state.get('positions', {})
     if not isinstance(positions, dict):
@@ -318,7 +215,7 @@ def enrich_portfolio_with_prices(
         
         current_price = current_prices.get(ticker, entry_price)
         atr = calculate_atr(price_cache_dir, ticker)
-        sl_tp = calculate_sl_tp(current_price if current_price > 0 else entry_price, atr)
+        sl_tp = calculate_sl_tp(entry_price, atr)
         
         if entry_price > 0:
             pl_pct = ((current_price - entry_price) / entry_price) * 100
@@ -403,7 +300,7 @@ Action Plan Preview:
 {'...(see attachment for full plan)' if len(action_plan_text) > 1500 else ''}
 
 {'='*80}
-Automated by seasonality_project/auto_decider.py v4.3.3
+Automated by seasonality_project/auto_decider.py
 """
         
         # HTML body
@@ -438,7 +335,7 @@ Automated by seasonality_project/auto_decider.py v4.3.3
     {'<p><i>...(see attachment for full plan)</i></p>' if len(action_plan_text) > 1500 else ''}
     
     <div class="footer">
-        <p><b>Automated by seasonality_project/auto_decider.py v4.3.3</b></p>
+        <p><b>Automated by seasonality_project/auto_decider.py</b></p>
         <p>GitHub: <a href="https://github.com/panuaalto1-afk/seasonality_project">panuaalto1-afk/seasonality_project</a></p>
     </div>
 </div>
@@ -500,7 +397,7 @@ def parse_args():
     p.add_argument("--run_root", type=str, required=True,
                    help="Run root directory (contains reports/)")
     p.add_argument("--price_cache_dir", type=str, required=True,
-                   help="Price cache directory (static, ~20y history)")
+                   help="Price cache directory")
     p.add_argument("--today", type=str, default=None,
                    help="Date YYYY-MM-DD (defaults to today)")
     p.add_argument("--commit", type=int, default=0, choices=[0, 1],
@@ -835,12 +732,7 @@ def generate_outputs(
         current_prices = load_current_prices(price_cache_dir, buy_tickers, today)
         
         for ticker in buy_tickers:
-            entry_price = current_prices.get(ticker)
-            
-            if entry_price is None:
-                print(f"[ERROR] No price found for {ticker}, skipping")
-                continue
-            
+            entry_price = current_prices.get(ticker, 100.0)
             atr = calculate_atr(price_cache_dir, ticker)
             sl_tp = calculate_sl_tp(entry_price, atr)
             
@@ -884,16 +776,10 @@ def generate_outputs(
                     'Regime': regime_data.get('regime', 'Unknown')
                 })
         
-        if buy_data:
-            buy_df = pd.DataFrame(buy_data)
-            buy_path = os.path.join(actions_dir, "trade_candidates.csv")
-            buy_df.to_csv(buy_path, index=False)
-            print(f"[OK] Saved: {buy_path}")
-        else:
-            pd.DataFrame(columns=['Ticker', 'Side', 'EntryPrice', 'StopLoss', 'TakeProfit']).to_csv(
-                os.path.join(actions_dir, "trade_candidates.csv"), index=False
-            )
-            print(f"[WARN] No valid buy candidates with prices")
+        buy_df = pd.DataFrame(buy_data)
+        buy_path = os.path.join(actions_dir, "trade_candidates.csv")
+        buy_df.to_csv(buy_path, index=False)
+        print(f"[OK] Saved: {buy_path}")
     else:
         pd.DataFrame(columns=['Ticker', 'Side', 'EntryPrice', 'StopLoss', 'TakeProfit']).to_csv(
             os.path.join(actions_dir, "trade_candidates.csv"), index=False
@@ -915,11 +801,10 @@ def generate_outputs(
             pos = current_positions.get(ticker, {})
             entry_price = pos.get('entry_price', 0.0)
             qty = pos.get('quantity', 0)
-            
             current_price = current_prices.get(ticker, entry_price)
             
             atr = calculate_atr(price_cache_dir, ticker)
-            sl_tp = calculate_sl_tp(entry_price if entry_price > 0 else current_price, atr)
+            sl_tp = calculate_sl_tp(entry_price, atr)
             
             if entry_price > 0:
                 pl_pct = ((current_price - entry_price) / entry_price) * 100
@@ -1080,8 +965,8 @@ def main():
     args = parse_args()
     
     print("\n" + "="*80)
-    print("AUTO DECIDER - Regime-Aware Trade Decision System v4.3.3")
-    print("With Inverse ETF Support + REAL Price Enrichment + Email")
+    print("AUTO DECIDER - Regime-Aware Trade Decision System v4.2")
+    print("With Inverse ETF Support + Price/SL/TP Enrichment + Email")
     print("="*80 + "\n")
     
     today = _as_date(args.today)
@@ -1161,11 +1046,7 @@ def main():
             del simulated_portfolio['positions'][ticker]
     
     for ticker in decisions['buy']:
-        price = current_prices.get(ticker)
-        
-        if price is None:
-            print(f"[WARN] Skipping {ticker} in portfolio sim (no price)")
-            continue
+        price = current_prices.get(ticker, 100.0)
         
         if ticker in decisions.get('inverse_etfs', {}):
             amount = decisions['inverse_etfs'][ticker]

@@ -1,5 +1,5 @@
-﻿# ml_unified_pipeline.py (ENHANCED VERSION)
-# Seasonality project â€” unified daily ML pipeline with full seasonality + regime + ML
+# ml_unified_pipeline.py (ENHANCED VERSION)
+# Seasonality project — unified daily ML pipeline with full seasonality + regime + ML
 
 import argparse
 import os
@@ -148,10 +148,10 @@ class RegimeCalculator:
                 current_vix = prices.iloc[-1]['close']
                 
                 # VIX normalization:
-                # 10-15: Low vol (bullish) â†’ +0.5
-                # 15-20: Normal â†’ 0
-                # 20-30: Elevated (bearish) â†’ -0.5
-                # 30+: High (very bearish) â†’ -1.0
+                # 10-15: Low vol (bullish) → +0.5
+                # 15-20: Normal → 0
+                # 20-30: Elevated (bearish) → -0.5
+                # 30+: High (very bearish) → -1.0
                 
                 if current_vix < 15:
                     return 0.5
@@ -370,15 +370,6 @@ class SeasonalityCalculator:
         
         # Add helper columns
         prices = prices.copy()
-
-        # ✅ FIX: Ensure close is numeric BEFORE any calculations
-        prices['close'] = pd.to_numeric(prices['close'], errors='coerce')
-        prices = prices.dropna(subset=['close'])
-
-        if prices.empty or len(prices) < 252:
-            return self._empty_features()
-
-        # Now safe to calculate returns
         prices['return'] = prices['close'].pct_change()
         prices['week'] = pd.to_datetime(prices['date']).dt.isocalendar().week
         prices['month'] = pd.to_datetime(prices['date']).dt.month
@@ -403,7 +394,7 @@ class SeasonalityCalculator:
         season_week_avg = float(week_data['return'].mean()) if not week_data.empty else 0.0
         season_week_hit_rate = float((week_data['return'] > 0).mean()) if not week_data.empty else 0.5
         
-        # 2. Day-of-Year (Â±3 day window)
+        # 2. Day-of-Year (±3 day window)
         day_window = hist[
             (hist['doy'] >= current_doy - 3) & 
             (hist['doy'] <= current_doy + 3)
@@ -539,8 +530,6 @@ class TradingLevelsCalculator:
             atr = tr.rolling(period).mean().iloc[-1]
         else:
             # Fallback: use close-to-close volatility as proxy
-            # ✅ FIX: Ensure close is numeric
-            prices['close'] = pd.to_numeric(prices['close'], errors='coerce')
             returns = prices['close'].pct_change()
             volatility = returns.rolling(period).std().iloc[-1]
             atr = volatility * prices['close'].iloc[-1]
@@ -1223,4 +1212,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

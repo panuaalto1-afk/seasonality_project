@@ -1,3 +1,4 @@
+
 # build_prices_from_indexes.py (reuse-first for cross-asset proxies)
 # ------------------------------------------------------------------
 # Esim:
@@ -21,7 +22,7 @@ except Exception:
 PROJECT_ROOT = Path(__file__).resolve().parent
 REPORTS_ROOT_DEFAULT = PROJECT_ROOT / "seasonality_reports"
 
-CROSS_ASSET = ["SHY","IEF","TLT","HYG","LQD","UUP","USO","GLD","CPER","TIP","RINF"]
+CROSS_ASSET = ["SHY","IEF","TLT","HYG","LQD","UUP","USO","GLD","CPER","TIP","RINF","SPY","QQQ","IWM","^SPX","^VIX"]
 COPPER_FUT = "HG=F"
 
 def ensure_dir(p: Path): p.mkdir(parents=True, exist_ok=True)

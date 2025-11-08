@@ -1,972 +1,417 @@
-# 🌟 Seasonality Trading System - Complete Technical Documentation
+YHTEENVETO: Seasonality Trading System
 
-**Project Owner:** panuaalto1-afk  
-**Repository:** https://github.com/panuaalto1-afk/seasonality_project  
-**Last Updated:** 2025-11-06 18:59 UTC  
-**Python Version:** 3.11+  
-**Trading Universe:** S&P 500 constituents (~500 stocks)  
-**Trading Strategy:** Long/Short seasonality + ML-driven momentum + Inverse ETF hedging
+Päivitetty: 2025-11-07 22:41 (Suomen aika)
+Tila: ✅ Kaikki 10 ajastettua tehtävää toimii
+Regime System: ✅ Palautettu GitHubista (regime_detector.py, regime_strategies.py)
+📋 1. AJASTETUT TEHTÄVÄT (10 kpl)
+Aika	Task Scheduler Nimi	Skripti	Tulos	Seuraava
+02:00	Seasonality – US Seasonality Full	us_seasonality_full.py	❌ Ei ajettu (seuraava: 20.12.2025)	20.12.2025 02:56
+10:00	Seasonality Prices klo 1000	build_prices_from_constituents.py	✅ 7.11.2025 10:00	08.11.2025 10:00
+10:30	Aggregate seasonality picker klo 1030	run_aggregate_picker_daily.cmd	✅ 7.11.2025 10:30	10.11.2025 10:30
+10:50	Trading_UpdateRegimePrices	update_regime_prices.bat	✅ 7.11.2025 21:59	10.11.2025 10:50
+11:00	ML Unified pipeline klo 1100	ml_unified_pipeline.py	✅ 7.11.2025 11:00	10.11.2025 11:00
+12:00	Seasonality – Build index prices	build_prices_from_indexes.py	✅ 7.11.2025 12:00	10.11.2025 12:00
+15:00	Optio seasonality signal klo 1500	run_optio_signals_daily.cmd	✅ 7.11.2025 15:00	10.11.2025 15:00
+15:30	Optio seasonality price enricher 1530	run_optio_enricher_daily.cmd	✅ 7.11.2025 15:30	10.11.2025 15:30
+15:45	Optio unified daily 1545	run_optio_unified_daily.cmd	✅ 7.11.2025 15:45	10.11.2025 15:45
+15:55	seasonality_auto_decider	run_auto_decider.cmd	✅ 7.11.2025 21:26	10.11.2025 15:55
+📂 2. HAKEMISTOPUU
+Code
 
----
-
-## 📋 Table of Contents
-
-1. [Directory Structure](#-complete-directory-structure)
-2. [Daily Automated Schedule](#-daily-automated-schedule-weekdays-only)
-3. [Data Flow Diagram](#-complete-data-flow-diagram)
-4. [Inverse ETF System](#-inverse-etf-trading-system) ⭐ NEW
-5. [Regime Detection](#-regime-based-position-limits)
-6. [Stop Loss & Take Profit](#-stop-loss--take-profit-calculation-atr-based)
-7. [Portfolio State](#-portfolio-state-schema)
-8. [Command Line Usage](#-command-line-usage)
-9. [Troubleshooting](#-troubleshooting)
-
----
-
-## 📁 Complete Directory Structure
-
-```
 C:\Users\panua\seasonality_project\
 │
-├── 📊 PRICE DATA (Two Separate Caches)
+├── 🐍 PYTHON-SKRIPTIT (Juuressa)
+│   ├── us_seasonality_full.py                    [02:00 Kuukausittain 20. päivä]
+│   ├── build_prices_from_constituents.py         [10:00 Päivittäin]
+│   ├── aggregate_seasonality_picker.py           [10:30 Päivittäin]
+│   ├── build_prices_from_indexes.py              [10:50 & 12:00 Päivittäin]
+│   ├── ml_unified_pipeline.py                    [11:00 Päivittäin]
+│   ├── optio_seasonality_signal.py               [15:00 Päivittäin]
+│   ├── optio_seasonality_price_enricher.py       [15:30 Päivittäin]
+│   ├── optio_unified_daily.py                    [15:45 Päivittäin]
+│   ├── auto_decider.py                           [15:55 Päivittäin]
+│   ├── regime_detector.py                        ⭐ Palautettu GitHubista 7.11.2025
+│   └── regime_strategies.py                      ⭐ Palautettu GitHubista 7.11.2025
+│
+├── 📋 BATCH-TIEDOSTOT (Task Scheduler wrapperit)
+│   ├── update_regime_prices.bat                  ⭐ Luotu 7.11.2025
+│   ├── run_auto_decider.cmd
+│   ├── run_aggregate_picker_daily.cmd
+│   ├── run_optio_signals_daily.cmd
+│   ├── run_optio_enricher_daily.cmd
+│   └── run_optio_unified_daily.cmd
+│
+├── ⚙️  KONFIGURAATIOT
+│   ├── .env                                      [Email: EMAIL_USER, EMAIL_APP_PASSWORD]
+│   └── seasonality_reports\
+│       ├── portfolio_state.json                  ⚠️ KRIITTINEN - Nykyiset positiot
+│       └── Constituents_raw.csv                  [Universe: ~500 osaketta]
+│
+├── 💾 PRICE CACHE (Kaksi erillistä)
 │   │
 │   ├── seasonality_reports\runs\2025-10-04_0903\price_cache\
-│   │   ├── AMD.csv                    # 20-year history, OVERWRITE daily (10:00 UTC)
-│   │   ├── AAPL.csv                   # All stock prices (516 files)
-│   │   ├── NVDA.csv                   # Updated by: build_prices_from_constituents.py
-│   │   ├── SH.csv                     # ⭐ Inverse ETFs (NEW)
-│   │   ├── PSQ.csv                    # ⭐ Added automatically in bearish regimes
-│   │   ├── DOG.csv
-│   │   ├── RWM.csv
-│   │   └── ...                        # Used by: ml_unified_pipeline.py, auto_decider.py
+│   │   └── 517 tiedostoa                         [Osakkeet: AMD, AAPL... + Indeksit: SPY, QQQ, IWM...]
+│   │                                            [Käyttö: auto_decider.py - Hinnat, ATR, SL/TP]
 │   │
 │   └── seasonality_reports\price_cache\
-│       ├── ^SPX.csv                   # Index prices, updated 12:00 UTC
-│       ├── ^VIX.csv                   # Updated by: build_prices_from_indexes.py
-│       ├── TLT.csv                    # Used by: regime_detector.py
-│       ├── GLD.csv
-│       └── ...
+│       └── 16 tiedostoa                          [Indeksit: ^SPX, ^VIX, SPY, QQQ, IWM, TLT, GLD...]
+│                                                [Käyttö: regime_detector.py - Regime tunnistus]
 │
-├── 🤖 ML PIPELINE & FEATURES
-│   ├── ml_unified_pipeline.py         # Main orchestrator (11:00 UTC)
-│   │                                  # ⭐ Auto-adds inverse ETFs in bearish regimes
-│   ├── ml_features.py                 # Technical indicators (RSI, MACD, ATR, BB, etc.)
-│   ├── ml_sector_features.py          # Sector rotation signals
-│   ├── ml_sector_rotation.py          # Sector strength ranking
-│   ├── ml_models.py                   # XGBoost/LightGBM models
-│   └── seasonality_calc.py            # Historical seasonality patterns
+├── 📊 PÄIVITTÄISET TULOKSET
+│   └── seasonality_reports\runs\2025-11-07_0000\
+│       │
+│       ├── reports\
+│       │   ├── features_2025-11-07.csv
+│       │   ├── labels_2025-11-07.csv
+│       │   ├── top_long_candidates_RAW_2025-11-07.csv
+│       │   ├── top_long_candidates_GATED_2025-11-07.csv    ⚡ auto_decider INPUT
+│       │   ├── top_short_candidates_RAW_2025-11-07.csv
+│       │   └── top_short_candidates_GATED_2025-11-07.csv
+│       │
+│       └── actions\20251107\
+│           ├── action_plan.txt                   [Yhteenveto kauppapäätöksistä]
+│           ├── trade_candidates.csv              [BUY orders: Entry, SL, TP]
+│           ├── sell_candidates.csv               [SELL orders: P/L%]
+│           ├── portfolio_after_sim.csv           [Portfolio kauppojen jälkeen]
+│           └── exit_watchlist.csv                [Stop-loss seuranta]
 │
-├── 📈 REGIME DETECTION
-│   ├── regime_detector.py             # Market regime classifier
-│   ├── regime_strategies.py           # Regime-specific configs
-│   │                                  # ⭐ Includes inverse ETF allocations
-│   └── seasonality_reports\aggregates\regime_research\
-│       └── 2025-10-17\                # Regime analysis results
-│
-├── 🎯 TRADE DECISION ENGINE
-│   ├── auto_decider.py                # Main automation (15:55 UTC) ⚡
-│   │                                  # ⭐ CRISIS mode: Exit longs, buy inverse ETFs
-│   │                                  # ⭐ Bearish modes: Include inverse ETFs in candidates
-│   ├── make_exit_watchlist.py         # Stop-loss monitoring (16:05 UTC)
-│   └── send_trades_email.py           # Email notifications (automatic)
-│
-├── 📊 OPTIONS STRATEGIES (Separate Pipeline)
-│   ├── optio_seasonality_signal.py    # Generate signals (15:00 UTC)
-│   ├── optio_seasonality_price_enricher.py  # Enrich prices (15:30 UTC)
-│   ├── optio_unified_daily.py         # Unified pipeline (15:30 UTC)
+├── 📈 OPTIO-TULOKSET
 │   └── seasonality_reports\aggregates\
-│       ├── optio_signals\2025-11-06\  # Daily options signals
-│       │   ├── top_breakout_long.csv
-│       │   ├── top_breakout_short.csv
-│       │   └── exit_alerts.csv
 │       │
-│       └── optio_signals_enriched\2025-11-06\
-│           └── optio_price_enriched_*.csv  # Priced options
-│
-├── 📋 SEASONALITY DATA
-│   ├── aggregate_seasonality_picker.py  # Daily aggregation (12:00 UTC)
-│   ├── us_seasonality_full.py         # Monthly full rebuild (02:00 UTC, 20th)
-│   │                                  # ⭐ Auto-adds inverse ETFs to universe
-│   └── seasonality_reports\
-│       ├── us_seasonality_*.csv       # Seasonality patterns (root level)
-│       └── aggregates\
-│           └── segments\2025-11-06\   # Ticker pools
-│               └── tickers_pool.csv
-│
-├── 🗂️ DAILY RUNS & OUTPUTS
-│   └── seasonality_reports\runs\
-│       ├── 2025-11-06_0000\           # Today's run
-│       │   ├── reports\
-│       │   │   ├── features_2025-11-06.csv
-│       │   │   ├── labels_2025-11-06.csv
-│       │   │   ├── top_long_candidates_RAW_2025-11-06.csv
-│       │   │   ├── top_long_candidates_GATED_2025-11-06.csv  ← AUTO_DECIDER INPUT ⚡
-│       │   │   ├── top_short_candidates_RAW_2025-11-06.csv
-│       │   │   └── top_short_candidates_GATED_2025-11-06.csv
-│       │   │
-│       │   └── actions\20251106\
-│       │       ├── trade_candidates.csv      # BUY orders (EntryPrice, Stop/TP)
-│       │       │                             # ⭐ May include inverse ETFs in CRISIS
-│       │       ├── sell_candidates.csv       # SELL orders (CurrentPrice, Stop/TP)
-│       │       ├── action_plan.txt           # Human-readable summary
-│       │       ├── portfolio_after_sim.csv   # Expected portfolio
-│       │       └── exit_watchlist.csv        # Stop-loss monitoring
+│       ├── optio_signals\2025-11-07\
+│       │   ├── top_breakout_long.csv             [Long optio-signaalit]
+│       │   ├── top_breakout_short.csv            [Short optio-signaalit]
+│       │   ├── exit_alerts.csv                   [Exit signaalit]
+│       │   └── *.html                            [Raportti HTML]
 │       │
-│       └── 2025-10-04_0903\
-│           └── price_cache\          # ← CANONICAL STOCK PRICE CACHE
-│               └── *.csv             #    (516 stocks + 4 inverse ETFs)
+│       └── optio_signals_enriched\2025-11-07\
+│           ├── optio_price_enriched_all.csv      [Hinnoitetut optiot]
+│           ├── optio_price_enriched_long.csv
+│           ├── optio_price_enriched_short.csv
+│           └── regime_sector_momentum.csv
 │
-├── 🧪 TESTING & UTILITIES
-│   ├── test_inverse_etfs.py          # ⭐ Test inverse ETF imports
-│   ├── test_crisis_scenario.py       # ⭐ Simulate CRISIS mode
-│   ├── inverse_etf_downloader.py     # ⭐ Download inverse ETF prices
-│   ├── advanced_backtest_analyzer.py
-│   ├── backtest_utils.py
-│   └── backtest_visualizer.py
-│
-└── 📋 CONFIGURATION
-    ├── portfolio_state.json          # Current positions (CRITICAL!) ⚠️
-    ├── .env                          # Email credentials (gitignored)
-    └── .gitignore
-```
+└── 📜 LOKIT
+    ├── logs\
+    │   ├── update_regime_prices_last.log         [10:50 ajo]
+    │   ├── auto_decider_last.log                 [15:55 ajo]
+    │   ├── auto_decider_debug.log
+    │   └── email_test.log
+    │
+    └── seasonality_reports\logs\
+        ├── auto_decider.log
+        └── optio_unified_daily.log
 
----
+🔄 3. DATA FLOW (Päivittäinen Prosessi)
+Code
 
-## ⏰ Daily Automated Schedule (Weekdays Only)
-
-| Time (UTC) | Time (ET) | Script | Purpose | Output |
-|------------|-----------|--------|---------|--------|
-| **02:00** (20th) | 21:00 (19th) | `us_seasonality_full.py` | Monthly full seasonality rebuild<br>⭐ **Adds inverse ETFs to universe** | `us_seasonality_*.csv` |
-| **10:00** ⚡ | 05:00 | `build_prices_from_constituents.py` | Download stock prices (516 tickers)<br>⭐ **Includes SH, PSQ, DOG, RWM** | `2025-10-04_0903/price_cache/*.csv` |
-| **11:00** ⚡ | 06:00 | `ml_unified_pipeline.py` | **Generate ML signals**<br>⭐ **Auto-adds inverse ETFs in bearish regimes** | `top_long_candidates_GATED_*.csv` |
-| **12:00** | 07:00 | `build_prices_from_indexes.py` | Download index prices (SPX, VIX, TLT...) | `price_cache/^*.csv` |
-| **12:00** | 07:00 | `aggregate_seasonality_picker.py` | Daily seasonality aggregation | `seasonality_agg_*.csv` |
-| **15:00** | 10:00 | `optio_seasonality_signal.py` | Generate options signals | `top_breakout_*.csv` |
-| **15:30** | 10:30 | `optio_seasonality_price_enricher.py` | Enrich options with prices | `optio_price_enriched_*.csv` |
-| **15:30** | 10:30 | `optio_unified_daily.py` | Unified options pipeline | Final options candidates |
-| **15:55** ⚡⚡⚡ | 10:55 | `auto_decider.py` | **STOCK TRADE DECISIONS**<br>⭐ **CRISIS: Exit longs, buy inverse ETFs** | `trade_candidates.csv`, `sell_candidates.csv` |
-| **16:05** | 11:05 | `make_exit_watchlist.py` | Generate stop-loss alerts | `exit_watchlist.csv` |
-
-**⏱️ Market Opens:** 09:30 ET (14:30 UTC) - Auto_decider completes 5 minutes **before** open
-
----
-
-## 🔄 Complete Data Flow Diagram
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│ OVERNIGHT: Price Data Collection                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-
-[02:00 UTC - Monthly 20th]
+[02:00 Kuukauden 20. päivä]
 us_seasonality_full.py
-         ↓
-  ⭐ Add inverse ETFs to universe
-         ├── INVERSE_ETFS = ['SH', 'PSQ', 'DOG', 'RWM']
-         └── universe = list(set(universe + INVERSE_ETFS))
-         ↓
-  Full seasonality database rebuild
+    └─> Rakentaa seasonality-tietokannan (20v historia)
 
-[10:00 UTC Daily] ⚡
+[10:00]
 build_prices_from_constituents.py
-         ↓
-  C:\...\runs\2025-10-04_0903\price_cache\
-         ├── AMD.csv (OVERWRITE 20yr history)
-         ├── AAPL.csv
-         ├── SH.csv   ⭐ (Inverse S&P 500)
-         ├── PSQ.csv  ⭐ (Inverse Nasdaq)
-         ├── DOG.csv  ⭐ (Inverse Dow 30)
-         ├── RWM.csv  ⭐ (Inverse Russell 2000)
-         └── ... (520 total tickers)
+    └─> Lataa 517 osakkeen hinnat (20v, OVERWRITE)
+        └─> runs/2025-10-04_0903/price_cache/*.csv
 
-[12:00 UTC Daily]
-build_prices_from_indexes.py
-         ↓
-  C:\...\seasonality_reports\price_cache\
-         ├── ^SPX.csv (OVERWRITE)
-         ├── ^VIX.csv
-         ├── TLT.csv
-         └── ...
-
-[12:00 UTC Daily]
+[10:30]
 aggregate_seasonality_picker.py
-         ↓
-  seasonality_agg_2025-11-06.csv
+    └─> Aggregoi päivän seasonality-signaalit
 
+[10:50] ⭐ UUSI
+update_regime_prices.bat → build_prices_from_indexes.py
+    └─> Lataa 16 indeksin hinnat (SPY, QQQ, IWM, ^SPX, ^VIX...)
+        └─> seasonality_reports/price_cache/*.csv
 
-┌─────────────────────────────────────────────────────────────────────────┐
-│ MORNING: ML Signal Generation (11:00 UTC)                                │
-└─────────────────────────────────────────────────────────────────────────┘
-
-[11:00 UTC] ⚡ CRITICAL PATH
+[11:00]
 ml_unified_pipeline.py
-         ├── Reads: 2025-10-04_0903/price_cache/*.csv
-         ├── Detects regime: regime_detector.py
-         │    └── If bearish → Auto-add inverse ETFs
-         │
-         ├── ⭐ REGIME-AWARE UNIVERSE:
-         │    ├── BULL: 516 stocks only
-         │    ├── NEUTRAL_BEARISH: 516 stocks + SH, PSQ
-         │    ├── BEAR_WEAK: 516 stocks + SH, PSQ, DOG
-         │    └── CRISIS: 516 stocks + SH, PSQ
-         │
-         ├── Calculates: mom5, mom20, mom60, vol20, ATR
-         ├── Generates: Composite scores (0-1 ranking)
-         └── Outputs:
-             ├── features_2025-11-06.csv
-             ├── top_long_candidates_RAW_2025-11-06.csv  (200 stocks)
-             └── top_long_candidates_GATED_2025-11-06.csv  (filtered) ← AUTO_DECIDER INPUT
+    ├─> LUKEE: runs/2025-10-04_0903/price_cache/*.csv
+    ├─> KUTSUU: regime_detector.py (jos löytyy)
+    │   └─> LUKEE: seasonality_reports/price_cache/*.csv
+    ├─> Laskee: ML features (momentum, volatility, ATR...)
+    └─> TUOTTAA: top_long_candidates_GATED_2025-11-07.csv
+
+[12:00]
+build_prices_from_indexes.py (toinen ajo)
+    └─> Lataa indeksit runs/2025-10-04_0903/price_cache/ (sama kuin 10:50)
+
+[15:00]
+optio_seasonality_signal.py
+    └─> TUOTTAA: top_breakout_long/short.csv
+
+[15:30]
+optio_seasonality_price_enricher.py
+    └─> TUOTTAA: optio_price_enriched_*.csv (hinnoitetut optiot)
+
+[15:45]
+optio_unified_daily.py
+    └─> Yhdistää optio-signaalit
+
+[15:55] ⚡⚡⚡ KRIITTISIN
+run_auto_decider.cmd → auto_decider.py
+    ├─> LUKEE: top_long_candidates_GATED_2025-11-07.csv
+    ├─> LUKEE: portfolio_state.json
+    ├─> LUKEE: runs/2025-10-04_0903/price_cache/*.csv (osakkeiden hinnat)
+    │
+    ├─> KUTSUU: regime_detector.py
+    │   └─> LUKEE: seasonality_reports/price_cache/*.csv (indeksit)
+    │   └─> PALAUTTAA: regime (BULL/NEUTRAL/BEAR/CRISIS)
+    │
+    ├─> KUTSUU: regime_strategies.py
+    │   └─> PALAUTTAA: max_positions, position_size_factor
+    │
+    ├─> PÄÄTTÄÄ: BUY / SELL / HOLD
+    │
+    ├─> TUOTTAA: actions/20251107/
+    │   ├── action_plan.txt
+    │   ├── trade_candidates.csv (BUY)
+    │   ├── sell_candidates.csv (SELL)
+    │   └── portfolio_after_sim.csv
+    │
+    ├─> PÄIVITTÄÄ: portfolio_state.json (jos --commit 1)
+    │
+    └─> LÄHETTÄÄ: Email 📧 panu.aalto1@gmail.com
+        └─> Liitteet: action_plan.txt, trade_candidates.csv, sell_candidates.csv
+
+🧠 4. REGIME DETECTION SYSTEM
+regime_detector.py (Palautettu 7.11.2025)
+
+Tarkoitus: Tunnistaa markkinaregime 5 komponentin perusteella
+
+Komponentit:
+
+    Equity Momentum (SPY, QQQ, IWM) - 35% paino
+    Volatility (SPY realized vol) - 20% paino
+    Credit Spreads (HYG vs LQD) - 20% paino
+    Safe Haven Flows (GLD, TLT) - 15% paino
+    Market Breadth (SPY vs IWM korrelaatio) - 10% paino
+
+Input: seasonality_reports/price_cache/*.csv (16 indeksiä)
+
+Output:
+Python
 
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│ PRE-OPEN: Trade Decision Engine (15:55 UTC) ⚡⚡⚡                        │
-└─────────────────────────────────────────────────────────────────────────┘
-
-[15:55 UTC] ⚡ MOST CRITICAL SCRIPT ⚡
-
-auto_decider.py
-         │
-         ├─[INPUT 1]─→ top_long_candidates_GATED_2025-11-06.csv
-         │             (from ml_unified_pipeline.py)
-         │
-         ├─[INPUT 2]─→ portfolio_state.json
-         │             (current 8 positions)
-         │
-         ├─[INPUT 3]─→ regime_detector.py
-         │             ├── Reads: price_cache/^SPX.csv, ^VIX.csv, TLT.csv
-         │             └── Returns: NEUTRAL_BULLISH / CRISIS / etc.
-         │
-         ├─[LOGIC]────→ Decide BUY/SELL/HOLD
-         │             │
-         │             ├── ⭐ CRISIS MODE LOGIC:
-         │             │    ├── Separate: inverse_etfs vs longs
-         │             │    │    └── inverse = {SH, PSQ, DOG, RWM}
-         │             │    ├── SELL: All long positions
-         │             │    ├── BUY: Inverse ETFs (80% allocation)
-         │             │    └── HOLD: Existing inverse ETFs
-         │             │
-         │             ├── ⭐ BEARISH MODE LOGIC:
-         │             │    ├── Include inverse ETFs in candidate pool
-         │             │    ├── Allocate: 20-60% to inverse ETFs
-         │             │    └── Reduce: Long positions to 2-6 max
-         │             │
-         │             └── NORMAL MODE:
-         │                  ├── Compare: Portfolio vs. Top-8 candidates
-         │                  ├── Regime filter: NEUTRAL_BULLISH → max 8 pos, 90% size
-         │                  └── Calculate: Stop Loss & Take Profit (ATR-based)
-         │
-         └─[OUTPUTS]──→ actions/20251106/
-                        ├── trade_candidates.csv       ← BUY orders + Stop/TP
-                        │                              ⭐ May include SH, PSQ in CRISIS
-                        ├── sell_candidates.csv        ← SELL orders + Stop/TP
-                        ├── action_plan.txt            ← Human summary
-                        └── portfolio_after_sim.csv    ← Expected state
-
-         ↓
-
-send_trades_email.py (AUTOMATIC)
-         ↓
-  📧 Email to: panu.aalto1@gmail.com
-     Attachments: trade_candidates.csv, sell_candidates.csv, action_plan.txt
-```
-
----
-
-## 🛡️ Inverse ETF Trading System
-
-### Overview
-Automatic inverse ETF allocation during bearish market regimes for portfolio protection. **Fully integrated** with regime detection and auto_decider logic.
-
-### Supported Inverse ETFs
-
-| Ticker | Name | Tracks | Leverage | Expense Ratio |
-|--------|------|--------|----------|---------------|
-| **SH** | ProShares Short S&P 500 | Inverse SPY | 1x | 0.89% |
-| **PSQ** | ProShares Short QQQ | Inverse Nasdaq | 1x | 0.95% |
-| **DOG** | ProShares Short Dow 30 | Inverse DIA | 1x | 0.95% |
-| **RWM** | ProShares Short Russell 2000 | Inverse IWM | 1x | 0.95% |
-
-**⚠️ Note:** Using 1x leverage for stability. 3x leveraged ETFs (SQQQ, SPXS) can be added for aggressive strategies.
-
-### Allocation by Regime
-
-| Regime | Short % | Max Positions | Inverse ETFs | Strategy |
-|--------|---------|---------------|--------------|----------|
-| **CRISIS** | **80%** | 2 | SH, PSQ | Exit all longs, buy inverse ETFs |
-| **BEAR_STRONG** | 60% | 2 | SH, PSQ, DOG | Defensive + inverse hedging |
-| **BEAR_WEAK** | 40% | 4 | SH, PSQ, DOG | Mean reversion + hedging |
-| **NEUTRAL_BEARISH** | 20% | 6 | SH, PSQ | Cautious with small hedge |
-| **NEUTRAL_BULLISH** | 0% | 8 | None | No shorts |
-| **BULL_WEAK** | 0% | 10 | None | Selective momentum |
-| **BULL_STRONG** | 0% | 12 | None | Full momentum |
-
-### CRISIS Mode Example
-
-**Scenario:** Market crashes, VIX > 40, SPX < 200-day MA
-
-**Initial Portfolio:**
-```
-Cash: $50,000
-AAPL: $15,000 (100 shares @ $150)
-MSFT: $15,000 (50 shares @ $300)
-Total: $80,000
-```
-
-**auto_decider.py Actions (15:55 UTC):**
-```
-[CRISIS MODE] Exiting all long positions
-
-SELL:
-- AAPL: 100 shares @ $150.00 → $15,000 cash
-- MSFT: 50 shares @ $300.00 → $15,000 cash
-Reason: CRISIS_EXIT_LONGS
-
-BUY (80% allocation = $64,000):
-- SH: 868 shares @ $36.90 → $32,000 (40% allocation)
-- PSQ: 1,049 shares @ $30.50 → $32,000 (40% allocation)
-Reason: INVERSE_ETF_CRISIS_80%
-
-HOLD:
-- Cash: $16,000 (20%)
-```
-
-**Result:**
-- ✅ Protected against market decline
-- ✅ Profit if S&P 500 drops (e.g., -10% market = +10% SH gain)
-- ✅ Maintain liquidity for opportunities
-
-### Bearish Mode Example
-
-**Scenario:** NEUTRAL_BEARISH regime (score: -0.05)
-
-**Portfolio Before:**
-```
-8 positions (AMD, AAPL, MSFT, NVDA, GOOGL, META, TSLA, CRM)
-```
-
-**auto_decider.py Actions:**
-```
-[NEUTRAL_BEARISH MODE] Max 6 positions, 20% inverse allocation
-
-SELL (weakest 2 longs):
-- META: Sell (ml_score dropped)
-- CRM: Sell (momentum fading)
-
-BUY (inverse ETFs):
-- SH: $8,000 (10% allocation)
-- PSQ: $8,000 (10% allocation)
-
-HOLD (strongest 4 longs):
-- NVDA, AAPL, MSFT, AMD (top ml_scores)
-```
-
-**Result:**
-- ✅ Reduced long exposure (6 → 4 positions)
-- ✅ Added 20% inverse hedge
-- ✅ Maintain quality long positions
-
-### Implementation Details
-
-#### 1. **us_seasonality_full.py** (Universe Generation)
-```python
-# Lines 347-350
-INVERSE_ETFS = ['SH', 'PSQ', 'DOG', 'RWM']
-universe = list(set(universe + INVERSE_ETFS))
-print(f"[INFO] Added {len(INVERSE_ETFS)} inverse ETFs to universe: {', '.join(INVERSE_ETFS)}")
-```
-
-#### 2. **ml_unified_pipeline.py** (Auto-Include in Bearish Regimes)
-```python
-# Lines 326-332
-BEAR_MARKET_INVERSE_ETFS = ['SH', 'PSQ', 'DOG', 'RWM']
-
-if regime in ['NEUTRAL_BEARISH', 'WEAK_BEARISH', 'BEAR_WEAK', 'BEAR_STRONG', 'CRISIS']:
-    original_count = len(universe)
-    universe = list(set(universe + BEAR_MARKET_INVERSE_ETFS))
-    added_count = len(universe) - original_count
-    if added_count > 0:
-        print(f"[INFO] Added {added_count} inverse ETFs for {regime} regime")
-```
-
-#### 3. **auto_decider.py** (CRISIS & Bearish Logic)
-```python
-# Lines 425-458: CRISIS Mode
-if regime == 'CRISIS':
-    print(f"\n[CRISIS MODE] Exiting all long positions")
-    
-    # Separate inverse ETFs from regular stocks
-    all_inverse_etfs = set(['SH', 'PSQ', 'DOG', 'RWM', 'SQQQ'])
-    inverse_etfs_in_portfolio = current_tickers & all_inverse_etfs
-    longs_in_portfolio = current_tickers - all_inverse_etfs
-    
-    # Sell all longs
-    decisions['sell'] = list(longs_in_portfolio)
-    for ticker in longs_in_portfolio:
-        decisions['reason'][ticker] = 'CRISIS_EXIT_LONGS'
-    
-    # Buy inverse ETFs if strategy allows
-    if strategy and not no_new_positions:
-        inverse_to_buy, inverse_reasons = allocate_inverse_etfs(
-            candidates_df, portfolio_state, regime_data, strategy
-        )
-        decisions['buy'] = inverse_to_buy
-        decisions['reason'].update(inverse_reasons)
-    
-    # Hold existing inverse ETFs
-    decisions['hold'] = list(inverse_etfs_in_portfolio)
-    
-    return decisions
-
-# Lines 487-496: Bearish Mode
-if strategy and regime in ['NEUTRAL_BEARISH', 'BEAR_WEAK', 'BEAR_STRONG']:
-    inverse_to_add, inverse_reasons = allocate_inverse_etfs(
-        candidates_df, portfolio_state, regime_data, strategy
-    )
-    # Add inverse ETFs to candidate pool
-    if inverse_to_add:
-        candidate_tickers = candidate_tickers.union(set(inverse_to_add))
-        decisions['reason'].update(inverse_reasons)
-```
-
-#### 4. **regime_strategies.py** (Regime Configs)
-```python
-# Lines 15-102 (excerpt)
-'CRISIS': {
-    'allow_shorts': True,
-    'short_allocation': 0.80,  # 80% to inverse ETFs
-    'inverse_etfs': ['SH', 'PSQ'],
-    'max_positions': 2,
-    'position_size_factor': 0.90
-},
-'BEAR_WEAK': {
-    'allow_shorts': True,
-    'short_allocation': 0.40,  # 40% to inverse ETFs
-    'inverse_etfs': ['SH', 'PSQ', 'DOG'],
-    'max_positions': 4,
-    'position_size_factor': 0.80
-},
-'NEUTRAL_BEARISH': {
-    'allow_shorts': True,
-    'short_allocation': 0.20,  # 20% to inverse ETFs
-    'inverse_etfs': ['SH', 'PSQ'],
-    'max_positions': 6,
-    'position_size_factor': 0.70
-}
-```
-
-### Testing Inverse ETF System
-
-#### Test 1: Import & Configuration
-```bash
-python test_inverse_etfs.py
-```
-
-**Expected Output:**
-```
-✅ All imports successful
-✅ Inverse ETFs available: ['SH', 'PSQ', 'DOG', 'RWM']
-✅ NEUTRAL_BEARISH: shorts=True, allocation=20%, ETFs=['SH', 'PSQ']
-✅ BEAR_WEAK: shorts=True, allocation=40%, ETFs=['SH', 'PSQ', 'DOG']
-✅ CRISIS: shorts=True, allocation=80%, ETFs=['SH', 'PSQ']
-✅ All systems ready for inverse ETF trading!
-```
-
-#### Test 2: CRISIS Scenario Simulation
-```bash
-python test_crisis_scenario.py
-```
-
-**Expected Output:**
-```
-🧪 Testing CRISIS scenario simulation
-
-Portfolio:
-  Cash: $50,000
-  Positions: $30,000
-  Total: $80,000
-
-Regime: CRISIS
-Short allocation target: 80%
-Target inverse allocation: $64,000
-
-[SHORT ALLOCATION]
-  Regime: CRISIS
-  Target allocation: 80.0% ($64,000)
-  Selected inverse ETFs: SH, PSQ
-
-Selected inverse ETFs: ['SH', 'PSQ']
-Reasons: ['INVERSE_ETF_CRISIS_80%', 'INVERSE_ETF_CRISIS_80%']
-
-✅ CRISIS mode would buy: SH, PSQ
-```
-
-#### Test 3: Download Inverse ETF Prices
-```bash
-python inverse_etf_downloader.py
-```
-
-**Expected Output:**
-```
-📥 Downloading inverse ETF price data...
-
-Downloading SH... ✅ 502 days, latest: $36.90
-Downloading PSQ... ✅ 502 days, latest: $30.50
-Downloading DOG... ✅ 502 days, latest: $24.20
-Downloading RWM... ✅ 502 days, latest: $16.90
-
-✅ Inverse ETF data ready!
-```
-
-### Configuration Options
-
-#### Add 3x Leveraged Inverse ETFs (Advanced)
-
-Edit `regime_strategies.py`:
-```python
-'CRISIS': {
-    'allow_shorts': True,
-    'short_allocation': 0.60,  # Reduce % due to 3x leverage
-    'inverse_etfs': ['SQQQ', 'SPXS'],  # 3x short ETFs
-    'max_positions': 2
-}
-```
-
-Edit `ml_unified_pipeline.py`:
-```python
-BEAR_MARKET_INVERSE_ETFS = ['SH', 'PSQ', 'DOG', 'RWM', 'SQQQ', 'SPXS']
-```
-
-**⚠️ Warning:** 3x leveraged ETFs have:
-- Higher volatility decay
-- Daily rebalancing losses
-- NOT suitable for holding > 1-2 weeks
-
-#### Customize Allocation Percentages
-
-Edit `regime_strategies.py`:
-```python
-'NEUTRAL_BEARISH': {
-    'short_allocation': 0.30,  # Change from 20% to 30%
-}
-```
-
-### When Inverse ETFs Are Used
-
-| Market Condition | Inverse ETF Action | Rationale |
-|-----------------|-------------------|-----------|
-| **VIX > 40** | CRISIS → 80% allocation | Extreme fear, market panic |
-| **SPX < 200 MA** | BEAR_STRONG → 60% allocation | Confirmed downtrend |
-| **Breadth < 30%** | BEAR_WEAK → 40% allocation | Weak market internals |
-| **Negative momentum** | NEUTRAL_BEARISH → 20% allocation | Early warning signal |
-| **Normal conditions** | 0% allocation | Long-only strategy |
-
-### Limitations & Best Practices
-
-#### ✅ Best Practices:
-1. **Short-term hedging** (1-4 weeks maximum)
-2. **CRISIS mode only** for aggressive allocations
-3. **Monitor daily** for exit signals
-4. **Combine with cash** (don't go 100% inverse)
-
-#### ❌ Avoid:
-1. **Long-term holding** (decay over time)
-2. **100% inverse allocation** (leaves no liquidity)
-3. **3x leverage** unless experienced
-4. **Emotional decisions** (follow regime signals)
-
-#### ⚠️ Risks:
-- **Volatility decay** in sideways markets
-- **Tracking errors** due to daily rebalancing
-- **Whipsaw losses** if regime changes rapidly
-- **Contango** (futures-based ETFs)
-
----
-
-## 🧠 Regime-Based Position Limits
-
-| Regime | Max Positions | Position Size | Inverse ETF % | Strategy Type | Trigger |
-|--------|--------------|---------------|---------------|---------------|---------|
-| **CRISIS** | 2 | 90% | **80%** | Exit longs, buy inverse ETFs | VIX > 40 OR Score < -0.20 |
-| **BEAR_STRONG** | 2 | 80% | **60%** | Defensive + inverse hedging | Score: -0.20 to -0.10 |
-| **BEAR_WEAK** | 4 | 80% | **40%** | Mean reversion + hedging | Score: -0.10 to 0 |
-| **NEUTRAL_BEARISH** | 6 | 70% | **20%** | Cautious with small hedge | Score: 0 to -0.10 |
-| **NEUTRAL_BULLISH** | 8 | 90% | 0% | Balanced long-only | Score: 0 to +0.10 |
-| **BULL_WEAK** | 10 | 100% | 0% | Selective momentum | Score: +0.10 to +0.20 |
-| **BULL_STRONG** | 12 | 120% | 0% | Aggressive momentum | Score > +0.20 |
-
-**Current Regime (2025-11-06):** NEUTRAL_BULLISH (score: 0.158, confidence: 16.1%)
-
-**Regime Detection Sources:**
-- SPX trend (20/50/200 SMA crossovers)
-- VIX level (fear gauge)
-- Sector breadth (% sectors above 50-day MA)
-- Market internals (advance/decline)
-- **NEW:** Inverse ETF allocation rules
-
----
-
-## 🎯 Stop Loss & Take Profit Calculation (ATR-Based)
-
-**Method:** 14-period Average True Range (Wilder's method)
-
-```python
-# For BUY positions (new entries)
-EntryPrice = Current Close Price
-ATR = 14-day Average True Range
-StopLoss = EntryPrice - (1.0 × ATR)      # 1 ATR risk
-TakeProfit = EntryPrice + (3.0 × ATR)    # 3 ATR target
-
-# Risk/Reward Ratio: 1:3
-
-# For SELL positions (exits)
-CurrentPrice = Latest Close
-StopLoss = Original EntryPrice - (1.0 × ATR)
-TakeProfit = Original EntryPrice + (3.0 × ATR)
-```
-
-**Example (AMD):**
-```
-EntryPrice: $250.05
-ATR (14d): $6.12
-StopLoss: $243.93  (-2.4% risk)
-TakeProfit: $268.41  (+7.3% target)
-```
-
-**⭐ Inverse ETF Stop Loss:**
-```
-# SH (Inverse S&P 500)
-EntryPrice: $36.90
-ATR (14d): $0.85
-StopLoss: $36.05  (tighter stop for inverse ETFs)
-TakeProfit: $39.45  (profit if market drops)
-```
-
-**Implementation:** `auto_decider.py` → `enrich_with_stop_tp()` function
-
----
-
-## 📊 Portfolio State Schema
-
-```json
 {
-  "positions": {
-    "AMD": {
-      "entry_date": "2025-11-03",
-      "entry_price": 250.05,
-      "quantity": 4,
-      "regime_at_entry": "NEUTRAL_BULLISH"
-    },
-    "SH": {
-      "entry_date": "2025-11-06",
-      "entry_price": 36.90,
-      "quantity": 868,
-      "regime_at_entry": "CRISIS",
-      "is_inverse_etf": true
+    'date': '2025-11-07',
+    'regime': 'NEUTRAL_BULLISH',
+    'composite_score': 0.158,
+    'confidence': 0.72,
+    'components': {
+        'equity': {'signal': 0.45, ...},
+        'volatility': {'signal': 0.32, ...},
+        ...
     }
-  },
-  "cash": 16000.0,
-  "counters": {
-    "day_entries": 2,
-    "week_entries": 5,
-    "week_start": "2025-11-04",
-    "last_day": "2025-11-06"
-  },
-  "settings": {
-    "max_positions": 8,
-    "max_entries_day": 3,
-    "max_entries_week": 10,
-    "max_weight_pct": 20.0,
-    "inverse_etfs_enabled": true
-  },
-  "last_updated": "2025-11-06"
 }
-```
 
-**⚠️ CRITICAL:** This file is updated ONLY when `auto_decider.py` runs with `--commit 1`
+Regimes:
 
----
+    BULL_STRONG (score ≥ 0.50)
+    BULL_WEAK (score ≥ 0.25)
+    NEUTRAL_BULLISH (score ≥ 0.0)
+    NEUTRAL_BEARISH (score ≥ -0.25)
+    BEAR_WEAK (score ≥ -0.50)
+    BEAR_STRONG (score ≥ -0.75)
+    CRISIS (score < -0.75)
 
-## 💻 Command Line Usage
+Tallennus: seasonality_reports/regime_history.csv
+regime_strategies.py (Palautettu 7.11.2025)
 
-### **ML Pipeline (11:00 UTC)**
-```bash
-python ml_unified_pipeline.py \
-  --universe_csv "seasonality_reports/aggregates/constituents_raw.csv" \
-  --today "2025-11-06" \
-  --gate_alpha 0.10 \
-  --run_root "seasonality_reports/runs/2025-11-06_0000"
-```
+Tarkoitus: Määrittää kaupankäyntiparametrit regimen mukaan
 
-### **Auto Decider (15:55 UTC)**
-```bash
-python auto_decider.py \
-  --project_root "." \
-  --universe_csv "seasonality_reports/aggregates/constituents_raw.csv" \
-  --run_root "seasonality_reports/runs/2025-11-06_0000" \
-  --price_cache_dir "seasonality_reports/runs/2025-10-04_0903/price_cache" \
-  --today "2025-11-06" \
-  --max_positions 8 \
-  --position_size 1000.0 \
-  --commit 1
-```
+Strategiat regimeittäin:
+Regime	Strategy Type	Max Positions	Position Size	Entry Style	Min ML Score
+BULL_STRONG	Momentum	12	130%	Aggressive	0.70
+BULL_WEAK	Momentum	10	100%	Selective	0.75
+NEUTRAL_BULLISH	Balanced	8	90%	Selective	0.75
+NEUTRAL_BEARISH	Defensive Quality	6	70%	Conservative	0.80
+BEAR_WEAK	Mean Reversion	4	50%	Very Conservative	0.85
+BEAR_STRONG	Defensive	2	30%	Extreme Conservative	0.90
+CRISIS	Capital Preservation	0	0%	No Entries	1.0
 
-**Flags:**
-- `--commit 0`: Dry-run (don't update portfolio_state.json)
-- `--commit 1`: LIVE mode (update portfolio) ⚡
-- `--no_new_positions`: Exit-only mode (sell all, buy nothing)
+Signal Weights (esim. BULL_STRONG):
 
-### **⭐ Test CRISIS Mode (Simulation)**
-```bash
-# Simulate CRISIS mode without committing
-python auto_decider.py \
-  --project_root "." \
-  --universe_csv "seasonality_reports/aggregates/constituents_raw.csv" \
-  --run_root "seasonality_reports/runs/2025-11-06_0000" \
-  --price_cache_dir "seasonality_reports/runs/2025-10-04_0903/price_cache" \
-  --today "2025-11-06" \
-  --max_positions 2 \
-  --position_size 1000.0 \
-  --commit 0 \
-  --force_regime CRISIS
-```
+    Momentum: 70%
+    Quality: 20%
+    Value: 10%
 
-### **Exit Watchlist (16:05 UTC)**
-```bash
-python make_exit_watchlist.py \
-  --price_cache_dir "seasonality_reports/runs/2025-10-04_0903/price_cache" \
-  --actions_dir "seasonality_reports/runs/2025-11-06_0000/actions/20251106" \
-  --stop_mult 2.0
-```
+Stop/TP Multipliers:
 
-### **⭐ Download Inverse ETF Prices**
-```bash
-# One-time setup or daily refresh
-python inverse_etf_downloader.py
-```
+    BULL_STRONG: SL 1.5x ATR, TP 2.0x ATR
+    NEUTRAL_BULLISH: SL 1.0x ATR, TP 1.2x ATR
+    BEAR_WEAK: SL 0.8x ATR, TP 0.8x ATR
 
----
+🔧 5. TÄMÄN PÄIVÄN KORJAUKSET (7.11.2025)
+✅ Korjaus 1: Email Ei Lähtenyt Task Schedulerista
 
-## 📈 Current System Status (2025-11-06)
+Ongelma: python-dotenv puuttui .venv:stä
+Ratkaisu: pip install python-dotenv
+Tila: ✅ Toimii
+✅ Korjaus 2: update_regime_prices.bat Puuttui
 
-**Portfolio:**
-- Positions: 8/8 (full)
-- Tickers: AMD, LLY, GILD, BMY, NVDA, CRM, TMO, AAPL
-- Cash: $85,000
-- Total Equity: ~$93,000 (estimated)
-- **Inverse ETFs:** None (NEUTRAL_BULLISH regime)
+Ongelma: Task Trading_UpdateRegimePrices viittasi puuttuvaan tiedostoon
+Ratkaisu: Luotiin update_regime_prices.bat
+Tila: ✅ Toimii
+✅ Korjaus 3: SPY, QQQ, IWM Eivät Päivittyneet
 
-**Market Regime:** NEUTRAL_BULLISH (16.1% confidence)
+Ongelma: build_prices_from_indexes.py ei sisältänyt näitä tickereitä
+Ratkaisu: Lisättiin CROSS_ASSET listaan: SPY, QQQ, IWM, ^SPX, ^VIX
+Tila: ✅ Toimii
+✅ Korjaus 4: regime_detector.py ja regime_strategies.py Puuttuivat
 
-**Inverse ETF Status:**
-- System: ✅ Operational
-- Price Data: ✅ Downloaded (SH, PSQ, DOG, RWM)
-- Last CRISIS Mode: Never triggered (backtest only)
+Ongelma: Tiedostot puuttuivat projektin juuresta
+Ratkaisu: Ladattiin GitHubista
+Tila: ✅ Palautettu (tarkista että toimivat)
+📧 6. EMAIL-ILMOITUKSET
 
-**Recent Actions:**
-- 2025-11-06: No trades (portfolio = top-8)
-- 2025-11-05: Bought BMY, TMO, AAPL
-- 2025-11-04: Bought LLY, GILD
-- 2025-11-03: Bought AMD, NVDA, CRM
+Lähettäjä: panu.aalto1@gmail.com
+Vastaanottaja: panu.aalto1@gmail.com
+Liitteet:
 
----
+    action_plan.txt (yhteenveto)
+    trade_candidates.csv (BUY orders)
+    sell_candidates.csv (SELL orders)
+    portfolio_after_sim.csv (portfolio kauppojen jälkeen)
 
-## 🐻 Bear Market Strategy Summary
+Konfiguraatio: .env tiedostossa:
+Code
 
-### Current Protection Layers
-
-1. **⭐ Inverse ETFs (NEW)**
-   - CRISIS: 80% allocation to SH, PSQ
-   - BEAR_STRONG: 60% allocation to SH, PSQ, DOG
-   - BEAR_WEAK: 40% allocation
-   - NEUTRAL_BEARISH: 20% allocation
-
-2. **Regime-Based Position Limits**
-   - CRISIS: 0-2 positions (mostly inverse ETFs)
-   - BEAR_STRONG: 2 positions (quality defensive)
-   - BEAR_WEAK: 4 positions (mean reversion)
-
-3. **Cash Preservation**
-   - CRISIS: 20% cash minimum
-   - BEAR_STRONG: 40% cash
-   - BEAR_WEAK: 60% cash
-
-4. **Stop Loss Monitoring**
-   - 1.0 ATR automatic exit signal
-   - Daily watchlist alerts
-
----
-
-## 🐛 Troubleshooting
-
-### **Issue 1: auto_decider.py fails at 15:55**
-```bash
-# Check ML pipeline completed:
-ls seasonality_reports/runs/2025-11-06_0000/reports/top_long_candidates_GATED_2025-11-06.csv
-
-# If missing, run manually:
-python ml_unified_pipeline.py --today "2025-11-06" --run_root "seasonality_reports/runs/2025-11-06_0000"
-```
-
-### **Issue 2: No email received**
-```bash
-# Check .env file:
 EMAIL_USER=panu.aalto1@gmail.com
 EMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx
 
-# Test manually:
-python send_trades_email.py
-```
+ML Unified Pipeline 
 
-### **Issue 3: Portfolio state corrupted**
-```bash
-# Restore from Git:
-git checkout HEAD -- seasonality_reports/portfolio_state.json
-```
+Täysin uudistettu ML-pohjainen signaaligeneraattori, joka yhdistää momentum-analyysin, kausiluonteisuuden, markkinaregiimit ja ATR-pohjaiset trading-tasot.
+🔧 Keskeiset Parannukset:
+1. Regime Detection (7-tilainen markkinaympäristö)
 
-### **Issue 4: Price cache missing/outdated**
-```bash
-# Stock prices:
-python build_prices_from_constituents.py \
-  --const "seasonality_reports/aggregates/constituents_raw.csv" \
-  --run_root "seasonality_reports/runs/2025-10-04_0903" \
-  --overwrite
+    Itsenäinen RegimeCalculator (kopio regime_detector.py logiikasta)
+    5 komponenttia: Equity, Volatility, Credit Spread, Safe Haven, Market Breadth
+    7 regimeä:
+        BULL_STRONG, BULL_WEAK
+        NEUTRAL_BULLISH, NEUTRAL_BEARISH
+        BEAR_WEAK, BEAR_STRONG
+        CRISIS
+    Data: Macro ETF hinnat (SPY, QQQ, IWM, GLD, TLT, HYG, LQD, VIX)
 
-# Index prices:
-python build_prices_from_indexes.py \
-  --run_root "seasonality_reports" \
-  --overwrite
-```
+2. Multi-Window Seasonality Analysis
 
-### **⭐ Issue 5: Inverse ETFs not in candidates**
-```bash
-# Re-run universe generation:
-python us_seasonality_full.py
+    Week-of-Year: Keskimääräinen viikkotason tuotto (10v historia)
+    Day-of-Year: 20 päivän forward return (±3 päivän window)
+    Month-of-Year: Kuukausitason kausiluonteisuus
+    Quarter-of-Year: Kvartaalitason trendit
+    Segmentit: Bullish/Bearish jaksojen tunnistus
+        Käyttää {TICKER}_segments_up.csv ja _segments_down.csv
+        Sisältää: segment strength, days into segment
 
-# Re-download inverse ETF prices:
-python inverse_etf_downloader.py
+3. Trading Levels Calculator
 
-# Verify prices exist:
-ls seasonality_reports\runs\2025-10-04_0903\price_cache\ | findstr "SH PSQ DOG RWM"
-```
+    Entry Price: T-1 close (edellisen päivän päätöskurssi)
+    ATR-14: 14 päivän Average True Range
+    Stop Loss: Entry - (ATR × regime_multiplier)
+        Regime-kohtaiset kertoimet (0.8-2.0)
+    Take Profit: Entry + (ATR × regime_multiplier)
+        Regime-kohtaiset kertoimet (0.5-2.5)
 
-### **⭐ Issue 6: CRISIS mode not triggering**
-```bash
-# Check regime detection:
-python regime_detector.py
+4. ML Scoring (Placeholder for Future Enhancement)
 
-# Force CRISIS mode (testing):
-python auto_decider.py --commit 0 --force_regime CRISIS --today "2025-11-06" ...
-```
+    Nykyinen: Momentum + Seasonality blend
+        50% momentum (mom5 + mom20)
+        50% seasonality (week_avg + 20d_avg)
+    Tulevaisuus: LightGBM/XGBoost regressio
+        Target: 20 päivän forward return
+        Features: Momentum + Seasonality + Regime (30+ features)
 
----
+📊 Output Format:
+Enhanced Features (24 saraketta):
+Code
 
-## 📞 Contact & Support
+ticker, asof_date,
+mom5, mom20, mom60, vol20,                          # Momentum
+season_week_avg, season_week_hit_rate,              # Seasonality (viikko)
+season_20d_avg, season_20d_hit_rate,                # Seasonality (20d)
+season_month_avg, season_quarter_avg,               # Seasonality (kk/kvartaali)
+in_bullish_segment, in_bearish_segment,             # Segmentit
+days_into_segment, segment_strength,                # Segment info
+entry_price, stop_loss, take_profit, atr_14,        # Trading levels
+sl_distance_pct, tp_distance_pct,                   # SL/TP etäisyys %
+regime, regime_score,                               # Regime
+ml_expected_return, score_long, score_short         # ML/Ranking
 
-**GitHub:** https://github.com/panuaalto1-afk/seasonality_project  
-**Email:** panu.aalto1@gmail.com  
-**Trading Hours:** 09:30-16:00 ET (14:30-21:00 UTC)  
-**Critical Decision Time:** 10:55 ET (15:55 UTC) ⚡
+Tiedostot:
+Code
 
----
+seasonality_reports/runs/{YYYY-MM-DD_HHMM}/reports/
+├── features_{YYYY-MM-DD}.csv              # Kaikki featuret (516 riviä)
+├── top_long_candidates_RAW_{date}.csv     # Top 200 (ei filtteröity)
+├── top_long_candidates_GATED_{date}.csv   # Filtteröity (gate_alpha)
+├── top_short_candidates_RAW_{date}.csv
+├── top_short_candidates_GATED_{date}.csv
+└── summary_{date}.txt                      # Yhteenveto + regime info
 
-## 📝 Version History
+🔗 Integraatio auto_decider.py:hyn:
+Python
 
-| Date | Version | Changes |
-|------|---------|---------|
-| 2025-11-06 | **v4.0** | **⭐ INVERSE ETF SYSTEM DEPLOYED**<br>- Added SH, PSQ, DOG, RWM support<br>- CRISIS mode: Exit longs, buy inverse ETFs<br>- Bearish modes: 20-60% inverse allocation<br>- Auto-add to universe<br>- Test suite created |
-| 2025-11-06 | v3.0 | Complete documentation with folder structure, dataflow, options pipeline |
-| 2025-11-06 | v2.1 | Added exit_watchlist monitoring, options integration notes |
-| 2025-11-06 | v2.0 | Corrected workflow timing, price cache locations |
-| 2025-11-06 | v1.3 | Added ATR-based Stop/TP calculation |
-| 2025-11-05 | v1.2 | Regime-aware position sizing |
-| 2025-11-04 | v1.1 | Email automation |
-| 2025-11-03 | v1.0 | Initial auto_decider deployment |
+# auto_decider.py lukee:
+gated_csv = "top_long_candidates_GATED_{date}.csv"
 
----
+# Käyttää sarakkeita:
+- ticker              # Osakkeen tunniste
+- score_long          # Ranking score (0-1)
+- entry_price         # Entry hinta
+- stop_loss           # Stop loss taso
+- take_profit         # Take profit taso
+- (+ muut optionaaliset)
 
-## ✅ Daily Pre-Flight Checklist
+# Soveltaa regime_strategies.py:
+- Position sizing (regime-kohtainen)
+- Max positions (8 default)
+- Risk management
 
-**Before 15:55 UTC (10:55 ET):**
-- [ ] ✅ 10:00 UTC: Stock prices updated
-  - [ ] **⭐ Verify inverse ETFs:** Check SH, PSQ, DOG, RWM in price_cache
-- [ ] ✅ 11:00 UTC: ML pipeline completed
-  - [ ] **⭐ Check regime:** Verify current market regime
-- [ ] ✅ 12:00 UTC: Index prices updated
-- [ ] ✅ 15:55 UTC: **auto_decider.py runs**
-  - [ ] **⭐ CRISIS check:** If regime = CRISIS, verify inverse ETFs in output
+⚙️ CLI Parametrit:
+bash
 
-**After Market Open (14:30 UTC / 09:30 ET):**
-- [ ] Review email: trade_candidates.csv (BUY orders)
-  - [ ] **⭐ If inverse ETFs present:** Verify allocation % matches regime
-- [ ] Review email: sell_candidates.csv (SELL orders)
-- [ ] Check exit_watchlist.csv for stop-loss breaches
-- [ ] Execute trades manually (or via broker API)
-- [ ] **⭐ Monitor inverse ETF positions:** Check hedge performance
+python ml_unified_pipeline.py \
+    --today "YYYY-MM-DD" \
+    --universe_csv "seasonality_reports/constituents_raw.csv" \
+    --gate_alpha 0.10 \
+    --train_years 10 \
+    --run_root "seasonality_reports/runs/{YYYY-MM-DD_HHMM}"
 
----
+📅 Päivittäinen Workflow:
+Code
 
-## 🎯 Key Reminders
+10:00 → update_price_cache_spy.py
+        Päivittää osake- ja ETF-hinnat
 
-1. **Inverse ETF Rules:**
-   - **CRISIS:** Exit all longs, buy inverse ETFs (80%)
-   - **BEAR_STRONG:** Reduce longs, add inverse ETFs (60%)
-   - **BEAR_WEAK:** Balanced with inverse ETFs (40%)
-   - **NEUTRAL_BEARISH:** Small hedge (20%)
-   - **Bullish regimes:** No inverse ETFs
+11:00 → ml_unified_pipeline.py (ENHANCED)
+        ├─ Regime detection
+        ├─ Seasonality calculation
+        ├─ Trading levels
+        └─ Tuottaa: top_long_candidates_GATED.csv
 
-2. **Testing Before Live:**
-   - Always test CRISIS mode with `--commit 0` first
-   - Run `test_crisis_scenario.py` for validation
-   - Verify inverse ETF prices are current
+15:55 → auto_decider.py
+        ├─ Lukee: GATED.csv
+        ├─ Soveltaa: regime_strategies.py
+        └─ Tekee: Kaupat
 
-3. **Price Cache Locations:**
-   - Stocks + Inverse ETFs: `runs/2025-10-04_0903/price_cache/`
-   - Indexes: `seasonality_reports/price_cache/`
+🔍 Tekninen Toteutus:
 
-4. **Email Timing:**
-   - Sent automatically after auto_decider completes
-   - Expect by 16:00-16:05 UTC (11:00-11:05 ET)
+Moduulit:
 
----
+    RegimeCalculator (520 riviä)
+        Itsenäinen regime detection
+        5 komponenttia → composite score → 7 regimeä
 
-## ⚖️ Disclaimer
+    SeasonalityCalculator (200 riviä)
+        Walk-forward safe (ei future leak)
+        Multi-window approach (viikko/päivä/kk/kvartaali)
+        Segment detection
 
-This system is for educational and research purposes. Inverse ETFs carry significant risks:
+    TradingLevelsCalculator (150 riviä)
+        ATR calculation (fallback: close-to-close volatility)
+        Regime-pohjaiset SL/TP multipliers
 
-**⚠️ RISKS:**
-- **Volatility decay** in sideways markets
-- **Daily rebalancing** causes tracking errors
-- **Not suitable** for long-term holding
-- **3x leverage** magnifies both gains AND losses
-- **Market whipsaws** can cause rapid losses
+    ML Model (Placeholder) (100 riviä)
+        Nykyinen: Momentum + Seasonality blend
+        Tulevaisuus: LightGBM regression
 
-**✅ BEST PRACTICES:**
-- Test in simulation mode first
-- Monitor daily - don't "set and forget"
-- Use stop losses even on inverse ETFs
-- Keep cash reserves
-- Exit inverse positions when regime improves
-
-**Always perform due diligence and risk management before trading.**
-
----
-
-## 🏆 System Status
-
-✅ Seasonality Analysis - Operational  
-✅ ML Pipeline - Operational  
-✅ Regime Detection - Operational  
-✅ **⭐ Inverse ETF System - Operational (v4.0)**  
-✅ Auto Decider - Operational  
-✅ Testing Suite - Complete  
-✅ Email Notifications - Operational  
-✅ Stop Loss Monitoring - Operational  
-
-**Last Updated:** 2025-11-06 18:59 UTC  
-**Version:** 4.0 (Inverse ETF System Deployed)
-
----
-
-**🎯 Happy Trading! Remember: The best trade is often no trade.** 🚀
-
-**⭐ New Feature:** Inverse ETF system adds powerful downside protection. Test thoroughly before relying on it in live markets.
+Yhteensä: ~1200 riviä Python-koodia

@@ -370,15 +370,6 @@ class SeasonalityCalculator:
         
         # Add helper columns
         prices = prices.copy()
-
-        # ✅ FIX: Ensure close is numeric BEFORE any calculations
-        prices['close'] = pd.to_numeric(prices['close'], errors='coerce')
-        prices = prices.dropna(subset=['close'])
-
-        if prices.empty or len(prices) < 252:
-            return self._empty_features()
-
-        # Now safe to calculate returns
         prices['return'] = prices['close'].pct_change()
         prices['week'] = pd.to_datetime(prices['date']).dt.isocalendar().week
         prices['month'] = pd.to_datetime(prices['date']).dt.month
@@ -539,8 +530,6 @@ class TradingLevelsCalculator:
             atr = tr.rolling(period).mean().iloc[-1]
         else:
             # Fallback: use close-to-close volatility as proxy
-            # ✅ FIX: Ensure close is numeric
-            prices['close'] = pd.to_numeric(prices['close'], errors='coerce')
             returns = prices['close'].pct_change()
             volatility = returns.rolling(period).std().iloc[-1]
             atr = volatility * prices['close'].iloc[-1]
