@@ -1,0 +1,74 @@
+{
+  "start_date": "2020-01-01",
+  "end_date": "2025-11-08",
+  "initial_cash": 100000.0,
+  "max_positions": 8,
+  "position_size": 5000.0,
+  "gate_alpha": 0.1,
+  "universe_csv": "seasonality_reports/constituents_raw.csv",
+  "stock_price_cache": "seasonality_reports/runs/2025-10-04_0903/price_cache",
+  "macro_price_cache": "seasonality_reports/price_cache",
+  "vintage_dir": "seasonality_reports/vintage",
+  "output_dir": "seasonality_reports/backtest_results",
+  "regime_strategies": {
+    "BULL_STRONG": {
+      "position_size_multiplier": 1.5,
+      "stop_multiplier": 0.8,
+      "tp_multiplier": 3.0,
+      "max_positions": 12,
+      "allow_inverse_etfs": false
+    },
+    "BULL_WEAK": {
+      "position_size_multiplier": 1.0,
+      "stop_multiplier": 1.0,
+      "tp_multiplier": 2.0,
+      "max_positions": 8,
+      "allow_inverse_etfs": false
+    },
+    "NEUTRAL_BULLISH": {
+      "position_size_multiplier": 0.9,
+      "stop_multiplier": 1.0,
+      "tp_multiplier": 1.5,
+      "max_positions": 8,
+      "allow_inverse_etfs": false
+    },
+    "NEUTRAL_BEARISH": {
+      "position_size_multiplier": 0.7,
+      "stop_multiplier": 1.2,
+      "tp_multiplier": 1.2,
+      "max_positions": 6,
+      "allow_inverse_etfs": true,
+      "inverse_etf_allocation": 0.3
+    },
+    "BEAR_WEAK": {
+      "position_size_multiplier": 0.5,
+      "stop_multiplier": 1.5,
+      "tp_multiplier": 1.5,
+      "max_positions": 4,
+      "allow_inverse_etfs": true,
+      "inverse_etf_allocation": 0.5
+    },
+    "BEAR_STRONG": {
+      "position_size_multiplier": 0.3,
+      "stop_multiplier": 1.8,
+      "tp_multiplier": 2.0,
+      "max_positions": 3,
+      "allow_inverse_etfs": true,
+      "inverse_etf_allocation": 0.7
+    },
+    "CRISIS": {
+      "position_size_multiplier": 0.3,
+      "stop_multiplier": 2.0,
+      "tp_multiplier": 2.5,
+      "max_positions": 2,
+      "allow_inverse_etfs": true,
+      "inverse_etf_allocation": 1.0
+    }
+  },
+  "entry_method": "T_open_with_gap",
+  "slippage_pct": 0.001,
+  "benchmarks": [
+    "SPY",
+    "QQQ"
+  ]
+}
