@@ -1,18 +1,19 @@
 # backtest_scripts/portfolio.py
 """
-Portfolio State Management for Backtesting
-Tracks positions, cash, and handles trade execution
+Portfolio Management for Backtesting
+Tracks positions, executes trades, handles SL/TP
+
+UPDATED: 2025-11-09 17:03 UTC - Fixed isinstance() bug with date import
 """
 
 import pandas as pd
-import numpy as np
 from typing import Dict, List, Optional
-from datetime import date
+from datetime import date as date_type  # FIXED: Renamed import to avoid conflict
 
 class Portfolio:
     """
-    Portfolio state tracker for backtest
-    Manages positions, cash, SL/TP triggers
+    Portfolio simulator for backtest
+    Tracks cash, positions, equity curve
     """
     
     def __init__(self, initial_cash: float):
@@ -24,111 +25,53 @@ class Portfolio:
         """
         self.initial_cash = initial_cash
         self.cash = initial_cash
-        self.positions = []  # List of open positions
-        self.trade_history = []  # All executed trades
-        self.daily_values = []  # Daily portfolio value
+        self.positions = []
+        self.trades_history = []
+        self.equity_curve = []
         
         print(f"[Portfolio] Initialized with ${initial_cash:,.2f}")
     
-    def get_state(self) -> Dict:
+    def buy(self, ticker: str, date: date_type, entry_price: float, shares: int,
+            stop_loss: float, take_profit: float, reason: str = "BUY"):
         """
-        Get current portfolio state
-        
-        Returns:
-            dict: {
-                'cash': float,
-                'positions': List[dict],
-                'total_value': float,
-                'positions_value': float
-            }
-        """
-        positions_value = sum(
-            pos['shares'] * pos['current_price']
-            for pos in self.positions
-        )
-        
-        return {
-            'cash': self.cash,
-            'positions': self.positions.copy(),
-            'total_value': self.cash + positions_value,
-            'positions_value': positions_value
-        }
-    
-    def buy(self, 
-            ticker: str,
-            date: date,
-            entry_price: float,
-            shares: int,
-            stop_loss: float,
-            take_profit: float,
-            reason: str = 'NEW_CANDIDATE') -> bool:
-        """
-        Execute BUY order
+        Buy a position
         
         Args:
             ticker: Stock ticker
-            date: Trade date
-            entry_price: Entry price (with gap/slippage if configured)
+            date: Entry date
+            entry_price: Entry price
             shares: Number of shares
-            stop_loss: Stop loss price
-            take_profit: Take profit price
-            reason: Reason for trade
-        
-        Returns:
-            True if executed, False if insufficient cash
+            stop_loss: Stop loss level
+            take_profit: Take profit level
+            reason: Reason for entry
         """
         cost = shares * entry_price
         
         if cost > self.cash:
-            return False
+            return  # Not enough cash
         
-        # Deduct cash
         self.cash -= cost
         
-        # Add position
-        position = {
+        self.positions.append({
             'ticker': ticker,
             'entry_date': date,
             'entry_price': entry_price,
             'shares': shares,
             'stop_loss': stop_loss,
             'take_profit': take_profit,
-            'current_price': entry_price,  # Updated daily
-            'cost': cost,
-            'reason': reason
-        }
-        
-        self.positions.append(position)
-        
-        # Record trade
-        self.trade_history.append({
-            'date': date,
-            'ticker': ticker,
-            'action': 'BUY',
-            'price': entry_price,
-            'shares': shares,
-            'value': cost,
+            'current_price': entry_price,
             'reason': reason
         })
-        
-        return True
     
-    def sell(self,
-            ticker: str,
-            date: date,
-            exit_price: float,
-            reason: str = 'MANUAL') -> Optional[Dict]:
+    def sell(self, ticker: str, date: date_type, exit_price: float, reason: str = "SELL"):
         """
-        Execute SELL order
+        Sell a position
         
         Args:
             ticker: Stock ticker
-            date: Trade date
+            date: Exit date
             exit_price: Exit price
-            reason: Reason for exit (SL, TP, REGIME, etc.)
-        
-        Returns:
-            Trade result dict or None if position not found
+            reason: Reason for exit
         """
         # Find position
         position = None
@@ -138,207 +81,154 @@ class Portfolio:
                 break
         
         if position is None:
-            return None
+            return  # Position not found
         
         # Calculate P/L
         proceeds = position['shares'] * exit_price
-        cost = position['cost']
+        cost = position['shares'] * position['entry_price']
         pl = proceeds - cost
         pl_pct = (pl / cost) * 100 if cost > 0 else 0.0
         
-        # Add cash
         self.cash += proceeds
         
-        # Calculate hold time
-        hold_days = (date - position['entry_date']).days
+        # Calculate hold time - FIXED: Use date_type instead of date
+        hold_days = (date - position['entry_date']).days if isinstance(position['entry_date'], date_type) else 0
         
         # Record trade
-        trade = {
-            'date': date,
+        self.trades_history.append({
             'ticker': ticker,
-            'action': 'SELL',
             'entry_date': position['entry_date'],
+            'exit_date': date,
             'entry_price': position['entry_price'],
             'exit_price': exit_price,
             'shares': position['shares'],
-            'cost': cost,
-            'proceeds': proceeds,
             'pl': pl,
             'pl_pct': pl_pct,
             'hold_days': hold_days,
-            'reason': reason
-        }
-        
-        self.trade_history.append(trade)
-        
-        return trade
+            'reason': reason,
+            'entry_reason': position.get('reason', 'UNKNOWN')
+        })
     
-    def update_prices(self, date: date, prices: Dict[str, float]):
-        """
-        Update current prices for all positions
-        
-        Args:
-            date: Current date
-            prices: Dict mapping ticker → current price
-        """
-        for pos in self.positions:
-            ticker = pos['ticker']
-            if ticker in prices:
-                pos['current_price'] = prices[ticker]
-    
-    def check_exits(self, 
-                   date: date,
-                   intraday_prices: Dict[str, Dict[str, float]]) -> List[Dict]:
+    def check_exits(self, current_date: date_type, intraday_prices: Dict[str, Dict[str, float]], 
+                    regime: str = 'NEUTRAL_BULLISH', min_hold_days: int = 0) -> List[Dict]:
         """
         Check for SL/TP triggers
         
         Args:
-            date: Current date
+            current_date: Current date
             intraday_prices: Dict mapping ticker → {'high': float, 'low': float}
+            regime: Current regime (NEW)
+            min_hold_days: Minimum hold days from regime strategy (NEW)
         
         Returns:
-            List of exit trades
+            List of exits triggered
         """
         exits = []
         
-        # FIX: Collect exits first, then execute
-        positions_to_exit = []
-        
-        for pos in self.positions:
+        for pos in self.positions[:]:  # Iterate over copy
             ticker = pos['ticker']
             
             if ticker not in intraday_prices:
                 continue
             
-            day_high = intraday_prices[ticker].get('high', pos['current_price'])
-            day_low = intraday_prices[ticker].get('low', pos['current_price'])
+            high = intraday_prices[ticker]['high']
+            low = intraday_prices[ticker]['low']
             
-            exit_price = None
-            reason = None
+            # Calculate days held - FIXED: Use date_type instead of date
+            entry_date = pos.get('entry_date', current_date)
+            days_held = (current_date - entry_date).days if isinstance(entry_date, date_type) else 0
             
-            # Check stop loss (triggered by low)
-            if day_low <= pos['stop_loss']:
-                exit_price = pos['stop_loss']
-                reason = 'STOP_LOSS'
+            # Check Stop Loss (ALWAYS enforced, regardless of min_hold_days)
+            if low <= pos['stop_loss']:
+                self.sell(ticker, current_date, pos['stop_loss'], "STOP_LOSS")
+                exits.append({
+                    'ticker': ticker,
+                    'reason': 'STOP_LOSS',
+                    'price': pos['stop_loss'],
+                    'days_held': days_held
+                })
+                continue
             
-            # Check take profit (triggered by high)
-            elif day_high >= pos['take_profit']:
-                exit_price = pos['take_profit']
-                reason = 'TAKE_PROFIT'
-            
-            if exit_price and reason:
-                positions_to_exit.append((ticker, exit_price, reason))
-        
-        # FIX: Execute exits after loop
-        for ticker, exit_price, reason in positions_to_exit:
-            trade = self.sell(ticker, date, exit_price, reason)
-            if trade:
-                exits.append(trade)
+            # Check Take Profit (ONLY if min_hold_days met)
+            if high >= pos['take_profit']:
+                if days_held >= min_hold_days:
+                    # Min hold days met → execute TP
+                    self.sell(ticker, current_date, pos['take_profit'], "TAKE_PROFIT")
+                    exits.append({
+                        'ticker': ticker,
+                        'reason': 'TAKE_PROFIT',
+                        'price': pos['take_profit'],
+                        'days_held': days_held
+                    })
+                else:
+                    # Min hold days NOT met → skip TP, let it run
+                    pass
         
         return exits
     
-
-    def record_daily_value(self, date: date):
+    def update_prices(self, current_date: date_type, eod_prices: Dict[str, float]):
+        """
+        Update current prices for all positions (end of day)
+        
+        Args:
+            current_date: Current date
+            eod_prices: Dict mapping ticker → close price
+        """
+        for pos in self.positions:
+            ticker = pos['ticker']
+            if ticker in eod_prices:
+                pos['current_price'] = eod_prices[ticker]
+    
+    def record_daily_value(self, current_date: date_type):
         """
         Record daily portfolio value
         
         Args:
-            date: Current date
+            current_date: Current date
         """
-        state = self.get_state()
+        # Calculate position values
+        position_value = sum(
+            pos['shares'] * pos['current_price']
+            for pos in self.positions
+        )
         
-        self.daily_values.append({
-            'date': date,
-            'cash': state['cash'],
-            'positions_value': state['positions_value'],
-            'total_value': state['total_value'],
-            'positions_count': len(self.positions)
+        total_value = self.cash + position_value
+        
+        self.equity_curve.append({
+            'date': current_date,
+            'cash': self.cash,
+            'position_value': position_value,
+            'total_value': total_value,
+            'num_positions': len(self.positions)
         })
+    
+    def get_state(self) -> Dict:
+        """
+        Get current portfolio state
+        
+        Returns:
+            Dict with portfolio state
+        """
+        return {
+            'cash': self.cash,
+            'positions': self.positions.copy(),
+            'num_positions': len(self.positions)
+        }
     
     def get_equity_curve(self) -> pd.DataFrame:
         """
-        Get equity curve DataFrame
+        Get equity curve as DataFrame
         
         Returns:
-            DataFrame with columns: date, total_value, cash, positions_value, positions_count
+            DataFrame with equity curve
         """
-        return pd.DataFrame(self.daily_values)
+        return pd.DataFrame(self.equity_curve)
     
     def get_trades_history(self) -> pd.DataFrame:
         """
-        Get trades history DataFrame
+        Get trades history as DataFrame
         
         Returns:
-            DataFrame with all executed trades
+            DataFrame with all trades
         """
-        return pd.DataFrame(self.trade_history)
-    
-    def get_performance_summary(self) -> Dict:
-        """
-        Calculate performance metrics
-        
-        Returns:
-            dict with performance metrics
-        """
-        if not self.daily_values:
-            return {}
-        
-        equity_curve = self.get_equity_curve()
-        
-        # Total return
-        final_value = equity_curve['total_value'].iloc[-1]
-        total_return = ((final_value - self.initial_cash) / self.initial_cash) * 100
-        
-        # Daily returns
-        equity_curve['daily_return'] = equity_curve['total_value'].pct_change()
-        
-        # Sharpe ratio (annualized, assuming 252 trading days)
-        daily_returns = equity_curve['daily_return'].dropna()
-        if len(daily_returns) > 0:
-            sharpe = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252) if daily_returns.std() > 0 else 0.0
-        else:
-            sharpe = 0.0
-        
-        # Max drawdown
-        cumulative = (1 + equity_curve['daily_return'].fillna(0)).cumprod()
-        running_max = cumulative.cummax()
-        drawdown = (cumulative - running_max) / running_max
-        max_drawdown = drawdown.min() * 100
-        
-        # Trade statistics
-        trades = self.get_trades_history()
-        sell_trades = trades[trades['action'] == 'SELL']
-        
-        if not sell_trades.empty:
-            total_trades = len(sell_trades)
-            winning_trades = len(sell_trades[sell_trades['pl'] > 0])
-            win_rate = (winning_trades / total_trades) * 100
-            avg_win = sell_trades[sell_trades['pl'] > 0]['pl_pct'].mean() if winning_trades > 0 else 0.0
-            avg_loss = sell_trades[sell_trades['pl'] < 0]['pl_pct'].mean() if (total_trades - winning_trades) > 0 else 0.0
-            avg_hold_days = sell_trades['hold_days'].mean()
-            
-            # Profit factor
-            total_wins = sell_trades[sell_trades['pl'] > 0]['pl'].sum()
-            total_losses = abs(sell_trades[sell_trades['pl'] < 0]['pl'].sum())
-            profit_factor = total_wins / total_losses if total_losses > 0 else 0.0
-        else:
-            total_trades = 0
-            win_rate = 0.0
-            avg_win = 0.0
-            avg_loss = 0.0
-            avg_hold_days = 0.0
-            profit_factor = 0.0
-        
-        return {
-            'initial_cash': self.initial_cash,
-            'final_value': final_value,
-            'total_return': total_return,
-            'sharpe_ratio': sharpe,
-            'max_drawdown': max_drawdown,
-            'total_trades': total_trades,
-            'win_rate': win_rate,
-            'avg_win': avg_win,
-            'avg_loss': avg_loss,
-            'avg_hold_days': avg_hold_days,
-            'profit_factor': profit_factor,
-        }
+        return pd.DataFrame(self.trades_history)

@@ -2,6 +2,8 @@
 """
 Auto Decider Simulator for Backtesting
 Replicates auto_decider.py decision logic
+
+UPDATED: 2025-11-09 16:56 UTC - Added min_hold_days enforcement
 """
 
 import pandas as pd
@@ -69,21 +71,24 @@ class AutoDeciderSimulator:
         base_position_size = position_size_override if position_size_override else 5000.0
         position_size = base_position_size * position_size_mult
         
+        # NEW: Get min_hold_days from strategy
+        min_hold_days = strategy.get('min_hold_days', 0)
+        
         current_positions = portfolio_state.get('positions', [])
         current_tickers = [pos['ticker'] for pos in current_positions]
         
-        # SELL DECISIONS (Regime-based exits)
+        # SELL DECISIONS (Regime-based exits + min_hold_days check)
         sell_decisions = []
         hold_decisions = []
         
-        # CRISIS regime: Exit ALL positions
+        # CRISIS regime: Exit ALL positions (ignore min_hold_days)
         if regime == 'CRISIS':
             sell_decisions = [
                 {'ticker': pos['ticker'], 'reason': 'CRISIS_EXIT', 'date': target_date}
                 for pos in current_positions
             ]
         
-        # BEAR_STRONG: Exit weak positions
+        # BEAR_STRONG: Exit weak positions (ignore min_hold_days)
         elif regime == 'BEAR_STRONG' and len(current_positions) > 0:
             positions_with_pl = []
             for pos in current_positions:
@@ -105,20 +110,39 @@ class AutoDeciderSimulator:
             for i in range(exit_count, len(positions_with_pl)):
                 hold_decisions.append(positions_with_pl[i]['position'])
         
-        # BEAR_WEAK / NEUTRAL_BEARISH: Reduce if over max
+        # BEAR_WEAK / NEUTRAL_BEARISH: Reduce if over max (respect min_hold_days)
         elif regime in ['BEAR_WEAK', 'NEUTRAL_BEARISH']:
             if len(current_positions) > max_positions:
-                positions_sorted = sorted(current_positions, key=lambda x: x.get('entry_date', target_date))
-                exit_count = len(current_positions) - max_positions
-                
-                for i in range(exit_count):
-                    sell_decisions.append({
-                        'ticker': positions_sorted[i]['ticker'],
-                        'reason': f'{regime}_REDUCE',
-                        'date': target_date
+                # NEW: Check hold time before selling
+                positions_with_age = []
+                for pos in current_positions:
+                    entry_date = pos.get('entry_date', target_date)
+                    days_held = (target_date - entry_date).days if isinstance(entry_date, date) else 0
+                    positions_with_age.append({
+                        'position': pos,
+                        'days_held': days_held,
+                        'can_sell': days_held >= min_hold_days
                     })
                 
-                hold_decisions = positions_sorted[exit_count:]
+                # Sort by age (oldest first) and only sell those that meet min_hold_days
+                positions_with_age.sort(key=lambda x: x['days_held'], reverse=True)
+                
+                exit_count = len(current_positions) - max_positions
+                sold = 0
+                
+                for item in positions_with_age:
+                    if sold >= exit_count:
+                        hold_decisions.append(item['position'])
+                    elif item['can_sell']:
+                        sell_decisions.append({
+                            'ticker': item['position']['ticker'],
+                            'reason': f'{regime}_REDUCE',
+                            'date': target_date
+                        })
+                        sold += 1
+                    else:
+                        # Can't sell yet (min hold not reached)
+                        hold_decisions.append(item['position'])
             else:
                 hold_decisions = current_positions.copy()
         else:
@@ -170,7 +194,8 @@ class AutoDeciderSimulator:
                         'score_long': row['score_long'],
                         'reason': 'NEW_CANDIDATE',
                         'date': target_date,
-                        'cost': actual_cost
+                        'cost': actual_cost,
+                        'entry_date': target_date  # NEW: Track entry date
                     })
                     
                     cash -= actual_cost

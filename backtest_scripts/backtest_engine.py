@@ -1,9 +1,9 @@
-﻿# backtest_scripts2/backtest_engine.py
+﻿# backtest_scripts/backtest_engine.py
 """
 Backtest Engine - Main Orchestrator
 Coordinates all backtest components
 
-UPDATED: 2025-11-09 - Added constituents loading, timestamp to output folder
+UPDATED: 2025-11-09 17:00 UTC - Integrated min_hold_days to portfolio.check_exits()
 """
 
 import os
@@ -171,7 +171,14 @@ class BacktestEngine:
             
             regime = regime_data['regime']
             
-            # 2. Generate ML signals (candidates)
+            # 2. Get regime strategy (for min_hold_days)
+            regime_strategy = self.config['regime_strategies'].get(
+                regime, 
+                self.config['regime_strategies']['NEUTRAL_BULLISH']
+            )
+            min_hold_days = regime_strategy.get('min_hold_days', 0)
+            
+            # 3. Generate ML signals (candidates)
             candidates = self.ml_generator.generate_signals(
                 target_date=current_date,
                 stock_prices=self.stock_prices,
@@ -179,7 +186,7 @@ class BacktestEngine:
                 gate_alpha=self.config['gate_alpha']
             )
             
-            # 3. Make trading decisions (auto_decider logic)
+            # 4. Make trading decisions (auto_decider logic)
             portfolio_state = self.portfolio.get_state()
             
             decisions = self.auto_decider.decide_trades(
@@ -190,7 +197,7 @@ class BacktestEngine:
                 cash=self.portfolio.cash
             )
             
-            # 4. Execute SELL orders first (from regime exits)
+            # 5. Execute SELL orders first (from regime exits)
             for sell in decisions['sell']:
                 ticker = sell['ticker']
                 # Get exit price (close of current day + slippage)
@@ -198,11 +205,16 @@ class BacktestEngine:
                 if exit_price:
                     self.portfolio.sell(ticker, current_date, exit_price, sell['reason'])
             
-            # 5. Check SL/TP triggers (intraday)
+            # 6. Check SL/TP triggers (intraday) - UPDATED: Pass regime and min_hold_days
             intraday_prices = self._get_intraday_prices(current_date)
-            sl_tp_exits = self.portfolio.check_exits(current_date, intraday_prices)
+            sl_tp_exits = self.portfolio.check_exits(
+                current_date, 
+                intraday_prices,
+                regime=regime,              # NEW
+                min_hold_days=min_hold_days # NEW
+            )
             
-            # 6. Execute BUY orders
+            # 7. Execute BUY orders
             for buy in decisions['buy']:
                 entry_price = self._get_entry_price(buy, current_date)
                 
@@ -216,11 +228,11 @@ class BacktestEngine:
                     reason=buy['reason']
                 )
             
-            # 7. Update position prices (end of day)
+            # 8. Update position prices (end of day)
             eod_prices = self._get_eod_prices(current_date)
             self.portfolio.update_prices(current_date, eod_prices)
             
-            # 8. Record daily value
+            # 9. Record daily value
             self.portfolio.record_daily_value(current_date)
         
         print("\n[OK] Simulation complete\n")
@@ -327,19 +339,19 @@ class BacktestEngine:
         """Get intraday high/low for SL/TP checks"""
         intraday = {}
         
-        for ticker in self.portfolio.positions:
-            ticker_sym = ticker['ticker']
+        for pos in self.portfolio.positions:
+            ticker = pos['ticker']
             
-            if ticker_sym not in self.stock_prices:
+            if ticker not in self.stock_prices:
                 continue
             
-            prices = self.stock_prices[ticker_sym]
+            prices = self.stock_prices[ticker]
             row = prices[prices['date'] == current_date]
             
             if row.empty:
                 continue
             
-            intraday[ticker_sym] = {
+            intraday[ticker] = {
                 'high': row.iloc[0]['high'],
                 'low': row.iloc[0]['low']
             }
@@ -433,4 +445,3 @@ class BacktestEngine:
 if __name__ == "__main__":
     engine = BacktestEngine()
     results = engine.run()
-
