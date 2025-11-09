@@ -1,7 +1,9 @@
-# backtest_scripts/performance_analyzer.py
+# backtest_scripts2/performance_analyzer.py
 """
 Performance Analyzer for Backtesting
 Calculates metrics, generates reports, regime breakdown
+
+UPDATED: 2025-11-09 - Added sector analysis, hold time analysis, regime transitions
 """
 
 import pandas as pd
@@ -15,8 +17,17 @@ class PerformanceAnalyzer:
     Calculate metrics, regime breakdown, generate reports
     """
     
-    def __init__(self):
+    def __init__(self, constituents: Optional[pd.DataFrame] = None):
+        """
+        Initialize performance analyzer
+        
+        Args:
+            constituents: Optional DataFrame with ticker→sector mapping (Ticker, Sector columns)
+        """
+        self.constituents = constituents
         print(f"[PerformanceAnalyzer] Initialized")
+        if constituents is not None:
+            print(f"  Sector data available: {len(constituents)} tickers")
     
     def analyze(self,
                 portfolio_equity_curve: pd.DataFrame,
@@ -37,28 +48,44 @@ class PerformanceAnalyzer:
         """
         analysis = {}
         
-        # 1. Portfolio metrics
+        # 1. Portfolio metrics (EXISTING)
         analysis['portfolio_metrics'] = self._calculate_portfolio_metrics(portfolio_equity_curve)
         
-        # 2. Trade statistics
+        # 2. Trade statistics (EXISTING)
         analysis['trade_stats'] = self._calculate_trade_stats(trades_history)
         
-        # 3. Regime breakdown
+        # 3. Regime breakdown (EXISTING)
         analysis['regime_breakdown'] = self._calculate_regime_breakdown(
             portfolio_equity_curve, trades_history, regime_history
         )
         
-        # 4. Benchmark comparison
+        # 4. Benchmark comparison (EXISTING)
         analysis['benchmark_comparison'] = self._compare_benchmarks(
             portfolio_equity_curve, benchmark_prices
         )
         
-        # 5. Monthly/Yearly returns
+        # 5. Monthly/Yearly returns (EXISTING)
         analysis['monthly_returns'] = self._calculate_monthly_returns(portfolio_equity_curve)
         analysis['yearly_returns'] = self._calculate_yearly_returns(portfolio_equity_curve)
         
-        # 6. Risk metrics
+        # 6. Risk metrics (EXISTING)
         analysis['risk_metrics'] = self._calculate_risk_metrics(portfolio_equity_curve)
+        
+        # === NEW ANALYSES (only if constituents available) ===
+        if self.constituents is not None and not trades_history.empty:
+            print("[PerformanceAnalyzer] Running enhanced analyses (sector, hold time, transitions)...")
+            
+            analysis['sector_breakdown'] = self._calculate_sector_breakdown(
+                trades_history, regime_history
+            )
+            
+            analysis['hold_time_analysis'] = self._calculate_hold_time_analysis(
+                trades_history, regime_history
+            )
+            
+            analysis['regime_transitions'] = self._calculate_regime_transitions(
+                regime_history, portfolio_equity_curve
+            )
         
         return analysis
     
@@ -378,6 +405,233 @@ class PerformanceAnalyzer:
             'skewness': skew,
             'kurtosis': kurt,
         }
+    
+    # =====================================================================
+    # NEW ANALYSIS METHODS - Added 2025-11-09
+    # =====================================================================
+    
+    def _calculate_sector_breakdown(self, 
+                                    trades: pd.DataFrame,
+                                    regime_history: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculate performance breakdown by sector and regime
+        
+        Args:
+            trades: Trade history
+            regime_history: Regime history
+        
+        Returns:
+            DataFrame with sector performance by regime
+        """
+        if self.constituents is None:
+            return pd.DataFrame()
+        
+        # Merge trades with sector info
+        trades_with_sector = trades.merge(
+            self.constituents[['Ticker', 'Sector']],
+            left_on='ticker',
+            right_on='Ticker',
+            how='left'
+        )
+        
+        # Filter to completed trades only
+        sell_trades = trades_with_sector[trades_with_sector['action'] == 'SELL'].copy()
+        
+        if sell_trades.empty:
+            return pd.DataFrame()
+        
+        # Merge with regime at trade date
+        sell_trades['date'] = pd.to_datetime(sell_trades['date']).dt.date
+        regime_history_copy = regime_history.copy()
+        regime_history_copy['date'] = pd.to_datetime(regime_history_copy['date']).dt.date
+        
+        trades_with_regime = sell_trades.merge(
+            regime_history_copy[['date', 'regime']],
+            on='date',
+            how='left'
+        )
+        
+        # Group by sector + regime
+        sector_stats = []
+        
+        for (sector, regime), group in trades_with_regime.groupby(['Sector', 'regime']):
+            if pd.isna(sector):
+                sector = 'Unknown'
+            
+            total_trades = len(group)
+            winning_trades = len(group[group['pl'] > 0])
+            win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0.0
+            
+            avg_pl_pct = group['pl_pct'].mean()
+            total_pl = group['pl'].sum()
+            
+            sector_stats.append({
+                'sector': sector,
+                'regime': regime,
+                'total_trades': total_trades,
+                'winning_trades': winning_trades,
+                'win_rate_pct': win_rate,
+                'avg_pl_pct': avg_pl_pct,
+                'total_pl': total_pl,
+            })
+        
+        df = pd.DataFrame(sector_stats)
+        
+        if not df.empty:
+            df = df.sort_values(['regime', 'avg_pl_pct'], ascending=[True, False])
+        
+        return df
+    
+    def _calculate_hold_time_analysis(self,
+                                      trades: pd.DataFrame,
+                                      regime_history: pd.DataFrame) -> Dict:
+        """
+        Analyze optimal hold time per regime
+        
+        Args:
+            trades: Trade history
+            regime_history: Regime history
+        
+        Returns:
+            Dict with hold time statistics
+        """
+        sell_trades = trades[trades['action'] == 'SELL'].copy()
+        
+        if sell_trades.empty:
+            return {}
+        
+        # Merge with regime
+        sell_trades['date'] = pd.to_datetime(sell_trades['date']).dt.date
+        regime_history_copy = regime_history.copy()
+        regime_history_copy['date'] = pd.to_datetime(regime_history_copy['date']).dt.date
+        
+        trades_with_regime = sell_trades.merge(
+            regime_history_copy[['date', 'regime']],
+            on='date',
+            how='left'
+        )
+        
+        # Define hold time buckets
+        def bucket_hold_time(days):
+            if days <= 3:
+                return '1-3d'
+            elif days <= 7:
+                return '4-7d'
+            elif days <= 14:
+                return '8-14d'
+            elif days <= 30:
+                return '15-30d'
+            else:
+                return '30d+'
+        
+        trades_with_regime['hold_bucket'] = trades_with_regime['hold_days'].apply(bucket_hold_time)
+        
+        # Calculate stats per regime per bucket
+        hold_time_stats = []
+        
+        for (regime, bucket), group in trades_with_regime.groupby(['regime', 'hold_bucket']):
+            if pd.isna(regime):
+                continue
+            
+            total_trades = len(group)
+            avg_pl_pct = group['pl_pct'].mean()
+            win_rate = (len(group[group['pl'] > 0]) / total_trades) * 100
+            
+            hold_time_stats.append({
+                'regime': regime,
+                'hold_bucket': bucket,
+                'total_trades': total_trades,
+                'avg_pl_pct': avg_pl_pct,
+                'win_rate_pct': win_rate,
+            })
+        
+        df_hold_time = pd.DataFrame(hold_time_stats)
+        
+        # Find optimal hold time per regime (highest avg P/L)
+        optimal_per_regime = {}
+        
+        if not df_hold_time.empty:
+            for regime in df_hold_time['regime'].unique():
+                regime_data = df_hold_time[df_hold_time['regime'] == regime]
+                best_bucket = regime_data.loc[regime_data['avg_pl_pct'].idxmax()]
+                optimal_per_regime[regime] = {
+                    'optimal_hold_bucket': best_bucket['hold_bucket'],
+                    'avg_pl_pct': best_bucket['avg_pl_pct'],
+                    'win_rate_pct': best_bucket['win_rate_pct'],
+                }
+        
+        return {
+            'hold_time_by_regime_bucket': df_hold_time.to_dict('records') if not df_hold_time.empty else [],
+            'optimal_per_regime': optimal_per_regime,
+        }
+    
+    def _calculate_regime_transitions(self,
+                                      regime_history: pd.DataFrame,
+                                      equity_curve: pd.DataFrame) -> pd.DataFrame:
+        """
+        Analyze performance around regime transitions
+        
+        Args:
+            regime_history: Daily regime data
+            equity_curve: Portfolio equity curve
+        
+        Returns:
+            DataFrame with transition analysis
+        """
+        if regime_history.empty or equity_curve.empty:
+            return pd.DataFrame()
+        
+        regime_history = regime_history.copy()
+        regime_history['date'] = pd.to_datetime(regime_history['date']).dt.date
+        
+        # Detect regime changes
+        regime_history['prev_regime'] = regime_history['regime'].shift(1)
+        transitions = regime_history[regime_history['regime'] != regime_history['prev_regime']].copy()
+        
+        if len(transitions) < 2:
+            return pd.DataFrame()
+        
+        # Merge with equity curve
+        equity_curve_copy = equity_curve.copy()
+        equity_curve_copy['date'] = pd.to_datetime(equity_curve_copy['date']).dt.date
+        equity_curve_copy['daily_return'] = equity_curve_copy['total_value'].pct_change()
+        
+        transition_stats = []
+        
+        for idx, row in transitions.iterrows():
+            transition_date = row['date']
+            from_regime = row['prev_regime']
+            to_regime = row['regime']
+            
+            # Get 5 days before transition
+            before_data = equity_curve_copy[
+                (equity_curve_copy['date'] < transition_date)
+            ].tail(5)
+            
+            # Get 5 days after transition
+            after_data = equity_curve_copy[
+                (equity_curve_copy['date'] >= transition_date)
+            ].head(5)
+            
+            if len(before_data) >= 3 and len(after_data) >= 3:
+                pl_before_5d = ((before_data['total_value'].iloc[-1] / before_data['total_value'].iloc[0]) - 1) * 100
+                pl_after_5d = ((after_data['total_value'].iloc[-1] / after_data['total_value'].iloc[0]) - 1) * 100
+                
+                transition_stats.append({
+                    'date': transition_date,
+                    'from_regime': from_regime,
+                    'to_regime': to_regime,
+                    'pl_before_5d_pct': pl_before_5d,
+                    'pl_after_5d_pct': pl_after_5d,
+                    'pl_delta_pct': pl_after_5d - pl_before_5d,
+                })
+        
+        df = pd.DataFrame(transition_stats)
+        
+        if not df.empty:
+            df = df.sort_values('pl_delta_pct', ascending=False)
+        
+        return df
     
     def generate_summary_text(self, analysis: Dict) -> str:
         """Generate text summary"""

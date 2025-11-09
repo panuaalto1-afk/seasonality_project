@@ -1,7 +1,10 @@
-﻿# backtest_scripts/visualizer.py
+﻿
+# backtest_scripts2/visualizer.py
 """
 Visualization Module for Backtesting
 Creates plots and charts for backtest results
+
+UPDATED: 2025-11-09 - Added sector heatmap, hold time scatter, regime transitions
 """
 
 import pandas as pd
@@ -55,29 +58,36 @@ class BacktestVisualizer:
         """
         print("\n[Visualizer] Creating plots...")
         
-        # 1. Equity Curve
+        # EXISTING PLOTS (unchanged)
         self.plot_equity_curve(equity_curve, benchmark_prices)
-        
-        # 2. Drawdown Chart
         self.plot_drawdown(equity_curve)
-        
-        # 3. Monthly Returns Heatmap
         self.plot_monthly_returns_heatmap(analysis.get('monthly_returns'))
-        
-        # 4. Regime Performance
         self.plot_regime_performance(analysis.get('regime_breakdown'))
-        
-        # 5. Trade Distribution
         self.plot_trade_distribution(trades_history)
-        
-        # 6. Rolling Sharpe
         self.plot_rolling_sharpe(equity_curve)
-        
-        # 7. Underwater Plot
         self.plot_underwater(equity_curve)
-        
-        # 8. Trade Timeline
         self.plot_trade_timeline(trades_history, equity_curve)
+        
+        # === NEW PLOTS (only if data available) ===
+        if 'sector_breakdown' in analysis:
+            self.plot_sector_heatmap(analysis['sector_breakdown'])
+        
+        if not trades_history.empty:
+            # Merge trades with regime for scatter plot
+            if not regime_history.empty:
+                trades_copy = trades_history.copy()
+                trades_copy['date'] = pd.to_datetime(trades_copy['date']).dt.date
+                regime_copy = regime_history.copy()
+                regime_copy['date'] = pd.to_datetime(regime_copy['date']).dt.date
+                trades_with_regime = trades_copy.merge(
+                    regime_copy[['date', 'regime']], on='date', how='left'
+                )
+                self.plot_hold_time_scatter(trades_with_regime)
+            else:
+                self.plot_hold_time_scatter(trades_history)
+        
+        if 'regime_transitions' in analysis:
+            self.plot_regime_transitions(analysis['regime_transitions'])
         
         print(f"[Visualizer] All plots saved to: {self.plots_dir}")
     
@@ -147,7 +157,7 @@ class BacktestVisualizer:
                 linewidth=2, color='#2E86AB')
         ax1.fill_between(equity_curve['date'], equity_curve['total_value'], 
                          alpha=0.3, color='#2E86AB')
-        ax1.set_ylabel('Portfolio Value (\$)', fontsize=12, fontweight='bold')
+        ax1.set_ylabel('Portfolio Value ($)', fontsize=12, fontweight='bold')
         ax1.set_title('Portfolio Value & Drawdown', fontsize=16, fontweight='bold', pad=20)
         ax1.grid(True, alpha=0.3)
         
@@ -322,7 +332,7 @@ class BacktestVisualizer:
                 color='blue', linewidth=2, label='Cumulative P/L')
         
         ax4.set_xlabel('Date', fontsize=11, fontweight='bold')
-        ax4.set_ylabel('Cumulative P/L (\$)', fontsize=11, fontweight='bold')
+        ax4.set_ylabel('Cumulative P/L ($)', fontsize=11, fontweight='bold')
         ax4.set_title('Cumulative P/L Over Time', fontsize=13, fontweight='bold')
         ax4.legend(loc='upper left', fontsize=10)
         ax4.grid(True, alpha=0.3)
@@ -447,7 +457,7 @@ class BacktestVisualizer:
                           color='darkred', marker='v', s=100, alpha=0.8, label='Sell (Loss)', zorder=5)
         
         ax.set_xlabel('Date', fontsize=12, fontweight='bold')
-        ax.set_ylabel('Portfolio Value (\$)', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Portfolio Value ($)', fontsize=12, fontweight='bold')
         ax.set_title('Trade Timeline on Equity Curve', fontsize=16, fontweight='bold', pad=20)
         ax.legend(loc='upper left', fontsize=10)
         ax.grid(True, alpha=0.3)
@@ -460,4 +470,131 @@ class BacktestVisualizer:
         plt.close()
         
         print("  ✓ trade_timeline.png")
-
+    
+    # =====================================================================
+    # NEW VISUALIZATION METHODS - Added 2025-11-09
+    # =====================================================================
+    
+    def plot_sector_heatmap(self, sector_breakdown: Optional[pd.DataFrame]):
+        """Plot sector performance heatmap (sector x regime)"""
+        if sector_breakdown is None or sector_breakdown.empty:
+            print("  ⊘ sector_heatmap.png (skipped: no sector data)")
+            return
+        
+        # Pivot: sector (rows) x regime (columns) x avg_pl_pct (values)
+        pivot = sector_breakdown.pivot_table(
+            index='sector',
+            columns='regime',
+            values='avg_pl_pct',
+            aggfunc='mean'
+        )
+        
+        if pivot.empty:
+            print("  ⊘ sector_heatmap.png (skipped: no data)")
+            return
+        
+        fig, ax = plt.subplots(figsize=(14, 10))
+        
+        sns.heatmap(pivot, annot=True, fmt='.2f', cmap='RdYlGn', center=0,
+                   linewidths=0.5, cbar_kws={'label': 'Avg P/L (%)'}, ax=ax)
+        
+        ax.set_title('Sector Performance by Regime (Avg P/L %)', 
+                    fontsize=16, fontweight='bold', pad=20)
+        ax.set_xlabel('Regime', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Sector', fontsize=12, fontweight='bold')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'sector_heatmap.png'), 
+                   dpi=self.dpi, bbox_inches='tight')
+        plt.close()
+        
+        print("  ✓ sector_heatmap.png")
+    
+    def plot_hold_time_scatter(self, trades: pd.DataFrame):
+        """Plot hold time vs P/L scatter (colored by regime)"""
+        if trades.empty:
+            return
+        
+        sell_trades = trades[trades['action'] == 'SELL'].copy()
+        
+        if sell_trades.empty or 'hold_days' not in sell_trades.columns:
+            print("  ⊘ hold_time_scatter.png (skipped: no trade data)")
+            return
+        
+        fig, ax = plt.subplots(figsize=(14, 8))
+        
+        # Plot by regime (if available)
+        if 'regime' in sell_trades.columns:
+            regimes = sell_trades['regime'].dropna().unique()
+            colors = sns.color_palette("husl", len(regimes))
+            
+            for i, regime in enumerate(regimes):
+                regime_trades = sell_trades[sell_trades['regime'] == regime]
+                ax.scatter(regime_trades['hold_days'], regime_trades['pl_pct'],
+                          alpha=0.6, s=50, label=regime, color=colors[i])
+        else:
+            ax.scatter(sell_trades['hold_days'], sell_trades['pl_pct'],
+                      alpha=0.6, s=50, color='#2E86AB')
+        
+        # Zero line
+        ax.axhline(0, color='red', linewidth=1, linestyle='--', alpha=0.7)
+        
+        ax.set_xlabel('Hold Time (days)', fontsize=12, fontweight='bold')
+        ax.set_ylabel('P/L (%)', fontsize=12, fontweight='bold')
+        ax.set_title('Hold Time vs P/L', fontsize=16, fontweight='bold', pad=20)
+        ax.grid(True, alpha=0.3)
+        
+        if 'regime' in sell_trades.columns:
+            ax.legend(loc='upper right', fontsize=10)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'hold_time_scatter.png'), 
+                   dpi=self.dpi, bbox_inches='tight')
+        plt.close()
+        
+        print("  ✓ hold_time_scatter.png")
+    
+    def plot_regime_transitions(self, transition_analysis: Optional[pd.DataFrame]):
+        """Plot regime transition analysis"""
+        if transition_analysis is None or transition_analysis.empty:
+            print("  ⊘ regime_transitions.png (skipped: no transition data)")
+            return
+        
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+        
+        # Top 10 best transitions
+        top_10 = transition_analysis.head(10)
+        
+        # Bottom 10 worst transitions
+        bottom_10 = transition_analysis.tail(10)
+        
+        # Plot 1: Best transitions
+        colors_top = ['#06A77D' if x > 0 else '#C1121F' for x in top_10['pl_delta_pct']]
+        ax1.barh(range(len(top_10)), top_10['pl_delta_pct'], color=colors_top)
+        ax1.set_yticks(range(len(top_10)))
+        ax1.set_yticklabels([f"{row['from_regime']} → {row['to_regime']}" 
+                             for _, row in top_10.iterrows()], fontsize=9)
+        ax1.set_xlabel('P/L Delta (%)', fontsize=11, fontweight='bold')
+        ax1.set_title('Top 10 Best Regime Transitions', fontsize=13, fontweight='bold')
+        ax1.axvline(0, color='black', linewidth=0.8, linestyle='--')
+        ax1.grid(True, alpha=0.3, axis='x')
+        
+        # Plot 2: Worst transitions
+        colors_bottom = ['#06A77D' if x > 0 else '#C1121F' for x in bottom_10['pl_delta_pct']]
+        ax2.barh(range(len(bottom_10)), bottom_10['pl_delta_pct'], color=colors_bottom)
+        ax2.set_yticks(range(len(bottom_10)))
+        ax2.set_yticklabels([f"{row['from_regime']} → {row['to_regime']}" 
+                              for _, row in bottom_10.iterrows()], fontsize=9)
+        ax2.set_xlabel('P/L Delta (%)', fontsize=11, fontweight='bold')
+        ax2.set_title('Top 10 Worst Regime Transitions', fontsize=13, fontweight='bold')
+        ax2.axvline(0, color='black', linewidth=0.8, linestyle='--')
+        ax2.grid(True, alpha=0.3, axis='x')
+        
+        plt.suptitle('Regime Transition Analysis (5-day P/L Delta)', 
+                    fontsize=16, fontweight='bold', y=0.995)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'regime_transitions.png'), 
+                   dpi=self.dpi, bbox_inches='tight')
+        plt.close()
+        
+        print("  ✓ regime_transitions.png")

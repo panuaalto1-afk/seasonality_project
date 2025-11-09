@@ -201,9 +201,10 @@ class Portfolio:
         """
         exits = []
         
-        positions_to_remove = []
+        # FIX: Collect exits first, then execute
+        positions_to_exit = []
         
-        for i, pos in enumerate(self.positions):
+        for pos in self.positions:
             ticker = pos['ticker']
             
             if ticker not in intraday_prices:
@@ -226,16 +227,17 @@ class Portfolio:
                 reason = 'TAKE_PROFIT'
             
             if exit_price and reason:
-                # Execute sell
-                trade = self.sell(ticker, date, exit_price, reason)
-                if trade:
-                    exits.append(trade)
-                
-                # Mark for removal (already removed by sell())
-                # No need to append to positions_to_remove
+                positions_to_exit.append((ticker, exit_price, reason))
+        
+        # FIX: Execute exits after loop
+        for ticker, exit_price, reason in positions_to_exit:
+            trade = self.sell(ticker, date, exit_price, reason)
+            if trade:
+                exits.append(trade)
         
         return exits
     
+
     def record_daily_value(self, date: date):
         """
         Record daily portfolio value

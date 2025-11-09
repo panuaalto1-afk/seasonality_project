@@ -1,7 +1,9 @@
-﻿# backtest_scripts/backtest_engine.py
+﻿# backtest_scripts2/backtest_engine.py
 """
 Backtest Engine - Main Orchestrator
 Coordinates all backtest components
+
+UPDATED: 2025-11-09 - Added constituents loading, timestamp to output folder
 """
 
 import os
@@ -9,7 +11,7 @@ import json
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from tqdm import tqdm
 
 from .config import *
@@ -28,12 +30,15 @@ class BacktestEngine:
     Runs full backtest simulation
     """
     
-    def __init__(self, config_overrides: Optional[Dict] = None):
+    def __init__(self, 
+                 config_overrides: Optional[Dict] = None,
+                 constituents_path: Optional[str] = None):
         """
         Initialize backtest engine
         
         Args:
             config_overrides: Optional dict to override config.py settings
+            constituents_path: Path to constituents.csv with sector data (NEW)
         """
         self.config = self._load_config(config_overrides)
         
@@ -46,6 +51,17 @@ class BacktestEngine:
         print(f"Position Size: ${self.config['position_size']:,.2f}")
         print("=" * 80)
         print("")
+        
+        # NEW: Load constituents if provided
+        self.constituents = None
+        if constituents_path:
+            try:
+                self.constituents = pd.read_csv(constituents_path)
+                print(f"[Engine] ✓ Loaded constituents: {len(self.constituents)} tickers")
+                if 'Sector' in self.constituents.columns:
+                    print(f"[Engine] ✓ Sector data available")
+            except Exception as e:
+                print(f"[Engine] ⚠ Could not load constituents: {e}")
         
         # Initialize components
         self._init_components()
@@ -114,7 +130,9 @@ class BacktestEngine:
         self.portfolio = Portfolio(self.config['initial_cash'])
         
         print("[7/7] Initializing analyzer...")
-        self.analyzer = PerformanceAnalyzer()
+        # UPDATED: Pass constituents to analyzer
+        self.analyzer = PerformanceAnalyzer(constituents=self.constituents)
+        
         self.visualizer = BacktestVisualizer(
             output_dir=self.config['output_dir'],
             dpi=PLOT_DPI
@@ -154,14 +172,6 @@ class BacktestEngine:
             regime = regime_data['regime']
             
             # 2. Generate ML signals (candidates)
-            candidates = self.ml_generator.generate_signals(
-                target_date=current_date,
-                stock_prices=self.stock_prices,
-                regime=regime,
-                gate_alpha=self.config['gate_alpha']
-            )
-            
-            
             candidates = self.ml_generator.generate_signals(
                 target_date=current_date,
                 stock_prices=self.stock_prices,
@@ -240,10 +250,14 @@ class BacktestEngine:
         # Create visualizations
         if self.config.get('save_plots', True):
             print("Creating visualizations...")
+            
+            # UPDATED: Add timestamp to output folder (HHMMSS format)
+            timestamp = datetime.now().strftime("%H%M%S")
             output_dir_full = os.path.join(
                 self.config['output_dir'],
-                f"{self.config['start_date'].strftime('%Y-%m-%d')}_{self.config['end_date'].strftime('%Y-%m-%d')}_enhanced"
+                f"{self.config['start_date'].strftime('%Y-%m-%d')}_{self.config['end_date'].strftime('%Y-%m-%d')}_{timestamp}"
             )
+            
             viz = BacktestVisualizer(output_dir_full, dpi=150)
             viz.create_all_plots(
                 equity_curve=equity_curve,
@@ -278,7 +292,7 @@ class BacktestEngine:
         base_price = buy_decision['entry']
         
         if self.config['entry_method'] == 'T_open_with_gap':
-            # Simulate realistic gap: Â±1-2% random
+            # Simulate realistic gap: ±1-2% random
             gap_pct = np.random.uniform(-0.02, 0.02)
             entry_price = base_price * (1 + gap_pct)
         elif self.config['entry_method'] == 'T_open':
@@ -357,10 +371,11 @@ class BacktestEngine:
         """Save all results to disk"""
         print("Saving results...")
         
-        # Create output directory
+        # UPDATED: Add timestamp to output folder (HHMMSS format)
+        timestamp = datetime.now().strftime("%H%M%S")
         output_dir = os.path.join(
             self.config['output_dir'],
-            f"{self.config['start_date'].strftime('%Y-%m-%d')}_{self.config['end_date'].strftime('%Y-%m-%d')}_enhanced"
+            f"{self.config['start_date'].strftime('%Y-%m-%d')}_{self.config['end_date'].strftime('%Y-%m-%d')}_{timestamp}"
         )
         
         os.makedirs(output_dir, exist_ok=True)
@@ -382,6 +397,22 @@ class BacktestEngine:
         if 'regime_breakdown' in analysis:
             analysis['regime_breakdown'].to_csv(os.path.join(output_dir, 'regime_breakdown.csv'), index=False)
         
+        # NEW: Save sector breakdown (if available)
+        if 'sector_breakdown' in analysis:
+            analysis['sector_breakdown'].to_csv(os.path.join(output_dir, 'sector_breakdown.csv'), index=False)
+        
+        # NEW: Save hold time analysis (if available)
+        if 'hold_time_analysis' in analysis:
+            hold_time_data = analysis['hold_time_analysis']
+            if 'hold_time_by_regime_bucket' in hold_time_data:
+                pd.DataFrame(hold_time_data['hold_time_by_regime_bucket']).to_csv(
+                    os.path.join(output_dir, 'hold_time_analysis.csv'), index=False
+                )
+        
+        # NEW: Save regime transitions (if available)
+        if 'regime_transitions' in analysis:
+            analysis['regime_transitions'].to_csv(os.path.join(output_dir, 'regime_transitions.csv'), index=False)
+        
         # Save monthly/yearly returns
         if 'monthly_returns' in analysis:
             analysis['monthly_returns'].to_csv(os.path.join(output_dir, 'monthly_returns.csv'), index=False)
@@ -402,6 +433,4 @@ class BacktestEngine:
 if __name__ == "__main__":
     engine = BacktestEngine()
     results = engine.run()
-
-
 
