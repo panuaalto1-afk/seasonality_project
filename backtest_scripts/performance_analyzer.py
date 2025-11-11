@@ -3,7 +3,7 @@
 Performance Analysis Module
 Calculates metrics, benchmarks, and generates reports
 
-UPDATED: 2025-11-10 18:52 UTC - Fixed monthly_returns to include year, month, return_pct columns
+UPDATED: 2025-11-11 15:40 UTC - Fixed regime_breakdown columns and indentation
 """
 
 import pandas as pd
@@ -258,7 +258,7 @@ class PerformanceAnalyzer:
     def _analyze_by_regime(self,
                           trades: pd.DataFrame,
                           regime_history: pd.DataFrame) -> pd.DataFrame:
-        """Analyze performance by market regime"""
+        """Analyze performance by market regime - FIXED column names"""
         
         if trades.empty or regime_history.empty:
             return pd.DataFrame()
@@ -276,15 +276,24 @@ class PerformanceAnalyzer:
             'hold_days': 'mean'
         }).reset_index()
         
-        regime_stats.columns = ['regime', 'num_trades', 'avg_return', 'total_return', 'avg_hold_days']
+        # FIXED: Column names to match visualizer expectations
+        regime_stats.columns = ['regime', 'trades_count', 'avg_return_pct', 'total_return_pct', 'avg_hold_days']
         
-        # Calculate win rate per regime - FIXED: include_groups=False
+        # Calculate win rate per regime
         win_rates = trades_with_regime.groupby('regime').apply(
             lambda x: (x['pl_pct'] > 0).sum() / len(x) * 100,
             include_groups=False
-        ).reset_index(name='win_rate')
+        ).reset_index(name='win_rate_pct')
         
         regime_stats = regime_stats.merge(win_rates, on='regime')
+        
+        # Calculate Sharpe ratio per regime (approximate from trade returns)
+        sharpe_ratios = trades_with_regime.groupby('regime').apply(
+            lambda x: (x['pl_pct'].mean() / x['pl_pct'].std()) if x['pl_pct'].std() > 0 else 0,
+            include_groups=False
+        ).reset_index(name='sharpe_ratio')
+        
+        regime_stats = regime_stats.merge(sharpe_ratios, on='regime')
         
         return regime_stats
     

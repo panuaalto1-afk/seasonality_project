@@ -1,10 +1,9 @@
-﻿
-# backtest_scripts2/visualizer.py
+﻿# backtest_scripts/visualizer.py
 """
 Visualization Module for Backtesting
 Creates plots and charts for backtest results
 
-UPDATED: 2025-11-09 - Added sector heatmap, hold time scatter, regime transitions
+UPDATED: 2025-11-11 15:40 UTC - Fixed deprecated fillna and column name references
 """
 
 import pandas as pd
@@ -58,42 +57,48 @@ class BacktestVisualizer:
         """
         print("\n[Visualizer] Creating plots...")
         
-        # EXISTING PLOTS (unchanged)
-        self.plot_equity_curve(equity_curve, benchmark_prices)
-        self.plot_drawdown(equity_curve)
-        self.plot_monthly_returns_heatmap(analysis.get('monthly_returns'))
-        self.plot_regime_performance(analysis.get('regime_breakdown'))
-        self.plot_trade_distribution(trades_history)
-        self.plot_rolling_sharpe(equity_curve)
-        self.plot_underwater(equity_curve)
-        self.plot_trade_timeline(trades_history, equity_curve)
-        
-        # === NEW PLOTS (only if data available) ===
-        if 'sector_breakdown' in analysis:
-            self.plot_sector_heatmap(analysis['sector_breakdown'])
-        
-        if not trades_history.empty:
-            # Merge trades with regime for scatter plot
-            if not regime_history.empty:
-                trades_copy = trades_history.copy()
-                trades_copy['date'] = pd.to_datetime(trades_copy['date']).dt.date
-                regime_copy = regime_history.copy()
-                regime_copy['date'] = pd.to_datetime(regime_copy['date']).dt.date
-                trades_with_regime = trades_copy.merge(
-                    regime_copy[['date', 'regime']], on='date', how='left'
-                )
-                self.plot_hold_time_scatter(trades_with_regime)
-            else:
-                self.plot_hold_time_scatter(trades_history)
-        
-        if 'regime_transitions' in analysis:
-            self.plot_regime_transitions(analysis['regime_transitions'])
-        
-        print(f"[Visualizer] All plots saved to: {self.plots_dir}")
+        try:
+            # EXISTING PLOTS
+            self.plot_equity_curve(equity_curve, benchmark_prices)
+            self.plot_drawdown(equity_curve)
+            self.plot_monthly_returns_heatmap(analysis.get('monthly_returns'))
+            self.plot_regime_performance(analysis.get('regime_breakdown'))
+            self.plot_trade_distribution(trades_history)
+            self.plot_rolling_sharpe(equity_curve)
+            self.plot_underwater(equity_curve)
+            self.plot_trade_timeline(trades_history, equity_curve)
+            
+            # NEW PLOTS (only if data available)
+            if 'sector_breakdown' in analysis and not analysis['sector_breakdown'].empty:
+                self.plot_sector_heatmap(analysis['sector_breakdown'])
+            
+            if not trades_history.empty:
+                # Merge trades with regime for scatter plot
+                if not regime_history.empty:
+                    trades_copy = trades_history.copy()
+                    trades_copy['date'] = pd.to_datetime(trades_copy['date']).dt.date
+                    regime_copy = regime_history.copy()
+                    regime_copy['date'] = pd.to_datetime(regime_copy['date']).dt.date
+                    trades_with_regime = trades_copy.merge(
+                        regime_copy[['date', 'regime']], on='date', how='left'
+                    )
+                    self.plot_hold_time_scatter(trades_with_regime)
+                else:
+                    self.plot_hold_time_scatter(trades_history)
+            
+            if 'regime_transitions' in analysis and not analysis['regime_transitions'].empty:
+                self.plot_regime_transitions(analysis['regime_transitions'])
+            
+            print(f"[Visualizer] ✓ All plots saved to: {self.plots_dir}")
+            
+        except Exception as e:
+            print(f"[Visualizer] ✗ Error creating plots: {e}")
+            import traceback
+            traceback.print_exc()
     
     def plot_equity_curve(self, equity_curve: pd.DataFrame, 
                          benchmark_prices: Dict[str, pd.DataFrame]):
-        """Plot equity curve vs benchmarks"""
+        """Plot equity curve vs benchmarks - FIXED deprecated fillna"""
         fig, ax = plt.subplots(figsize=(14, 7))
         
         equity_curve['date'] = pd.to_datetime(equity_curve['date'])
@@ -114,7 +119,8 @@ class BacktestVisualizer:
             # Align with portfolio dates
             merged = equity_curve[['date']].merge(prices[['date', 'close']], 
                                                    on='date', how='left')
-            merged['close'] = merged['close'].fillna(method='ffill')
+            # FIXED: Use ffill() instead of fillna(method='ffill')
+            merged['close'] = merged['close'].ffill()
             
             start_bench = merged['close'].iloc[0]
             normalized_bench = (merged['close'] / start_bench) * 100
@@ -185,6 +191,7 @@ class BacktestVisualizer:
     def plot_monthly_returns_heatmap(self, monthly_returns: Optional[pd.DataFrame]):
         """Plot monthly returns heatmap"""
         if monthly_returns is None or monthly_returns.empty:
+            print("  ⊘ monthly_returns_heatmap.png (skipped: no data)")
             return
         
         # Skip if less than 12 months
@@ -218,8 +225,9 @@ class BacktestVisualizer:
         print("  ✓ monthly_returns_heatmap.png")
     
     def plot_regime_performance(self, regime_breakdown: Optional[pd.DataFrame]):
-        """Plot performance by regime"""
+        """Plot performance by regime - FIXED column names"""
         if regime_breakdown is None or regime_breakdown.empty:
+            print("  ⊘ regime_performance.png (skipped: no data)")
             return
         
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
@@ -281,11 +289,13 @@ class BacktestVisualizer:
     def plot_trade_distribution(self, trades: pd.DataFrame):
         """Plot trade distribution statistics"""
         if trades.empty:
+            print("  ⊘ trade_distribution.png (skipped: no trades)")
             return
         
         sell_trades = trades[trades['action'] == 'SELL'].copy()
         
         if sell_trades.empty:
+            print("  ⊘ trade_distribution.png (skipped: no SELL trades)")
             return
         
         fig = plt.figure(figsize=(16, 10))
@@ -414,6 +424,7 @@ class BacktestVisualizer:
     def plot_trade_timeline(self, trades: pd.DataFrame, equity_curve: pd.DataFrame):
         """Plot trade markers on equity curve"""
         if trades.empty:
+            print("  ⊘ trade_timeline.png (skipped: no trades)")
             return
         
         fig, ax = plt.subplots(figsize=(14, 7))
@@ -472,13 +483,18 @@ class BacktestVisualizer:
         print("  ✓ trade_timeline.png")
     
     # =====================================================================
-    # NEW VISUALIZATION METHODS - Added 2025-11-09
+    # NEW VISUALIZATION METHODS
     # =====================================================================
     
     def plot_sector_heatmap(self, sector_breakdown: Optional[pd.DataFrame]):
         """Plot sector performance heatmap (sector x regime)"""
         if sector_breakdown is None or sector_breakdown.empty:
             print("  ⊘ sector_heatmap.png (skipped: no sector data)")
+            return
+        
+        # Check if regime column exists
+        if 'regime' not in sector_breakdown.columns:
+            print("  ⊘ sector_heatmap.png (skipped: no regime in sector data)")
             return
         
         # Pivot: sector (rows) x regime (columns) x avg_pl_pct (values)
@@ -513,6 +529,7 @@ class BacktestVisualizer:
     def plot_hold_time_scatter(self, trades: pd.DataFrame):
         """Plot hold time vs P/L scatter (colored by regime)"""
         if trades.empty:
+            print("  ⊘ hold_time_scatter.png (skipped: no trades)")
             return
         
         sell_trades = trades[trades['action'] == 'SELL'].copy()
@@ -560,38 +577,33 @@ class BacktestVisualizer:
             print("  ⊘ regime_transitions.png (skipped: no transition data)")
             return
         
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+        # Check if we have enough columns for meaningful analysis
+        required_cols = ['date', 'prev_regime', 'regime']
+        if not all(col in transition_analysis.columns for col in required_cols):
+            print("  ⊘ regime_transitions.png (skipped: missing columns)")
+            return
         
-        # Top 10 best transitions
-        top_10 = transition_analysis.head(10)
+        fig, ax = plt.subplots(figsize=(14, 8))
         
-        # Bottom 10 worst transitions
-        bottom_10 = transition_analysis.tail(10)
+        # Plot transitions over time
+        transition_analysis = transition_analysis.copy()
+        transition_analysis['date'] = pd.to_datetime(transition_analysis['date'])
+        transition_analysis['transition'] = (
+            transition_analysis['prev_regime'].astype(str) + ' → ' + 
+            transition_analysis['regime'].astype(str)
+        )
         
-        # Plot 1: Best transitions
-        colors_top = ['#06A77D' if x > 0 else '#C1121F' for x in top_10['pl_delta_pct']]
-        ax1.barh(range(len(top_10)), top_10['pl_delta_pct'], color=colors_top)
-        ax1.set_yticks(range(len(top_10)))
-        ax1.set_yticklabels([f"{row['from_regime']} → {row['to_regime']}" 
-                             for _, row in top_10.iterrows()], fontsize=9)
-        ax1.set_xlabel('P/L Delta (%)', fontsize=11, fontweight='bold')
-        ax1.set_title('Top 10 Best Regime Transitions', fontsize=13, fontweight='bold')
-        ax1.axvline(0, color='black', linewidth=0.8, linestyle='--')
-        ax1.grid(True, alpha=0.3, axis='x')
+        # Count transitions by type
+        transition_counts = transition_analysis['transition'].value_counts().head(10)
         
-        # Plot 2: Worst transitions
-        colors_bottom = ['#06A77D' if x > 0 else '#C1121F' for x in bottom_10['pl_delta_pct']]
-        ax2.barh(range(len(bottom_10)), bottom_10['pl_delta_pct'], color=colors_bottom)
-        ax2.set_yticks(range(len(bottom_10)))
-        ax2.set_yticklabels([f"{row['from_regime']} → {row['to_regime']}" 
-                              for _, row in bottom_10.iterrows()], fontsize=9)
-        ax2.set_xlabel('P/L Delta (%)', fontsize=11, fontweight='bold')
-        ax2.set_title('Top 10 Worst Regime Transitions', fontsize=13, fontweight='bold')
-        ax2.axvline(0, color='black', linewidth=0.8, linestyle='--')
-        ax2.grid(True, alpha=0.3, axis='x')
+        colors = ['#2E86AB' for _ in range(len(transition_counts))]
+        transition_counts.plot(kind='barh', ax=ax, color=colors)
         
-        plt.suptitle('Regime Transition Analysis (5-day P/L Delta)', 
-                    fontsize=16, fontweight='bold', y=0.995)
+        ax.set_xlabel('Count', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Transition', fontsize=12, fontweight='bold')
+        ax.set_title('Top 10 Regime Transitions', fontsize=16, fontweight='bold', pad=20)
+        ax.grid(True, alpha=0.3, axis='x')
+        
         plt.tight_layout()
         plt.savefig(os.path.join(self.plots_dir, 'regime_transitions.png'), 
                    dpi=self.dpi, bbox_inches='tight')
