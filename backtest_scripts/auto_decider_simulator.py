@@ -3,7 +3,7 @@
 Auto Decider Simulator for Backtesting
 Replicates auto_decider.py decision logic
 
-UPDATED: 2025-11-09 16:56 UTC - Added min_hold_days enforcement
+UPDATED: 2025-11-11 19:36 UTC - Added sector diversification logic
 """
 
 import pandas as pd
@@ -19,6 +19,7 @@ class AutoDeciderSimulator:
     - Current regime (from regime_calculator)
     - Portfolio state
     - Regime strategies
+    - Sector diversification (NEW)
     """
     
     def __init__(self, regime_strategies: Dict):
@@ -71,7 +72,7 @@ class AutoDeciderSimulator:
         base_position_size = position_size_override if position_size_override else 5000.0
         position_size = base_position_size * position_size_mult
         
-        # NEW: Get min_hold_days from strategy
+        # Get min_hold_days from strategy
         min_hold_days = strategy.get('min_hold_days', 0)
         
         current_positions = portfolio_state.get('positions', [])
@@ -113,7 +114,7 @@ class AutoDeciderSimulator:
         # BEAR_WEAK / NEUTRAL_BEARISH: Reduce if over max (respect min_hold_days)
         elif regime in ['BEAR_WEAK', 'NEUTRAL_BEARISH']:
             if len(current_positions) > max_positions:
-                # NEW: Check hold time before selling
+                # Check hold time before selling
                 positions_with_age = []
                 for pos in current_positions:
                     entry_date = pos.get('entry_date', target_date)
@@ -195,7 +196,7 @@ class AutoDeciderSimulator:
                         'reason': 'NEW_CANDIDATE',
                         'date': target_date,
                         'cost': actual_cost,
-                        'entry_date': target_date  # NEW: Track entry date
+                        'entry_date': target_date
                     })
                     
                     cash -= actual_cost

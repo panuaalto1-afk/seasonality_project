@@ -3,25 +3,26 @@
 Portfolio Management for Backtesting
 Tracks positions, executes trades, handles SL/TP
 
-UPDATED: 2025-11-09 17:03 UTC - Fixed isinstance() bug with date import
+UPDATED: 2025-11-11 19:33 UTC - Added sector tracking and enhanced position management
 """
 
 import pandas as pd
 from typing import Dict, List, Optional
-from datetime import date as date_type  # FIXED: Renamed import to avoid conflict
+from datetime import date as date_type
 
 class Portfolio:
     """
     Portfolio simulator for backtest
-    Tracks cash, positions, equity curve
+    Tracks cash, positions, equity curve with sector information
     """
     
-    def __init__(self, initial_cash: float):
+    def __init__(self, initial_cash: float, constituents: Optional[pd.DataFrame] = None):
         """
         Initialize portfolio
         
         Args:
             initial_cash: Starting cash
+            constituents: Optional DataFrame with ticker-to-sector mapping
         """
         self.initial_cash = initial_cash
         self.cash = initial_cash
@@ -29,7 +30,44 @@ class Portfolio:
         self.trades_history = []
         self.equity_curve = []
         
+        # NEW: Sector mapping
+        self.constituents = constituents
+        self.ticker_to_sector = {}
+        
+        if constituents is not None:
+            # Build ticker → sector mapping
+            ticker_col = None
+            for col in ['ticker', 'Ticker', 'Symbol']:
+                if col in constituents.columns:
+                    ticker_col = col
+                    break
+            
+            sector_col = None
+            for col in ['Sector', 'GICS Sector', 'sector', 'gics_sector']:
+                if col in constituents.columns:
+                    sector_col = col
+                    break
+            
+            if ticker_col and sector_col:
+                self.ticker_to_sector = dict(zip(
+                    constituents[ticker_col].astype(str).str.upper(),
+                    constituents[sector_col]
+                ))
+                print(f"[Portfolio] Loaded sector mapping for {len(self.ticker_to_sector)} tickers")
+        
         print(f"[Portfolio] Initialized with ${initial_cash:,.2f}")
+    
+    def get_sector(self, ticker: str) -> str:
+        """Get sector for ticker"""
+        return self.ticker_to_sector.get(ticker.upper(), 'Unknown')
+    
+    def get_sector_exposure(self) -> Dict[str, int]:
+        """Get current number of positions per sector"""
+        sector_counts = {}
+        for pos in self.positions:
+            sector = pos.get('sector', 'Unknown')
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        return sector_counts
     
     def buy(self, ticker: str, date: date_type, entry_price: float, shares: int,
             stop_loss: float, take_profit: float, reason: str = "BUY"):
@@ -52,6 +90,9 @@ class Portfolio:
         
         self.cash -= cost
         
+        # NEW: Get sector
+        sector = self.get_sector(ticker)
+        
         self.positions.append({
             'ticker': ticker,
             'entry_date': date,
@@ -60,8 +101,12 @@ class Portfolio:
             'stop_loss': stop_loss,
             'take_profit': take_profit,
             'current_price': entry_price,
-            'reason': reason
+            'reason': reason,
+            'sector': sector,  # NEW
         })
+        
+        # DEBUG: Log sector info
+        # print(f"[Portfolio] Opened {ticker} ({sector}) | {shares} shares @ ${entry_price:.2f}")
     
     def sell(self, ticker: str, date: date_type, exit_price: float, reason: str = "SELL"):
         """
@@ -91,12 +136,13 @@ class Portfolio:
         
         self.cash += proceeds
         
-        # Calculate hold time - FIXED: Use date_type instead of date
+        # Calculate hold time
         hold_days = (date - position['entry_date']).days if isinstance(position['entry_date'], date_type) else 0
         
-        # Record trade
+        # Record trade with sector info
         self.trades_history.append({
             'ticker': ticker,
+            'sector': position.get('sector', 'Unknown'),  # NEW
             'entry_date': position['entry_date'],
             'exit_date': date,
             'entry_price': position['entry_price'],
@@ -106,7 +152,9 @@ class Portfolio:
             'pl_pct': pl_pct,
             'hold_days': hold_days,
             'reason': reason,
-            'entry_reason': position.get('reason', 'UNKNOWN')
+            'entry_reason': position.get('reason', 'UNKNOWN'),
+            'action': 'SELL',  # For compatibility with visualizer
+            'date': date,  # For compatibility with visualizer
         })
     
     def check_exits(self, current_date: date_type, intraday_prices: Dict[str, Dict[str, float]], 
@@ -117,8 +165,8 @@ class Portfolio:
         Args:
             current_date: Current date
             intraday_prices: Dict mapping ticker → {'high': float, 'low': float}
-            regime: Current regime (NEW)
-            min_hold_days: Minimum hold days from regime strategy (NEW)
+            regime: Current regime
+            min_hold_days: Minimum hold days from regime strategy
         
         Returns:
             List of exits triggered
@@ -134,7 +182,7 @@ class Portfolio:
             high = intraday_prices[ticker]['high']
             low = intraday_prices[ticker]['low']
             
-            # Calculate days held - FIXED: Use date_type instead of date
+            # Calculate days held
             entry_date = pos.get('entry_date', current_date)
             days_held = (current_date - entry_date).days if isinstance(entry_date, date_type) else 0
             
@@ -194,12 +242,16 @@ class Portfolio:
         
         total_value = self.cash + position_value
         
+        # NEW: Track sector exposure in daily record
+        sector_exposure = self.get_sector_exposure()
+        
         self.equity_curve.append({
             'date': current_date,
             'cash': self.cash,
             'position_value': position_value,
             'total_value': total_value,
-            'num_positions': len(self.positions)
+            'num_positions': len(self.positions),
+            'sector_exposure': sector_exposure.copy(),  # NEW
         })
     
     def get_state(self) -> Dict:
@@ -212,7 +264,8 @@ class Portfolio:
         return {
             'cash': self.cash,
             'positions': self.positions.copy(),
-            'num_positions': len(self.positions)
+            'num_positions': len(self.positions),
+            'sector_exposure': self.get_sector_exposure(),  # NEW
         }
     
     def get_equity_curve(self) -> pd.DataFrame:

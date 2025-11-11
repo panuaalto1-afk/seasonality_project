@@ -3,7 +3,7 @@
 Visualization Module for Backtesting
 Creates plots and charts for backtest results
 
-UPDATED: 2025-11-11 15:40 UTC - Fixed deprecated fillna and column name references
+UPDATED: 2025-11-11 19:42 UTC - Added yearly breakdown visualization
 """
 
 import pandas as pd
@@ -68,7 +68,11 @@ class BacktestVisualizer:
             self.plot_underwater(equity_curve)
             self.plot_trade_timeline(trades_history, equity_curve)
             
-            # NEW PLOTS (only if data available)
+            # NEW: Yearly breakdown plot
+            if 'yearly_breakdown' in analysis and not analysis['yearly_breakdown'].empty:
+                self.plot_yearly_breakdown(analysis['yearly_breakdown'])
+            
+            # SECTOR PLOTS (only if data available)
             if 'sector_breakdown' in analysis and not analysis['sector_breakdown'].empty:
                 self.plot_sector_heatmap(analysis['sector_breakdown'])
             
@@ -98,7 +102,7 @@ class BacktestVisualizer:
     
     def plot_equity_curve(self, equity_curve: pd.DataFrame, 
                          benchmark_prices: Dict[str, pd.DataFrame]):
-        """Plot equity curve vs benchmarks - FIXED deprecated fillna"""
+        """Plot equity curve vs benchmarks"""
         fig, ax = plt.subplots(figsize=(14, 7))
         
         equity_curve['date'] = pd.to_datetime(equity_curve['date'])
@@ -119,7 +123,7 @@ class BacktestVisualizer:
             # Align with portfolio dates
             merged = equity_curve[['date']].merge(prices[['date', 'close']], 
                                                    on='date', how='left')
-            # FIXED: Use ffill() instead of fillna(method='ffill')
+            # Use ffill() instead of fillna(method='ffill')
             merged['close'] = merged['close'].ffill()
             
             start_bench = merged['close'].iloc[0]
@@ -225,7 +229,7 @@ class BacktestVisualizer:
         print("  ✓ monthly_returns_heatmap.png")
     
     def plot_regime_performance(self, regime_breakdown: Optional[pd.DataFrame]):
-        """Plot performance by regime - FIXED column names"""
+        """Plot performance by regime"""
         if regime_breakdown is None or regime_breakdown.empty:
             print("  ⊘ regime_performance.png (skipped: no data)")
             return
@@ -486,6 +490,62 @@ class BacktestVisualizer:
     # NEW VISUALIZATION METHODS
     # =====================================================================
     
+    def plot_yearly_breakdown(self, yearly_breakdown: Optional[pd.DataFrame]):
+        """NEW: Plot yearly performance breakdown"""
+        if yearly_breakdown is None or yearly_breakdown.empty:
+            print("  ⊘ yearly_breakdown.png (skipped: no data)")
+            return
+        
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        
+        # 1. Yearly returns bar chart
+        ax1 = axes[0, 0]
+        colors = ['#06A77D' if x > 0 else '#C1121F' for x in yearly_breakdown['return']]
+        yearly_breakdown.plot(x='year', y='return', kind='bar', ax=ax1, color=colors, legend=False)
+        ax1.set_title('Annual Returns by Year', fontsize=13, fontweight='bold')
+        ax1.set_xlabel('Year', fontsize=11, fontweight='bold')
+        ax1.set_ylabel('Return (%)', fontsize=11, fontweight='bold')
+        ax1.axhline(0, color='black', linewidth=0.8, linestyle='--')
+        ax1.grid(True, alpha=0.3, axis='y')
+        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        
+        # 2. Sharpe ratio by year
+        ax2 = axes[0, 1]
+        yearly_breakdown.plot(x='year', y='sharpe_ratio', kind='bar', ax=ax2, color='#2E86AB', legend=False)
+        ax2.set_title('Sharpe Ratio by Year', fontsize=13, fontweight='bold')
+        ax2.set_xlabel('Year', fontsize=11, fontweight='bold')
+        ax2.set_ylabel('Sharpe Ratio', fontsize=11, fontweight='bold')
+        ax2.axhline(0, color='black', linewidth=0.8, linestyle='--')
+        ax2.axhline(1, color='green', linewidth=0.8, linestyle=':', alpha=0.5)
+        ax2.grid(True, alpha=0.3, axis='y')
+        plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        
+        # 3. Max drawdown by year
+        ax3 = axes[1, 0]
+        yearly_breakdown.plot(x='year', y='max_drawdown', kind='bar', ax=ax3, color='#C1121F', legend=False)
+        ax3.set_title('Max Drawdown by Year', fontsize=13, fontweight='bold')
+        ax3.set_xlabel('Year', fontsize=11, fontweight='bold')
+        ax3.set_ylabel('Max Drawdown (%)', fontsize=11, fontweight='bold')
+        ax3.grid(True, alpha=0.3, axis='y')
+        plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        
+        # 4. Number of trades by year
+        ax4 = axes[1, 1]
+        yearly_breakdown.plot(x='year', y='num_trades', kind='bar', ax=ax4, color='#F18F01', legend=False)
+        ax4.set_title('Number of Trades by Year', fontsize=13, fontweight='bold')
+        ax4.set_xlabel('Year', fontsize=11, fontweight='bold')
+        ax4.set_ylabel('Number of Trades', fontsize=11, fontweight='bold')
+        ax4.grid(True, alpha=0.3, axis='y')
+        plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        
+        plt.suptitle('10-Year Performance Breakdown', fontsize=16, fontweight='bold', y=0.995)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, 'yearly_breakdown.png'), 
+                   dpi=self.dpi, bbox_inches='tight')
+        plt.close()
+        
+        print("  ✓ yearly_breakdown.png")
+    
     def plot_sector_heatmap(self, sector_breakdown: Optional[pd.DataFrame]):
         """Plot sector performance heatmap (sector x regime)"""
         if sector_breakdown is None or sector_breakdown.empty:
@@ -501,7 +561,7 @@ class BacktestVisualizer:
         pivot = sector_breakdown.pivot_table(
             index='sector',
             columns='regime',
-            values='avg_pl_pct',
+            values='avg_return',
             aggfunc='mean'
         )
         
@@ -512,9 +572,9 @@ class BacktestVisualizer:
         fig, ax = plt.subplots(figsize=(14, 10))
         
         sns.heatmap(pivot, annot=True, fmt='.2f', cmap='RdYlGn', center=0,
-                   linewidths=0.5, cbar_kws={'label': 'Avg P/L (%)'}, ax=ax)
+                   linewidths=0.5, cbar_kws={'label': 'Avg Return (%)'}, ax=ax)
         
-        ax.set_title('Sector Performance by Regime (Avg P/L %)', 
+        ax.set_title('Sector Performance by Regime (Avg Return %)', 
                     fontsize=16, fontweight='bold', pad=20)
         ax.set_xlabel('Regime', fontsize=12, fontweight='bold')
         ax.set_ylabel('Sector', fontsize=12, fontweight='bold')

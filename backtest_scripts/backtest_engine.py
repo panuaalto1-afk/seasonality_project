@@ -3,7 +3,7 @@
 Backtest Engine - Main Orchestrator
 Coordinates all backtest components
 
-UPDATED: 2025-11-10 16:51 UTC - Fixed VIX symbol (^VIX), removed VIXM
+UPDATED: 2025-11-11 19:36 UTC - Enhanced 10-year analysis with sector diversification
 """
 
 import os
@@ -27,7 +27,7 @@ from .visualizer import BacktestVisualizer
 class BacktestEngine:
     """
     Main backtest orchestrator
-    Runs full backtest simulation
+    Runs full backtest simulation with sector diversification
     """
     
     def __init__(self, 
@@ -43,7 +43,7 @@ class BacktestEngine:
         self.config = self._load_config(config_overrides)
         
         print("=" * 80)
-        print("BACKTEST ENGINE - Enhanced ML Unified Pipeline")
+        print("BACKTEST ENGINE - Enhanced 10-Year Analysis with Sector Diversification")
         print("=" * 80)
         print(f"Period: {self.config['start_date']} to {self.config['end_date']}")
         print(f"Initial Capital: ${self.config['initial_cash']:,.2f}")
@@ -58,8 +58,20 @@ class BacktestEngine:
             try:
                 self.constituents = pd.read_csv(constituents_path)
                 print(f"[Engine] ✓ Loaded constituents: {len(self.constituents)} tickers")
-                if 'Sector' in self.constituents.columns:
-                    print(f"[Engine] ✓ Sector data available")
+                
+                # Check for sector column
+                sector_col = None
+                for col in ['Sector', 'GICS Sector', 'sector', 'gics_sector']:
+                    if col in self.constituents.columns:
+                        sector_col = col
+                        break
+                
+                if sector_col:
+                    print(f"[Engine] ✓ Sector data available: {self.constituents[sector_col].nunique()} unique sectors")
+                    if ENABLE_SECTOR_DIVERSIFICATION:
+                        print(f"[Engine] ✓ Sector diversification enabled (max {MAX_POSITIONS_PER_SECTOR} per sector)")
+                else:
+                    print(f"[Engine] ⚠ No sector column found in constituents")
             except Exception as e:
                 print(f"[Engine] ⚠ Could not load constituents: {e}")
         
@@ -84,6 +96,8 @@ class BacktestEngine:
             'entry_method': ENTRY_METHOD,
             'slippage_pct': SLIPPAGE_PCT,
             'benchmarks': BENCHMARKS,
+            'enable_sector_diversification': ENABLE_SECTOR_DIVERSIFICATION,
+            'max_positions_per_sector': MAX_POSITIONS_PER_SECTOR,
         }
         
         if overrides:
@@ -113,7 +127,7 @@ class BacktestEngine:
         )
         
         print("[4/7] Preloading macro prices...")
-        # FIXED: Use ^VIX (Yahoo Finance format), remove VIXM (not available)
+        # Use ^VIX (Yahoo Finance format)
         macro_symbols = ['SPY', 'QQQ', 'IWM', 'GLD', 'TLT', 'HYG', 'LQD', '^VIX']
         self.macro_prices = self.data_loader.preload_all_macro_prices(
             macro_symbols,
@@ -128,10 +142,14 @@ class BacktestEngine:
         self.auto_decider = AutoDeciderSimulator(self.config['regime_strategies'])
         
         print("[6/7] Initializing portfolio...")
-        self.portfolio = Portfolio(self.config['initial_cash'])
+        # Pass constituents to portfolio for sector tracking
+        self.portfolio = Portfolio(
+            self.config['initial_cash'],
+            constituents=self.constituents
+        )
         
         print("[7/7] Initializing analyzer...")
-        # Pass constituents to analyzer
+        # Pass constituents to analyzer for sector analysis
         self.analyzer = PerformanceAnalyzer(constituents=self.constituents)
         
         self.visualizer = BacktestVisualizer(
@@ -158,7 +176,8 @@ class BacktestEngine:
             self.config['end_date']
         )
         
-        print(f"Total trading days: {len(trading_days)}\n")
+        print(f"Total trading days: {len(trading_days)}")
+        print(f"Expected years: {len(trading_days) / 252:.1f}\n")
         
         # Track regime history
         regime_history = []
@@ -186,6 +205,10 @@ class BacktestEngine:
                 regime=regime,
                 gate_alpha=self.config['gate_alpha']
             )
+            
+            # NEW: Apply sector diversification filter if enabled
+            if self.config['enable_sector_diversification'] and not candidates.empty:
+                candidates = self._apply_sector_filter(candidates)
             
             # 4. Make trading decisions (auto_decider logic)
             portfolio_state = self.portfolio.get_state()
@@ -290,6 +313,41 @@ class BacktestEngine:
             'regime_history': regime_df,
             'analysis': analysis
         }
+    
+    def _apply_sector_filter(self, candidates: pd.DataFrame) -> pd.DataFrame:
+        """
+        NEW: Apply sector diversification filter to candidates
+        
+        Args:
+            candidates: ML candidates DataFrame
+        
+        Returns:
+            Filtered candidates
+        """
+        if candidates.empty:
+            return candidates
+        
+        # Get current sector exposure
+        sector_exposure = self.portfolio.get_sector_exposure()
+        
+        # Add sector to candidates
+        candidates = candidates.copy()
+        candidates['sector'] = candidates['ticker'].apply(lambda x: self.portfolio.get_sector(x))
+        
+        # Filter out sectors that are at max capacity
+        max_per_sector = self.config['max_positions_per_sector']
+        
+        def can_add_sector(sector):
+            current_count = sector_exposure.get(sector, 0)
+            return current_count < max_per_sector
+        
+        candidates['can_add'] = candidates['sector'].apply(can_add_sector)
+        filtered = candidates[candidates['can_add']].copy()
+        
+        # Drop helper columns
+        filtered = filtered.drop(columns=['sector', 'can_add'])
+        
+        return filtered
     
     def _get_entry_price(self, buy_decision: Dict, current_date: date) -> float:
         """
@@ -407,30 +465,34 @@ class BacktestEngine:
         regime_history.to_csv(os.path.join(output_dir, 'regime_history.csv'), index=False)
         
         # Save regime breakdown
-        if 'regime_breakdown' in analysis:
+        if 'regime_breakdown' in analysis and not analysis['regime_breakdown'].empty:
             analysis['regime_breakdown'].to_csv(os.path.join(output_dir, 'regime_breakdown.csv'), index=False)
         
-        # Save sector breakdown (if available)
-        if 'sector_breakdown' in analysis:
+        # Save sector breakdown
+        if 'sector_breakdown' in analysis and not analysis['sector_breakdown'].empty:
             analysis['sector_breakdown'].to_csv(os.path.join(output_dir, 'sector_breakdown.csv'), index=False)
         
-        # Save hold time analysis (if available)
+        # NEW: Save yearly breakdown
+        if 'yearly_breakdown' in analysis and not analysis['yearly_breakdown'].empty:
+            analysis['yearly_breakdown'].to_csv(os.path.join(output_dir, 'yearly_breakdown.csv'), index=False)
+        
+        # Save hold time analysis
         if 'hold_time_analysis' in analysis:
             hold_time_data = analysis['hold_time_analysis']
-            if 'hold_time_by_regime_bucket' in hold_time_data:
-                pd.DataFrame(hold_time_data['hold_time_by_regime_bucket']).to_csv(
+            if 'hold_time_by_regime_bucket' in hold_time_data and not hold_time_data['hold_time_by_regime_bucket'].empty:
+                hold_time_data['hold_time_by_regime_bucket'].to_csv(
                     os.path.join(output_dir, 'hold_time_analysis.csv'), index=False
                 )
         
-        # Save regime transitions (if available)
-        if 'regime_transitions' in analysis:
+        # Save regime transitions
+        if 'regime_transitions' in analysis and not analysis['regime_transitions'].empty:
             analysis['regime_transitions'].to_csv(os.path.join(output_dir, 'regime_transitions.csv'), index=False)
         
         # Save monthly/yearly returns
-        if 'monthly_returns' in analysis:
+        if 'monthly_returns' in analysis and not analysis['monthly_returns'].empty:
             analysis['monthly_returns'].to_csv(os.path.join(output_dir, 'monthly_returns.csv'), index=False)
         
-        if 'yearly_returns' in analysis:
+        if 'yearly_returns' in analysis and not analysis['yearly_returns'].empty:
             analysis['yearly_returns'].to_csv(os.path.join(output_dir, 'yearly_returns.csv'), index=False)
         
         # Save summary text

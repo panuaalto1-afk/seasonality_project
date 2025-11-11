@@ -3,7 +3,7 @@
 Performance Analysis Module
 Calculates metrics, benchmarks, and generates reports
 
-UPDATED: 2025-11-11 15:40 UTC - Fixed regime_breakdown columns and indentation
+UPDATED: 2025-11-11 19:33 UTC - Enhanced 10-year analysis with yearly breakdown
 """
 
 import pandas as pd
@@ -14,7 +14,7 @@ from datetime import date
 class PerformanceAnalyzer:
     """
     Analyzes backtest performance
-    Calculates metrics, compares to benchmarks
+    Calculates metrics, compares to benchmarks, analyzes by time periods
     """
     
     def __init__(self, constituents: Optional[pd.DataFrame] = None):
@@ -64,6 +64,11 @@ class PerformanceAnalyzer:
             trades_history, regime_history
         )
         
+        # NEW: Yearly breakdown
+        analysis['yearly_breakdown'] = self._analyze_by_year(
+            portfolio_equity_curve, trades_history
+        )
+        
         # Monthly/Yearly returns
         analysis['monthly_returns'] = self._calculate_monthly_returns(portfolio_equity_curve)
         analysis['yearly_returns'] = self._calculate_yearly_returns(portfolio_equity_curve)
@@ -77,6 +82,9 @@ class PerformanceAnalyzer:
         
         # Regime transitions
         analysis['regime_transitions'] = self._analyze_regime_transitions(regime_history)
+        
+        # NEW: Rolling metrics
+        analysis['rolling_metrics'] = self._calculate_rolling_metrics(portfolio_equity_curve)
         
         print("[PerformanceAnalyzer] Analysis complete")
         
@@ -101,22 +109,43 @@ class PerformanceAnalyzer:
         days = (equity_curve.iloc[-1]['date'] - equity_curve.iloc[0]['date']).days
         years = days / 365.25
         annual_return = ((final_value / initial_value) ** (1 / years) - 1) * 100 if years > 0 else 0
+        cagr = annual_return  # Same as annual_return
         
         # Volatility (annualized)
         volatility = equity_curve['returns'].std() * np.sqrt(252) * 100
         
-        # Sharpe ratio (assuming 0% risk-free rate)
-        sharpe = (annual_return / volatility) if volatility > 0 else 0
+        # Sharpe ratio (assuming 2% risk-free rate)
+        risk_free_rate = 2.0  # 2% annual
+        sharpe = ((annual_return - risk_free_rate) / volatility) if volatility > 0 else 0
         
         # Sortino ratio (downside deviation)
         downside_returns = equity_curve[equity_curve['returns'] < 0]['returns']
         downside_vol = downside_returns.std() * np.sqrt(252) * 100 if len(downside_returns) > 0 else 0.001
-        sortino = (annual_return / downside_vol) if downside_vol > 0 else 0
+        sortino = ((annual_return - risk_free_rate) / downside_vol) if downside_vol > 0 else 0
         
         # Max drawdown
         equity_curve['cummax'] = equity_curve['total_value'].cummax()
         equity_curve['drawdown'] = (equity_curve['total_value'] - equity_curve['cummax']) / equity_curve['cummax'] * 100
         max_drawdown = equity_curve['drawdown'].min()
+        
+        # Drawdown duration
+        in_drawdown = equity_curve['drawdown'] < 0
+        drawdown_periods = []
+        current_period = 0
+        
+        for dd in in_drawdown:
+            if dd:
+                current_period += 1
+            else:
+                if current_period > 0:
+                    drawdown_periods.append(current_period)
+                current_period = 0
+        
+        if current_period > 0:
+            drawdown_periods.append(current_period)
+        
+        max_dd_duration = max(drawdown_periods) if drawdown_periods else 0
+        avg_dd_duration = np.mean(drawdown_periods) if drawdown_periods else 0
         
         # Calmar ratio
         calmar = (annual_return / abs(max_drawdown)) if max_drawdown != 0 else 0
@@ -126,23 +155,20 @@ class PerformanceAnalyzer:
             'final_value': final_value,
             'total_return': total_return,
             'annual_return': annual_return,
+            'cagr': cagr,
             'volatility': volatility,
             'sharpe_ratio': sharpe,
             'sortino_ratio': sortino,
             'max_drawdown': max_drawdown,
-            'calmar_ratio': calmar
+            'max_drawdown_duration': max_dd_duration,
+            'avg_drawdown_duration': avg_dd_duration,
+            'calmar_ratio': calmar,
+            'years': years,
         }
     
     def _calculate_trade_stats(self, trades: pd.DataFrame) -> Dict:
-        """
-        Calculate detailed trade statistics
+        """Calculate detailed trade statistics"""
         
-        Args:
-            trades: Trades history DataFrame
-        
-        Returns:
-            Dict with trade statistics
-        """
         if trades.empty:
             return {
                 'total_trades': 0,
@@ -157,8 +183,6 @@ class PerformanceAnalyzer:
                 'max_loss': 0.0
             }
         
-        # FIXED: trades DataFrame already contains all exits (no 'action' column)
-        # Just work with trades directly
         winning = trades[trades['pl_pct'] > 0]
         losing = trades[trades['pl_pct'] <= 0]
         
@@ -258,7 +282,7 @@ class PerformanceAnalyzer:
     def _analyze_by_regime(self,
                           trades: pd.DataFrame,
                           regime_history: pd.DataFrame) -> pd.DataFrame:
-        """Analyze performance by market regime - FIXED column names"""
+        """Analyze performance by market regime"""
         
         if trades.empty or regime_history.empty:
             return pd.DataFrame()
@@ -276,7 +300,6 @@ class PerformanceAnalyzer:
             'hold_days': 'mean'
         }).reset_index()
         
-        # FIXED: Column names to match visualizer expectations
         regime_stats.columns = ['regime', 'trades_count', 'avg_return_pct', 'total_return_pct', 'avg_hold_days']
         
         # Calculate win rate per regime
@@ -287,7 +310,7 @@ class PerformanceAnalyzer:
         
         regime_stats = regime_stats.merge(win_rates, on='regime')
         
-        # Calculate Sharpe ratio per regime (approximate from trade returns)
+        # Calculate Sharpe ratio per regime
         sharpe_ratios = trades_with_regime.groupby('regime').apply(
             lambda x: (x['pl_pct'].mean() / x['pl_pct'].std()) if x['pl_pct'].std() > 0 else 0,
             include_groups=False
@@ -297,8 +320,75 @@ class PerformanceAnalyzer:
         
         return regime_stats
     
+    def _analyze_by_year(self,
+                        equity_curve: pd.DataFrame,
+                        trades_history: pd.DataFrame) -> pd.DataFrame:
+        """NEW: Analyze performance by year"""
+        
+        if equity_curve.empty:
+            return pd.DataFrame()
+        
+        equity_curve = equity_curve.copy()
+        equity_curve['date'] = pd.to_datetime(equity_curve['date'])
+        equity_curve['year'] = equity_curve['date'].dt.year
+        
+        # Calculate yearly metrics
+        yearly_stats = []
+        
+        for year in equity_curve['year'].unique():
+            year_data = equity_curve[equity_curve['year'] == year].copy()
+            
+            if len(year_data) < 2:
+                continue
+            
+            start_value = year_data.iloc[0]['total_value']
+            end_value = year_data.iloc[-1]['total_value']
+            year_return = ((end_value - start_value) / start_value) * 100
+            
+            # Returns for this year
+            year_data['returns'] = year_data['total_value'].pct_change()
+            
+            # Volatility
+            volatility = year_data['returns'].std() * np.sqrt(252) * 100
+            
+            # Sharpe
+            sharpe = (year_return / volatility) if volatility > 0 else 0
+            
+            # Max drawdown
+            year_data['cummax'] = year_data['total_value'].cummax()
+            year_data['drawdown'] = (year_data['total_value'] - year_data['cummax']) / year_data['cummax'] * 100
+            max_dd = year_data['drawdown'].min()
+            
+            # Trades for this year
+            if not trades_history.empty:
+                trades_history_copy = trades_history.copy()
+                trades_history_copy['exit_date'] = pd.to_datetime(trades_history_copy['exit_date'])
+                trades_history_copy['year'] = trades_history_copy['exit_date'].dt.year
+                year_trades = trades_history_copy[trades_history_copy['year'] == year]
+                
+                num_trades = len(year_trades)
+                winning_trades = len(year_trades[year_trades['pl'] > 0])
+                win_rate = (winning_trades / num_trades * 100) if num_trades > 0 else 0
+            else:
+                num_trades = 0
+                win_rate = 0
+            
+            yearly_stats.append({
+                'year': year,
+                'return': year_return,
+                'volatility': volatility,
+                'sharpe_ratio': sharpe,
+                'max_drawdown': max_dd,
+                'num_trades': num_trades,
+                'win_rate': win_rate,
+                'start_value': start_value,
+                'end_value': end_value,
+            })
+        
+        return pd.DataFrame(yearly_stats)
+    
     def _calculate_monthly_returns(self, equity_curve: pd.DataFrame) -> pd.DataFrame:
-        """Calculate monthly returns - FIXED to return year, month, return_pct columns"""
+        """Calculate monthly returns"""
         
         if equity_curve.empty:
             return pd.DataFrame()
@@ -318,7 +408,6 @@ class PerformanceAnalyzer:
         monthly.columns = ['year_month', 'start_value', 'end_value', 'year', 'month']
         monthly['return_pct'] = ((monthly['end_value'] - monthly['start_value']) / monthly['start_value']) * 100
         
-        # Return only the columns needed for visualization
         return monthly[['year', 'month', 'return_pct']]
     
     def _calculate_yearly_returns(self, equity_curve: pd.DataFrame) -> pd.DataFrame:
@@ -342,47 +431,28 @@ class PerformanceAnalyzer:
     def _analyze_by_sector(self, trades: pd.DataFrame) -> pd.DataFrame:
         """Analyze performance by sector"""
         
-        if trades.empty or self.constituents is None or 'Sector' not in self.constituents.columns:
+        if trades.empty:
             return pd.DataFrame()
         
-        # FIXED: Handle different column names (ticker vs Ticker vs Symbol)
-        ticker_col = None
-        for col in ['ticker', 'Ticker', 'Symbol']:
-            if col in self.constituents.columns:
-                ticker_col = col
-                break
-        
-        if ticker_col is None:
-            print(f"[PerformanceAnalyzer] Warning: No ticker column found in constituents")
+        # Check if sector column exists
+        if 'sector' not in trades.columns:
             return pd.DataFrame()
-        
-        # Prepare constituents with standardized column name
-        constituents_subset = self.constituents[[ticker_col, 'Sector']].copy()
-        constituents_subset.rename(columns={ticker_col: 'ticker'}, inplace=True)
-        
-        # Merge trades with sector data
-        trades_with_sector = trades.merge(
-            constituents_subset,
-            on='ticker',
-            how='left'
-        )
         
         # Group by sector
-        sector_stats = trades_with_sector.groupby('Sector').agg({
+        sector_stats = trades.groupby('sector').agg({
             'pl_pct': ['count', 'mean', 'sum'],
             'hold_days': 'mean'
         }).reset_index()
         
         sector_stats.columns = ['sector', 'num_trades', 'avg_return', 'total_return', 'avg_hold_days']
         
-        # Calculate win rate per sector - FIXED: include_groups=False
-        win_rates = trades_with_sector.groupby('Sector').apply(
+        # Calculate win rate per sector
+        win_rates = trades.groupby('sector').apply(
             lambda x: (x['pl_pct'] > 0).sum() / len(x) * 100 if len(x) > 0 else 0,
             include_groups=False
         ).reset_index(name='win_rate')
         
-        sector_stats = sector_stats.merge(win_rates, left_on='sector', right_on='Sector', how='left')
-        sector_stats = sector_stats.drop('Sector', axis=1)
+        sector_stats = sector_stats.merge(win_rates, on='sector', how='left')
         
         return sector_stats
     
@@ -438,17 +508,39 @@ class PerformanceAnalyzer:
         if transitions.empty:
             return pd.DataFrame(columns=['date', 'prev_regime', 'regime'])
         
-        # FIXED: Return only available columns (handle missing 'score')
+        # Return available columns
         available_cols = []
         for col in ['date', 'prev_regime', 'regime', 'score']:
             if col in transitions.columns:
                 available_cols.append(col)
         
-        # Ensure at least basic columns exist
         if not available_cols:
             available_cols = ['date', 'prev_regime', 'regime']
         
         return transitions[available_cols]
+    
+    def _calculate_rolling_metrics(self, equity_curve: pd.DataFrame, window: int = 252) -> Dict:
+        """NEW: Calculate rolling metrics"""
+        
+        if equity_curve.empty or len(equity_curve) < window:
+            return {}
+        
+        equity_curve = equity_curve.copy()
+        equity_curve['returns'] = equity_curve['total_value'].pct_change()
+        
+        # Rolling Sharpe
+        rolling_mean = equity_curve['returns'].rolling(window).mean()
+        rolling_std = equity_curve['returns'].rolling(window).std()
+        rolling_sharpe = (rolling_mean / rolling_std) * np.sqrt(252)
+        
+        # Rolling volatility
+        rolling_volatility = equity_curve['returns'].rolling(window).std() * np.sqrt(252) * 100
+        
+        return {
+            'rolling_sharpe': rolling_sharpe.dropna().tolist(),
+            'rolling_volatility': rolling_volatility.dropna().tolist(),
+            'dates': equity_curve['date'].iloc[window-1:].tolist(),
+        }
     
     def generate_summary_text(self, analysis: Dict) -> str:
         """Generate human-readable summary"""
@@ -456,45 +548,58 @@ class PerformanceAnalyzer:
         pm = analysis.get('portfolio_metrics', {})
         ts = analysis.get('trade_stats', {})
         bc = analysis.get('benchmark_comparison', {})
+        yb = analysis.get('yearly_breakdown', pd.DataFrame())
         
         summary = []
         summary.append("=" * 80)
-        summary.append("BACKTEST PERFORMANCE SUMMARY")
+        summary.append("BACKTEST PERFORMANCE SUMMARY - 10-YEAR ANALYSIS")
         summary.append("=" * 80)
         summary.append("")
         
         summary.append("PORTFOLIO PERFORMANCE:")
-        summary.append(f"  Initial Value:     ${pm.get('initial_value', 0):,.2f}")
-        summary.append(f"  Final Value:       ${pm.get('final_value', 0):,.2f}")
-        summary.append(f"  Total Return:      {pm.get('total_return', 0):.2f}%")
-        summary.append(f"  Annual Return:     {pm.get('annual_return', 0):.2f}%")
-        summary.append(f"  Sharpe Ratio:      {pm.get('sharpe_ratio', 0):.3f}")
-        summary.append(f"  Sortino Ratio:     {pm.get('sortino_ratio', 0):.3f}")
-        summary.append(f"  Max Drawdown:      {pm.get('max_drawdown', 0):.2f}%")
-        summary.append(f"  Volatility (Ann):  {pm.get('volatility', 0):.2f}%")
-        summary.append(f"  Calmar Ratio:      {pm.get('calmar_ratio', 0):.3f}")
+        summary.append(f"  Initial Value:       ${pm.get('initial_value', 0):,.2f}")
+        summary.append(f"  Final Value:         ${pm.get('final_value', 0):,.2f}")
+        summary.append(f"  Total Return:        {pm.get('total_return', 0):.2f}%")
+        summary.append(f"  CAGR:                {pm.get('cagr', 0):.2f}%")
+        summary.append(f"  Sharpe Ratio:        {pm.get('sharpe_ratio', 0):.3f}")
+        summary.append(f"  Sortino Ratio:       {pm.get('sortino_ratio', 0):.3f}")
+        summary.append(f"  Calmar Ratio:        {pm.get('calmar_ratio', 0):.3f}")
+        summary.append(f"  Max Drawdown:        {pm.get('max_drawdown', 0):.2f}%")
+        summary.append(f"  Max DD Duration:     {pm.get('max_drawdown_duration', 0):.0f} days")
+        summary.append(f"  Volatility (Ann):    {pm.get('volatility', 0):.2f}%")
         summary.append("")
         
         summary.append("TRADE STATISTICS:")
-        summary.append(f"  Total Trades:      {ts.get('total_trades', 0)}")
-        summary.append(f"  Winning Trades:    {ts.get('winning_trades', 0)}")
-        summary.append(f"  Win Rate:          {ts.get('win_rate', 0):.2f}%")
-        summary.append(f"  Avg Win:           {ts.get('avg_win', 0):.2f}%")
-        summary.append(f"  Avg Loss:          {ts.get('avg_loss', 0):.2f}%")
-        summary.append(f"  Profit Factor:     {ts.get('profit_factor', 0):.3f}")
-        summary.append(f"  Avg Hold Time:     {ts.get('avg_hold_time', 0):.1f} days")
+        summary.append(f"  Total Trades:        {ts.get('total_trades', 0)}")
+        summary.append(f"  Winning Trades:      {ts.get('winning_trades', 0)}")
+        summary.append(f"  Win Rate:            {ts.get('win_rate', 0):.2f}%")
+        summary.append(f"  Avg Win:             {ts.get('avg_win', 0):.2f}%")
+        summary.append(f"  Avg Loss:            {ts.get('avg_loss', 0):.2f}%")
+        summary.append(f"  Profit Factor:       {ts.get('profit_factor', 0):.3f}")
+        summary.append(f"  Avg Hold Time:       {ts.get('avg_hold_time', 0):.1f} days")
         summary.append("")
         
         if bc:
             summary.append("BENCHMARK COMPARISON:")
             for bench_name, bench_stats in bc.items():
                 summary.append(f"  vs {bench_name}:")
-                summary.append(f"    Benchmark Return:  {bench_stats.get('benchmark_return', 0):.2f}%")
-                summary.append(f"    Outperformance:    {bench_stats.get('outperformance', 0):.2f}%")
-                summary.append(f"    Alpha:             {bench_stats.get('alpha', 0):.2f}%")
-                summary.append(f"    Beta:              {bench_stats.get('beta', 0):.3f}")
+                summary.append(f"    Benchmark Return:    {bench_stats.get('benchmark_return', 0):.2f}%")
+                summary.append(f"    Portfolio Return:    {bench_stats.get('portfolio_return', 0):.2f}%")
+                summary.append(f"    Outperformance:      {bench_stats.get('outperformance', 0):.2f}%")
+                summary.append(f"    Alpha:               {bench_stats.get('alpha', 0):.2f}%")
+                summary.append(f"    Beta:                {bench_stats.get('beta', 0):.3f}")
+            summary.append("")
         
-        summary.append("")
+        # NEW: Yearly breakdown summary
+        if not yb.empty:
+            summary.append("YEARLY PERFORMANCE:")
+            summary.append("-" * 80)
+            summary.append(f"{'Year':<8} {'Return %':<12} {'Sharpe':<10} {'Max DD %':<12} {'Trades':<10}")
+            summary.append("-" * 80)
+            for _, row in yb.iterrows():
+                summary.append(f"{int(row['year']):<8} {row['return']:>10.2f}% {row['sharpe_ratio']:>8.3f}  {row['max_drawdown']:>10.2f}% {int(row['num_trades']):>8}")
+            summary.append("")
+        
         summary.append("=" * 80)
         summary.append("")
         
