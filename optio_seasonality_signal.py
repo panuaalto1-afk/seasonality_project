@@ -43,7 +43,7 @@ PRICE_CACHE_DIR = r"C:\Users\panua\seasonality_project\seasonality_reports\runs\
 TODAY = dt.datetime.now().strftime("%Y-%m-%d")
 OUT_DIR = os.path.join(AGG_DIR, "optio_signals", TODAY)
 
-UNIVERSE_CSV = os.path.join(AGG_DIR, "Constituents_raw.csv")
+UNIVERSE_CSV = os.path.join(REPORTS_DIR, "Constituents_raw.csv")
 USE_FALLBACK_UNIVERSE = ["AAPL","MSFT","NVDA","GOOGL","AMZN","META","TSLA"]
 
 # Likviditeettifiltterit
@@ -72,7 +72,7 @@ W_COMP = 0.20
 W_SEAS = 0.15
 W_MKT  = 0.05
 
-TOP_N = 60
+TOP_N = 100
 
 CACHE_DIR    = os.path.join(AGG_DIR, "optio_signals", "_cache")
 IV_OI_CACHE  = os.path.join(CACHE_DIR, "iv_oi_cache.csv")
@@ -514,11 +514,11 @@ def main():
         return path_csv, path_html
 
     # Listat — suodatetaan vain todelliset rivit
-    long_cand = df[(df["DBS"] >= 55) & (df["Priority"] >= 60) & (df["SEAS_trend"].isin(["UP","NEUTRAL",""]))].copy()
+    long_cand = df[(df["DBS"] >= 50) & (df["Priority"] >= 50) & (df["SEAS_trend"].isin(["UP","NEUTRAL",""]))].copy()
     long_cand = long_cand.sort_values(["Priority","MPI","Compression"], ascending=False).head(TOP_N)
     long_paths = save_list(long_cand, "top_breakout_long")
 
-    short_cand = df[(df["DBS"] <= 45) & (df["Priority"] >= 60)].copy()
+    short_cand = df[(df["DBS"] <= 50) & (df["Priority"] >= 50)].copy()
     short_cand = short_cand.sort_values(["Priority","MPI","Compression"], ascending=False).head(TOP_N)
     short_paths = save_list(short_cand, "top_breakout_short")
 

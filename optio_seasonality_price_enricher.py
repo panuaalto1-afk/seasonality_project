@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# optio_seasonality_price_enricher.py (v1.3)
+# optio_seasonality_price_enricher.py (v1.4 - FIXED price_cache detection)
 
 import argparse, sys, io
 from pathlib import Path
@@ -36,12 +36,22 @@ def write_csv_robust(df: pd.DataFrame, p: Path, sep: str = ','):
 def ensure_dir(p: Path): p.mkdir(parents=True, exist_ok=True)
 
 def latest_dated_folder(base: Path) -> Path | None:
+    """Find latest dated folder - supports both YYYY-MM-DD and YYYY-MM-DD_HHMM formats"""
     if not base.exists(): return None
     cands = []
     for d in base.iterdir():
         if d.is_dir():
-            try: dt.datetime.strptime(d.name, "%Y-%m-%d"); cands.append(d)
-            except: pass
+            try: 
+                # Try YYYY-MM-DD format first
+                dt.datetime.strptime(d.name, "%Y-%m-%d")
+                cands.append(d)
+            except:
+                # Try YYYY-MM-DD_HHMM format
+                try:
+                    dt.datetime.strptime(d.name, "%Y-%m-%d_%H%M")
+                    cands.append(d)
+                except:
+                    pass
     return sorted(cands, key=lambda x: x.name)[-1] if cands else None
 
 def ticker_col_guess(df: pd.DataFrame) -> str | None:
@@ -320,20 +330,30 @@ def main():
     ap.add_argument('--save-cache', default='false', type=str)
     ap.add_argument('--price-dir', default='', type=str)
     ap.add_argument('--force-sides', default='false', type=str, help='true => tee long/short myös ilman optio-listoja')
-    ap.add_argument('--top-n', default='60', type=str, help='force-sides: listan maksimipituus')
+    ap.add_argument('--top-n', default='100', type=str, help='force-sides: listan maksimipituus')
     ap.add_argument('--round', default='3', type=str, help='pyöristyksen desimaalit (numeerisille)')
     args = ap.parse_args()
 
     root = Path(args.root)
     reports_dir = Path(args.reports_dir) if args.reports_dir else (root / 'seasonality_reports')
 
-    # Oletus price_dir jos ei annettu: uusin runs\...\price_cache reports-dirissä
+    # FIXED: Prioritize known stable price_cache location
     if args.price_dir:
         price_dir = Path(args.price_dir)
     else:
-        runs = reports_dir / 'runs'
-        latest_run = latest_dated_folder(runs) if runs.exists() else None
-        price_dir = (latest_run / 'price_cache') if latest_run else (root / 'price_cache')
+        # Priority 1: Use known stable price_cache (2025-10-04_0903)
+        stable_cache = reports_dir / 'runs' / '2025-10-04_0903' / 'price_cache'
+        if stable_cache.exists():
+            price_dir = stable_cache
+        else:
+            # Priority 2: Find any runs folder with price_cache
+            runs = reports_dir / 'runs'
+            if runs.exists():
+                all_runs = sorted([d for d in runs.iterdir() if d.is_dir() and (d / 'price_cache').exists()], 
+                                 key=lambda x: x.name, reverse=True)
+                price_dir = (all_runs[0] / 'price_cache') if all_runs else (root / 'price_cache')
+            else:
+                price_dir = root / 'price_cache'
 
     optio_base = reports_dir / 'aggregates' / 'optio_signals'
     optio_dir  = latest_dated_folder(optio_base) if args.optio_date == 'latest' else (optio_base / args.optio_date)

@@ -1,0 +1,6 @@
+Tehtiin muutoksia optio_seasonality_signal.py skriptiin. Päivitettiin sitä lukemaan enemmän signaaleja 60 => 100, jotta saadaan jatkossa riittävästi signaaleja backtestaukseen. Skripti oli jäänyt fallback moodiin. Laskettiin myös hieman long ja short candidates kriteerejä, jotta signaaleja tulee riittävästi. 
+ 
+Päivitettiin optio_seasonality_price_enricher.py skriptiä 
+
+Päivitettiin optio_unified_daily.py skriptiä niin, että se päivittää tiedoston optio_price_enriched_with_regime.csv sekä regime_sector_momentum.csv onnistuneesti. Nyt se hakee jälkimmäisen listan regime tiedot oikein regime_history.csv tiedostosta.
+Viety viimeisimmät tiedostot githubiin.   
