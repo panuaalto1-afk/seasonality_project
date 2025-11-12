@@ -493,11 +493,23 @@ class BacktestEngine:
             if price_history is None or len(price_history) < 60:
                 return None
             
-            # Calculate seasonality
-            seasonality_score = self.seasonality_calc.calculate_seasonality(
+            # Calculate seasonality features - KORJATTU: calculate_features()
+            seasonality_features = self.seasonality_calc.calculate_features(
                 symbol,
-                pd.Timestamp(date),
-                price_history
+                price_history,
+                date  # target_date
+            )
+            
+            # Extract main seasonality signals
+            season_20d = seasonality_features.get('season_20d_avg', 0.0)
+            season_week = seasonality_features.get('season_week_avg', 0.0)
+            in_bullish = seasonality_features.get('in_bullish_segment', 0)
+            
+            # Combine seasonality signals (weighted)
+            seasonality_score = (
+                season_20d * 0.5 +          # 20-day forward return avg
+                season_week * 0.3 +         # Week-of-year avg
+                (in_bullish * 0.05)         # Bullish segment boost
             )
             
             # Calculate momentum
@@ -507,14 +519,22 @@ class BacktestEngine:
             returns = price_history['close'].pct_change().dropna()
             volatility = returns.std() * np.sqrt(252) if len(returns) > 0 else 0.0
             
-            # Combine scores (simple blend for now)
+            # Combine scores (weighted blend)
+            # Seasonality has more weight (60%) than momentum (40%)
             score_long = (seasonality_score * 0.6 + momentum * 0.4)
+            
+            # Normalize to 0-1 range roughly
+            # Seasonality can be -0.1 to +0.1, momentum -0.5 to +0.5
+            # Combined: roughly -0.26 to +0.26, map to 0-1
+            score_long = (score_long + 0.3) / 0.6  # Map roughly to 0-1
+            score_long = max(0.0, min(1.0, score_long))  # Clip to 0-1
             
             return {
                 'score_long': score_long,
                 'seasonality': seasonality_score,
                 'momentum': momentum,
                 'volatility': volatility,
+                'features': seasonality_features,
             }
         
         except Exception as e:
