@@ -1,208 +1,242 @@
 ﻿# backtest_scripts/auto_decider_simulator.py
 """
-Auto Decider Simulator for Backtesting
-Replicates auto_decider.py decision logic
+Auto Decider Simulator with Sector-Specific Parameters
+Determines entry/exit decisions based on regime and sector
 
-UPDATED: 2025-11-11 19:36 UTC - Added sector diversification logic
+UPDATED: 2025-11-12 15:19 UTC
+CHANGES:
+  - Sector-specific TP/SL levels
+  - Enhanced min_hold_days logic
+  - Volatility-based adjustments
 """
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional
-from datetime import date
+from typing import Dict, Optional, Tuple
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class AutoDeciderSimulator:
     """
-    Simulates auto_decider.py logic for backtesting
-    Makes BUY/SELL/HOLD decisions based on:
-    - ML candidates (from ml_signal_generator)
-    - Current regime (from regime_calculator)
-    - Portfolio state
-    - Regime strategies
-    - Sector diversification (NEW)
+    Simulates auto_decider logic with sector-aware strategies
     """
     
-    def __init__(self, regime_strategies: Dict):
+    def __init__(self, config: dict):
         """
-        Initialize auto decider simulator
+        Initialize simulator
         
         Args:
-            regime_strategies: Dict mapping regime → strategy params
+            config: Configuration dict
         """
-        self.regime_strategies = regime_strategies
-        print(f"[AutoDeciderSimulator] Initialized with {len(regime_strategies)} regime strategies")
+        self.config = config
+        self.regime_strategies = config.get('REGIME_STRATEGIES', {})
+        self.sector_strategies = config.get('SECTOR_STRATEGIES', {})
+        
+        # Gate parameters
+        self.gate_alpha = config.get('GATE_ALPHA', 0.15)
+        
+        # Stop/TP settings
+        self.use_stop_loss = config.get('USE_STOP_LOSS', True)
+        self.use_take_profit = config.get('USE_TAKE_PROFIT', True)
+        
+        logger.info(f"[AutoDecider] Initialized (gate_alpha={self.gate_alpha})")
+        logger.info(f"[AutoDecider] Loaded {len(self.regime_strategies)} regime strategies")
+        logger.info(f"[AutoDecider] Loaded {len(self.sector_strategies)} sector strategies")
     
-    def decide_trades(self,
-                     target_date: date,
-                     candidates_df: pd.DataFrame,
-                     portfolio_state: Dict,
-                     regime: str,
-                     cash: float,
-                     max_positions_override: Optional[int] = None,
-                     position_size_override: Optional[float] = None) -> Dict:
+    
+    def should_enter(
+        self,
+        symbol: str,
+        score_long: float,
+        regime: str,
+        sector: Optional[str] = None,
+        volatility: Optional[float] = None
+    ) -> bool:
         """
-        Make trading decisions for a specific date
+        Determine if should enter position
         
         Args:
-            target_date: Date of decision
-            candidates_df: ML candidates (from ml_signal_generator)
-            portfolio_state: Current portfolio state
-            regime: Current market regime
-            cash: Available cash
-            max_positions_override: Override max positions
-            position_size_override: Override position size
+            symbol: Stock ticker
+            score_long: ML/seasonality score
+            regime: Current regime
+            sector: Sector name
+            volatility: Stock volatility
         
         Returns:
-            dict: {'buy': [], 'sell': [], 'hold': []}
+            True if should enter
         """
-        # Check if candidates_df is empty or invalid
-        if candidates_df is None or candidates_df.empty:
-            current_positions = portfolio_state.get('positions', [])
-            return {
-                'buy': [],
-                'sell': [],
-                'hold': current_positions.copy()
-            }
+        # Basic gate check
+        if score_long < self.gate_alpha:
+            return False
         
-        # Get regime strategy
-        strategy = self.regime_strategies.get(regime, self.regime_strategies['NEUTRAL_BULLISH'])
+        # Check regime allows entries
+        regime_strategy = self.regime_strategies.get(regime, {})
+        max_positions = regime_strategy.get('max_positions', 20)
+        if max_positions == 0:
+            return False
         
-        max_positions = max_positions_override if max_positions_override else strategy['max_positions']
-        position_size_mult = strategy['position_size_multiplier']
-        base_position_size = position_size_override if position_size_override else 5000.0
-        position_size = base_position_size * position_size_mult
+        # Sector-specific volatility check
+        if sector and volatility is not None:
+            sector_params = self.sector_strategies.get(
+                sector,
+                self.sector_strategies.get('Default', {})
+            )
+            vol_tolerance = sector_params.get('volatility_tolerance', 0.03)
+            
+            if volatility > vol_tolerance:
+                logger.debug(
+                    f"[AutoDecider] {symbol} volatility too high: "
+                    f"{volatility:.4f} > {vol_tolerance:.4f}"
+                )
+                return False
         
-        # Get min_hold_days from strategy
-        min_hold_days = strategy.get('min_hold_days', 0)
+        return True
+    
+    
+    def should_exit(
+        self,
+        symbol: str,
+        position: Dict,
+        current_price: float,
+        current_date: pd.Timestamp,
+        score_long: float,
+        regime: str,
+        atr: Optional[float] = None
+    ) -> Tuple[bool, str]:
+        """
+        Determine if should exit position
         
-        current_positions = portfolio_state.get('positions', [])
-        current_tickers = [pos['ticker'] for pos in current_positions]
+        Args:
+            symbol: Stock ticker
+            position: Position dict
+            current_price: Current price
+            current_date: Current date
+            score_long: Current ML/seasonality score
+            regime: Current regime
+            atr: Average True Range
         
-        # SELL DECISIONS (Regime-based exits + min_hold_days check)
-        sell_decisions = []
-        hold_decisions = []
+        Returns:
+            (should_exit: bool, reason: str)
+        """
+        entry_price = position['entry_price']
+        entry_date = position['entry_date']
+        sector = position.get('sector')
         
-        # CRISIS regime: Exit ALL positions (ignore min_hold_days)
+        # Calculate return
+        current_return = (current_price - entry_price) / entry_price
+        
+        # Calculate hold time
+        hold_days = (current_date - entry_date).days
+        
+        # Get effective parameters (sector overrides regime)
+        tp_mult, sl_mult, min_hold = self._get_exit_parameters(position, regime, sector)
+        
+        # 1. Minimum hold period check
+        if hold_days < min_hold:
+            # Only emergency exits allowed during min hold
+            if regime == 'CRISIS':
+                return True, 'CRISIS_EXIT'
+            if regime == 'BEAR_STRONG' and current_return < -0.05:
+                return True, 'BEAR_STRONG_WEAK_EXIT'
+            return False, ''
+        
+        # 2. Take Profit check
+        if self.use_take_profit and atr is not None:
+            tp_threshold = (atr / entry_price) * tp_mult
+            if current_return >= tp_threshold:
+                return True, 'TAKE_PROFIT'
+        
+        # 3. Stop Loss check
+        if self.use_stop_loss and atr is not None:
+            sl_threshold = -(atr / entry_price) * sl_mult
+            if current_return <= sl_threshold:
+                return True, 'STOP_LOSS'
+        
+        # 4. Regime-based exit
+        regime_strategy = self.regime_strategies.get(regime, {})
+        regime_pos_mult = regime_strategy.get('position_size_multiplier', 1.0)
+        
+        # Exit if regime turns very bearish
         if regime == 'CRISIS':
-            sell_decisions = [
-                {'ticker': pos['ticker'], 'reason': 'CRISIS_EXIT', 'date': target_date}
-                for pos in current_positions
-            ]
+            return True, 'CRISIS_EXIT'
         
-        # BEAR_STRONG: Exit weak positions (ignore min_hold_days)
-        elif regime == 'BEAR_STRONG' and len(current_positions) > 0:
-            positions_with_pl = []
-            for pos in current_positions:
-                entry = pos.get('entry_price', 0)
-                current_price = pos.get('current_price', entry)
-                pl_pct = ((current_price - entry) / entry) * 100 if entry > 0 else 0.0
-                positions_with_pl.append({'position': pos, 'pl_pct': pl_pct})
+        if regime == 'BEAR_STRONG' and regime_pos_mult < 0.5:
+            return True, 'BEAR_STRONG_WEAK_EXIT'
+        
+        # 5. Signal degradation (for weak bull/neutral)
+        if regime in ['NEUTRAL_BEARISH', 'BEAR_WEAK']:
+            if score_long < self.gate_alpha * 0.5:  # Signal very weak
+                return True, f'{regime}_REDUCE'
+        
+        return False, ''
+    
+    
+    def _get_exit_parameters(
+        self,
+        position: Dict,
+        regime: str,
+        sector: Optional[str]
+    ) -> Tuple[float, float, int]:
+        """
+        Get effective TP/SL/min_hold parameters
+        
+        Args:
+            position: Position dict
+            regime: Current regime
+            sector: Sector name
+        
+        Returns:
+            (tp_mult, sl_mult, min_hold_days)
+        """
+        # Start with regime defaults
+        regime_strategy = self.regime_strategies.get(regime, {})
+        tp_mult = regime_strategy.get('tp_multiplier', 2.0)
+        sl_mult = regime_strategy.get('stop_multiplier', 1.0)
+        min_hold = regime_strategy.get('min_hold_days', 14)
+        
+        # Override with sector-specific if available
+        if sector:
+            sector_params = self.sector_strategies.get(
+                sector,
+                self.sector_strategies.get('Default', {})
+            )
             
-            positions_with_pl.sort(key=lambda x: x['pl_pct'])
-            exit_count = max(1, int(len(positions_with_pl) * 0.3))
+            # Use sector TP if specified
+            sector_tp = position.get('sector_tp_mult')
+            if sector_tp is not None:
+                tp_mult = sector_tp
+            elif 'tp_multiplier' in sector_params:
+                tp_mult = sector_params['tp_multiplier']
             
-            for i in range(exit_count):
-                sell_decisions.append({
-                    'ticker': positions_with_pl[i]['position']['ticker'],
-                    'reason': 'BEAR_STRONG_WEAK_EXIT',
-                    'date': target_date
-                })
+            # Use sector SL if specified
+            sector_sl = position.get('sector_sl_mult')
+            if sector_sl is not None:
+                sl_mult = sector_sl
+            elif 'sl_multiplier' in sector_params:
+                sl_mult = sector_params['sl_multiplier']
             
-            for i in range(exit_count, len(positions_with_pl)):
-                hold_decisions.append(positions_with_pl[i]['position'])
+            # Use sector min_hold if specified
+            sector_min_hold = position.get('sector_min_hold')
+            if sector_min_hold is not None:
+                min_hold = sector_min_hold
+            elif 'min_hold_days' in sector_params:
+                min_hold = sector_params['min_hold_days']
         
-        # BEAR_WEAK / NEUTRAL_BEARISH: Reduce if over max (respect min_hold_days)
-        elif regime in ['BEAR_WEAK', 'NEUTRAL_BEARISH']:
-            if len(current_positions) > max_positions:
-                # Check hold time before selling
-                positions_with_age = []
-                for pos in current_positions:
-                    entry_date = pos.get('entry_date', target_date)
-                    days_held = (target_date - entry_date).days if isinstance(entry_date, date) else 0
-                    positions_with_age.append({
-                        'position': pos,
-                        'days_held': days_held,
-                        'can_sell': days_held >= min_hold_days
-                    })
-                
-                # Sort by age (oldest first) and only sell those that meet min_hold_days
-                positions_with_age.sort(key=lambda x: x['days_held'], reverse=True)
-                
-                exit_count = len(current_positions) - max_positions
-                sold = 0
-                
-                for item in positions_with_age:
-                    if sold >= exit_count:
-                        hold_decisions.append(item['position'])
-                    elif item['can_sell']:
-                        sell_decisions.append({
-                            'ticker': item['position']['ticker'],
-                            'reason': f'{regime}_REDUCE',
-                            'date': target_date
-                        })
-                        sold += 1
-                    else:
-                        # Can't sell yet (min hold not reached)
-                        hold_decisions.append(item['position'])
-            else:
-                hold_decisions = current_positions.copy()
-        else:
-            hold_decisions = current_positions.copy()
+        return tp_mult, sl_mult, min_hold
+    
+    
+    def get_regime_strategy(self, regime: str) -> Dict:
+        """
+        Get strategy for given regime
         
-        # BUY DECISIONS
-        buy_decisions = []
+        Args:
+            regime: Regime name
         
-        positions_after_sells = len(current_positions) - len(sell_decisions)
-        available_slots = max_positions - positions_after_sells
-        
-        if available_slots > 0 and cash >= position_size and position_size_mult > 0:
-            sell_tickers = [s['ticker'] for s in sell_decisions]
-            
-            available_candidates = candidates_df[
-                ~candidates_df['ticker'].isin(current_tickers) &
-                ~candidates_df['ticker'].isin(sell_tickers)
-            ].copy()
-            
-            if not available_candidates.empty:
-                top_candidates = available_candidates.nlargest(available_slots, 'score_long')
-                
-                for _, row in top_candidates.iterrows():
-                    if cash < position_size:
-                        break
-                    
-                    entry_price = row['entry_price']
-                    if entry_price <= 0:
-                        continue
-                    
-                    shares = int(position_size / entry_price)
-                    if shares <= 0:
-                        continue
-                    
-                    actual_cost = shares * entry_price
-                    if actual_cost > cash:
-                        shares = int(cash / entry_price)
-                        actual_cost = shares * entry_price
-                        if shares <= 0:
-                            continue
-                    
-                    buy_decisions.append({
-                        'ticker': row['ticker'],
-                        'entry': entry_price,
-                        'shares': shares,
-                        'stop_loss': row['stop_loss'],
-                        'take_profit': row['take_profit'],
-                        'atr': row.get('atr_14', 0.0),
-                        'score_long': row['score_long'],
-                        'reason': 'NEW_CANDIDATE',
-                        'date': target_date,
-                        'cost': actual_cost,
-                        'entry_date': target_date
-                    })
-                    
-                    cash -= actual_cost
-        
-        return {
-            'buy': buy_decisions,
-            'sell': sell_decisions,
-            'hold': hold_decisions
-        }
+        Returns:
+            Strategy dict
+        """
+        strategy = self.regime_strategies.get(regime, {}).copy()
+        strategy['name'] = regime
+        return strategy

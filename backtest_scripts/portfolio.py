@@ -1,287 +1,446 @@
 # backtest_scripts/portfolio.py
 """
-Portfolio Management for Backtesting
-Tracks positions, executes trades, handles SL/TP
+Portfolio Management with Dynamic Position Sizing
+Handles position tracking, entry/exit, and P/L calculation
 
-UPDATED: 2025-11-11 19:33 UTC - Added sector tracking and enhanced position management
+UPDATED: 2025-11-12 15:19 UTC
+CHANGES:
+  - Dynamic position sizing based on portfolio value
+  - Sector-specific position limits
+  - Adaptive position sizing (drawdown/Sharpe/volatility)
+  - Enhanced position tracking
 """
 
 import pandas as pd
-from typing import Dict, List, Optional
-from datetime import date as date_type
+import numpy as np
+from typing import Dict, Optional, Tuple
+import logging
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
 
 class Portfolio:
     """
-    Portfolio simulator for backtest
-    Tracks cash, positions, equity curve with sector information
+    Portfolio manager with dynamic position sizing
     """
     
-    def __init__(self, initial_cash: float, constituents: Optional[pd.DataFrame] = None):
+    def __init__(
+        self,
+        initial_cash: float,
+        config: dict,
+        sector_mapping: Optional[Dict[str, str]] = None
+    ):
         """
         Initialize portfolio
         
         Args:
-            initial_cash: Starting cash
-            constituents: Optional DataFrame with ticker-to-sector mapping
+            initial_cash: Starting capital
+            config: Configuration dictionary
+            sector_mapping: Dict mapping ticker -> sector
         """
         self.initial_cash = initial_cash
         self.cash = initial_cash
-        self.positions = []
-        self.trades_history = []
+        self.config = config
+        self.sector_mapping = sector_mapping or {}
+        
+        # Portfolio state
+        self.positions = {}  # symbol -> position dict
         self.equity_curve = []
+        self.trades_history = []
         
-        # NEW: Sector mapping
-        self.constituents = constituents
-        self.ticker_to_sector = {}
+        # Performance tracking
+        self.total_value = initial_cash
+        self.peak_value = initial_cash
+        self.current_drawdown = 0.0
         
-        if constituents is not None:
-            # Build ticker → sector mapping
-            ticker_col = None
-            for col in ['ticker', 'Ticker', 'Symbol']:
-                if col in constituents.columns:
-                    ticker_col = col
-                    break
-            
-            sector_col = None
-            for col in ['Sector', 'GICS Sector', 'sector', 'gics_sector']:
-                if col in constituents.columns:
-                    sector_col = col
-                    break
-            
-            if ticker_col and sector_col:
-                self.ticker_to_sector = dict(zip(
-                    constituents[ticker_col].astype(str).str.upper(),
-                    constituents[sector_col]
-                ))
-                print(f"[Portfolio] Loaded sector mapping for {len(self.ticker_to_sector)} tickers")
+        # Rolling metrics for adaptive sizing
+        self.recent_returns = []  # Last 60 days
+        self.rolling_sharpe = 0.0
+        self.rolling_volatility = 0.0
         
-        print(f"[Portfolio] Initialized with ${initial_cash:,.2f}")
+        # Position sizing config
+        self.position_method = config.get('POSITION_SIZE_METHOD', 'percentage')
+        self.position_pct = config.get('POSITION_SIZE_PCT', 0.05)
+        self.position_fixed = config.get('POSITION_SIZE_FIXED', 5000.0)
+        self.min_position = config.get('MIN_POSITION_SIZE', 1000.0)
+        self.max_position = config.get('MAX_POSITION_SIZE', 50000.0)
+        self.max_position_pct = config.get('MAX_POSITION_PCT', 0.10)
+        
+        # Adaptive sizing config
+        self.adaptive_config = config.get('ADAPTIVE_POSITION_SIZING', {})
+        
+        # Sector limits
+        self.sector_max = config.get('SECTOR_MAX_POSITIONS', {})
+        self.sector_strategies = config.get('SECTOR_STRATEGIES', {})
+        
+        # Slippage
+        self.slippage = config.get('SLIPPAGE_PCT', 0.001)
+        
+        logger.info(f"[Portfolio] Initialized with ${initial_cash:,.2f}")
+        if self.position_method == 'percentage':
+            logger.info(f"[Portfolio] Using DYNAMIC position sizing: {self.position_pct*100:.1f}% per position")
+        else:
+            logger.info(f"[Portfolio] Using FIXED position sizing: ${self.position_fixed:,.2f} per position")
+        
+        if sector_mapping:
+            logger.info(f"[Portfolio] Loaded sector mapping for {len(sector_mapping)} tickers")
     
-    def get_sector(self, ticker: str) -> str:
-        """Get sector for ticker"""
-        return self.ticker_to_sector.get(ticker.upper(), 'Unknown')
     
-    def get_sector_exposure(self) -> Dict[str, int]:
-        """Get current number of positions per sector"""
-        sector_counts = {}
-        for pos in self.positions:
-            sector = pos.get('sector', 'Unknown')
-            sector_counts[sector] = sector_counts.get(sector, 0) + 1
-        return sector_counts
-    
-    def buy(self, ticker: str, date: date_type, entry_price: float, shares: int,
-            stop_loss: float, take_profit: float, reason: str = "BUY"):
+    def calculate_position_size(
+        self,
+        symbol: str,
+        regime_multiplier: float = 1.0,
+        sector: Optional[str] = None
+    ) -> float:
         """
-        Buy a position
+        Calculate dynamic position size
         
         Args:
-            ticker: Stock ticker
-            date: Entry date
-            entry_price: Entry price
-            shares: Number of shares
-            stop_loss: Stop loss level
-            take_profit: Take profit level
-            reason: Reason for entry
+            symbol: Stock ticker
+            regime_multiplier: Multiplier from regime strategy
+            sector: Sector name (optional)
+        
+        Returns:
+            Position size in dollars
         """
-        cost = shares * entry_price
+        # Base position size
+        if self.position_method == 'percentage':
+            base_size = self.total_value * self.position_pct
+        else:
+            base_size = self.position_fixed
         
-        if cost > self.cash:
-            return  # Not enough cash
+        # Apply regime multiplier
+        position_size = base_size * regime_multiplier
         
-        self.cash -= cost
+        # Apply sector-specific boost
+        if sector and sector in self.sector_strategies:
+            sector_boost = self.sector_strategies[sector].get('position_size_boost', 1.0)
+            position_size *= sector_boost
         
-        # NEW: Get sector
-        sector = self.get_sector(ticker)
+        # Apply adaptive adjustments
+        if self.adaptive_config.get('enabled', False):
+            position_size = self._apply_adaptive_sizing(position_size)
         
-        self.positions.append({
-            'ticker': ticker,
+        # Enforce limits
+        position_size = max(self.min_position, position_size)
+        position_size = min(self.max_position, position_size)
+        position_size = min(self.total_value * self.max_position_pct, position_size)
+        
+        return position_size
+    
+    
+    def _apply_adaptive_sizing(self, position_size: float) -> float:
+        """
+        Apply adaptive position sizing adjustments
+        
+        Args:
+            position_size: Base position size
+        
+        Returns:
+            Adjusted position size
+        """
+        multiplier = 1.0
+        
+        # 1. Drawdown reduction
+        dd_config = self.adaptive_config.get('drawdown_reduction', {})
+        if dd_config.get('enabled', False):
+            for dd_threshold, dd_mult in sorted(dd_config.get('thresholds', {}).items()):
+                if abs(self.current_drawdown) >= dd_threshold:
+                    multiplier = min(multiplier, dd_mult)
+        
+        # 2. Sharpe boost
+        sharpe_config = self.adaptive_config.get('sharpe_boost', {})
+        if sharpe_config.get('enabled', False) and self.rolling_sharpe > 0:
+            for sharpe_threshold, sharpe_mult in sorted(sharpe_config.get('thresholds', {}).items(), reverse=True):
+                if self.rolling_sharpe >= sharpe_threshold:
+                    multiplier = max(multiplier, sharpe_mult)
+                    break
+        
+        # 3. Volatility reduction
+        vol_config = self.adaptive_config.get('volatility_reduction', {})
+        if vol_config.get('enabled', False):
+            vol_threshold = vol_config.get('threshold', 0.04)
+            if self.rolling_volatility > vol_threshold:
+                multiplier *= vol_config.get('multiplier', 0.8)
+        
+        return position_size * multiplier
+    
+    
+    def can_open_position(self, sector: Optional[str] = None) -> bool:
+        """
+        Check if we can open a new position
+        
+        Args:
+            sector: Sector name (for sector limits)
+        
+        Returns:
+            True if position can be opened
+        """
+        # Check total position limit
+        max_pos = self.config.get('MAX_POSITIONS', 20)
+        if len(self.positions) >= max_pos:
+            return False
+        
+        # Check sector-specific limit
+        if sector and self.config.get('ENABLE_SECTOR_DIVERSIFICATION', False):
+            sector_max = self.sector_max.get(sector, self.sector_max.get('Default', 4))
+            current_sector_count = sum(
+                1 for pos in self.positions.values() 
+                if pos.get('sector') == sector
+            )
+            if current_sector_count >= sector_max:
+                return False
+        
+        return True
+    
+    
+    def open_position(
+        self,
+        symbol: str,
+        date: pd.Timestamp,
+        price: float,
+        regime_strategy: dict,
+        sector: Optional[str] = None,
+        entry_reason: str = "NEW_CANDIDATE"
+    ) -> bool:
+        """
+        Open a new position with dynamic sizing
+        
+        Args:
+            symbol: Stock ticker
+            date: Entry date
+            price: Entry price
+            regime_strategy: Current regime strategy dict
+            sector: Sector name
+            entry_reason: Reason for entry
+        
+        Returns:
+            True if position opened successfully
+        """
+        if not self.can_open_position(sector):
+            return False
+        
+        if symbol in self.positions:
+            logger.warning(f"Position for {symbol} already exists")
+            return False
+        
+        # Calculate position size
+        regime_mult = regime_strategy.get('position_size_multiplier', 1.0)
+        target_value = self.calculate_position_size(symbol, regime_mult, sector)
+        
+        # Apply slippage to entry price
+        entry_price = price * (1 + self.slippage)
+        
+        # Calculate shares
+        shares = int(target_value / entry_price)
+        
+        if shares == 0:
+            logger.warning(f"Cannot open position for {symbol}: insufficient capital")
+            return False
+        
+        # Actual cost
+        actual_cost = shares * entry_price
+        
+        if actual_cost > self.cash:
+            logger.warning(f"Cannot open position for {symbol}: insufficient cash")
+            return False
+        
+        # Deduct cash
+        self.cash -= actual_cost
+        
+        # Get sector-specific parameters
+        sector_params = self.sector_strategies.get(sector, self.sector_strategies.get('Default', {}))
+        
+        # Store position
+        self.positions[symbol] = {
+            'symbol': symbol,
+            'sector': sector,
             'entry_date': date,
             'entry_price': entry_price,
             'shares': shares,
-            'stop_loss': stop_loss,
-            'take_profit': take_profit,
-            'current_price': entry_price,
-            'reason': reason,
-            'sector': sector,  # NEW
-        })
+            'cost_basis': actual_cost,
+            'entry_reason': entry_reason,
+            'regime': regime_strategy.get('name', 'UNKNOWN'),
+            'stop_multiplier': regime_strategy.get('stop_multiplier', 1.0),
+            'tp_multiplier': regime_strategy.get('tp_multiplier', 2.0),
+            'min_hold_days': regime_strategy.get('min_hold_days', 14),
+            # Sector-specific overrides
+            'sector_tp_mult': sector_params.get('tp_multiplier'),
+            'sector_sl_mult': sector_params.get('sl_multiplier'),
+            'sector_min_hold': sector_params.get('min_hold_days'),
+        }
         
-        # DEBUG: Log sector info
-        # print(f"[Portfolio] Opened {ticker} ({sector}) | {shares} shares @ ${entry_price:.2f}")
+        logger.debug(
+            f"[Portfolio] OPEN {symbol} @ ${entry_price:.2f} "
+            f"x {shares} shares = ${actual_cost:.2f} "
+            f"({sector or 'N/A'}) [{entry_reason}]"
+        )
+        
+        return True
     
-    def sell(self, ticker: str, date: date_type, exit_price: float, reason: str = "SELL"):
+    
+    def close_position(
+        self,
+        symbol: str,
+        date: pd.Timestamp,
+        price: float,
+        reason: str = "SIGNAL_EXIT"
+    ) -> Optional[Dict]:
         """
-        Sell a position
+        Close an existing position
         
         Args:
-            ticker: Stock ticker
+            symbol: Stock ticker
             date: Exit date
-            exit_price: Exit price
-            reason: Reason for exit
-        """
-        # Find position
-        position = None
-        for i, pos in enumerate(self.positions):
-            if pos['ticker'] == ticker:
-                position = self.positions.pop(i)
-                break
+            price: Exit price
+            reason: Exit reason
         
-        if position is None:
-            return  # Position not found
+        Returns:
+            Trade result dict or None
+        """
+        if symbol not in self.positions:
+            logger.warning(f"Cannot close {symbol}: position not found")
+            return None
+        
+        pos = self.positions[symbol]
+        
+        # Apply slippage to exit price
+        exit_price = price * (1 - self.slippage)
         
         # Calculate P/L
-        proceeds = position['shares'] * exit_price
-        cost = position['shares'] * position['entry_price']
+        proceeds = pos['shares'] * exit_price
+        cost = pos['cost_basis']
         pl = proceeds - cost
-        pl_pct = (pl / cost) * 100 if cost > 0 else 0.0
+        pl_pct = (pl / cost) * 100 if cost > 0 else 0
         
+        # Add to cash
         self.cash += proceeds
         
         # Calculate hold time
-        hold_days = (date - position['entry_date']).days if isinstance(position['entry_date'], date_type) else 0
+        hold_days = (date - pos['entry_date']).days
         
-        # Record trade with sector info
-        self.trades_history.append({
-            'ticker': ticker,
-            'sector': position.get('sector', 'Unknown'),  # NEW
-            'entry_date': position['entry_date'],
+        # Record trade
+        trade = {
+            'ticker': symbol,
+            'sector': pos['sector'],
+            'entry_date': pos['entry_date'],
             'exit_date': date,
-            'entry_price': position['entry_price'],
+            'entry_price': pos['entry_price'],
             'exit_price': exit_price,
-            'shares': position['shares'],
+            'shares': pos['shares'],
             'pl': pl,
             'pl_pct': pl_pct,
             'hold_days': hold_days,
             'reason': reason,
-            'entry_reason': position.get('reason', 'UNKNOWN'),
-            'action': 'SELL',  # For compatibility with visualizer
-            'date': date,  # For compatibility with visualizer
-        })
-    
-    def check_exits(self, current_date: date_type, intraday_prices: Dict[str, Dict[str, float]], 
-                    regime: str = 'NEUTRAL_BULLISH', min_hold_days: int = 0) -> List[Dict]:
-        """
-        Check for SL/TP triggers
+            'entry_reason': pos['entry_reason'],
+            'action': 'SELL',
+            'date': date,
+        }
         
-        Args:
-            current_date: Current date
-            intraday_prices: Dict mapping ticker → {'high': float, 'low': float}
-            regime: Current regime
-            min_hold_days: Minimum hold days from regime strategy
+        self.trades_history.append(trade)
         
-        Returns:
-            List of exits triggered
-        """
-        exits = []
+        # Remove position
+        del self.positions[symbol]
         
-        for pos in self.positions[:]:  # Iterate over copy
-            ticker = pos['ticker']
-            
-            if ticker not in intraday_prices:
-                continue
-            
-            high = intraday_prices[ticker]['high']
-            low = intraday_prices[ticker]['low']
-            
-            # Calculate days held
-            entry_date = pos.get('entry_date', current_date)
-            days_held = (current_date - entry_date).days if isinstance(entry_date, date_type) else 0
-            
-            # Check Stop Loss (ALWAYS enforced, regardless of min_hold_days)
-            if low <= pos['stop_loss']:
-                self.sell(ticker, current_date, pos['stop_loss'], "STOP_LOSS")
-                exits.append({
-                    'ticker': ticker,
-                    'reason': 'STOP_LOSS',
-                    'price': pos['stop_loss'],
-                    'days_held': days_held
-                })
-                continue
-            
-            # Check Take Profit (ONLY if min_hold_days met)
-            if high >= pos['take_profit']:
-                if days_held >= min_hold_days:
-                    # Min hold days met → execute TP
-                    self.sell(ticker, current_date, pos['take_profit'], "TAKE_PROFIT")
-                    exits.append({
-                        'ticker': ticker,
-                        'reason': 'TAKE_PROFIT',
-                        'price': pos['take_profit'],
-                        'days_held': days_held
-                    })
-                else:
-                    # Min hold days NOT met → skip TP, let it run
-                    pass
-        
-        return exits
-    
-    def update_prices(self, current_date: date_type, eod_prices: Dict[str, float]):
-        """
-        Update current prices for all positions (end of day)
-        
-        Args:
-            current_date: Current date
-            eod_prices: Dict mapping ticker → close price
-        """
-        for pos in self.positions:
-            ticker = pos['ticker']
-            if ticker in eod_prices:
-                pos['current_price'] = eod_prices[ticker]
-    
-    def record_daily_value(self, current_date: date_type):
-        """
-        Record daily portfolio value
-        
-        Args:
-            current_date: Current date
-        """
-        # Calculate position values
-        position_value = sum(
-            pos['shares'] * pos['current_price']
-            for pos in self.positions
+        logger.debug(
+            f"[Portfolio] CLOSE {symbol} @ ${exit_price:.2f} "
+            f"P/L: ${pl:.2f} ({pl_pct:+.2f}%) "
+            f"[{reason}]"
         )
         
-        total_value = self.cash + position_value
+        return trade
+    
+    
+    def update_market_value(self, date: pd.Timestamp, prices: Dict[str, float]):
+        """
+        Update portfolio value with current prices
         
-        # NEW: Track sector exposure in daily record
-        sector_exposure = self.get_sector_exposure()
+        Args:
+            date: Current date
+            prices: Dict of symbol -> price
+        """
+        # Calculate position values
+        position_value = 0.0
+        for symbol, pos in self.positions.items():
+            if symbol in prices:
+                position_value += pos['shares'] * prices[symbol]
         
+        # Total value
+        self.total_value = self.cash + position_value
+        
+        # Update drawdown
+        if self.total_value > self.peak_value:
+            self.peak_value = self.total_value
+            self.current_drawdown = 0.0
+        else:
+            self.current_drawdown = (self.total_value - self.peak_value) / self.peak_value
+        
+        # Update rolling metrics
+        self._update_rolling_metrics()
+        
+        # Record equity curve
         self.equity_curve.append({
-            'date': current_date,
+            'date': date,
             'cash': self.cash,
             'position_value': position_value,
-            'total_value': total_value,
+            'total_value': self.total_value,
             'num_positions': len(self.positions),
-            'sector_exposure': sector_exposure.copy(),  # NEW
+            'drawdown': self.current_drawdown,
         })
     
-    def get_state(self) -> Dict:
+    
+    def _update_rolling_metrics(self):
         """
-        Get current portfolio state
+        Update rolling performance metrics for adaptive sizing
+        """
+        if len(self.equity_curve) < 2:
+            return
         
-        Returns:
-            Dict with portfolio state
-        """
-        return {
-            'cash': self.cash,
-            'positions': self.positions.copy(),
-            'num_positions': len(self.positions),
-            'sector_exposure': self.get_sector_exposure(),  # NEW
-        }
+        # Calculate daily return
+        prev_value = self.equity_curve[-2]['total_value']
+        curr_value = self.total_value
+        daily_return = (curr_value - prev_value) / prev_value if prev_value > 0 else 0
+        
+        # Store recent returns (60-day window)
+        self.recent_returns.append(daily_return)
+        if len(self.recent_returns) > 60:
+            self.recent_returns.pop(0)
+        
+        # Calculate rolling Sharpe (if enough data)
+        if len(self.recent_returns) >= 30:
+            returns = np.array(self.recent_returns)
+            self.rolling_volatility = np.std(returns) * np.sqrt(252)
+            
+            if self.rolling_volatility > 0:
+                mean_return = np.mean(returns) * 252
+                self.rolling_sharpe = mean_return / self.rolling_volatility
+            else:
+                self.rolling_sharpe = 0.0
+    
     
     def get_equity_curve(self) -> pd.DataFrame:
-        """
-        Get equity curve as DataFrame
-        
-        Returns:
-            DataFrame with equity curve
-        """
+        """Get equity curve as DataFrame"""
         return pd.DataFrame(self.equity_curve)
     
+    
     def get_trades_history(self) -> pd.DataFrame:
-        """
-        Get trades history as DataFrame
-        
-        Returns:
-            DataFrame with all trades
-        """
+        """Get trades history as DataFrame"""
         return pd.DataFrame(self.trades_history)
+    
+    
+    def get_current_positions(self) -> Dict:
+        """Get current positions"""
+        return self.positions.copy()
+    
+    
+    def get_summary(self) -> Dict:
+        """Get portfolio summary"""
+        return {
+            'total_value': self.total_value,
+            'cash': self.cash,
+            'num_positions': len(self.positions),
+            'current_drawdown': self.current_drawdown,
+            'rolling_sharpe': self.rolling_sharpe,
+            'rolling_volatility': self.rolling_volatility,
+        }

@@ -1,510 +1,738 @@
 ﻿# backtest_scripts/backtest_engine.py
 """
-Backtest Engine - Main Orchestrator
-Coordinates all backtest components
+Enhanced Backtest Engine with Dynamic Position Sizing
+Main orchestrator for 10-year backtest analysis
 
-UPDATED: 2025-11-11 19:36 UTC - Enhanced 10-year analysis with sector diversification
+UPDATED: 2025-11-12 15:46 UTC
+FIXES:
+  - Fixed RegimeCalculator initialization with macro_prices
+  - All data_loader compatibility issues fixed
+  - Complete working version
 """
 
-import os
-import json
 import pandas as pd
 import numpy as np
+from datetime import datetime, date
 from typing import Dict, List, Optional
-from datetime import date, timedelta, datetime
+import logging
 from tqdm import tqdm
+import os
 
 from .config import *
 from .data_loader import BacktestDataLoader
+from .portfolio import Portfolio
 from .regime_calculator import RegimeCalculator
 from .seasonality_calculator import SeasonalityCalculator
 from .ml_signal_generator import MLSignalGenerator
 from .auto_decider_simulator import AutoDeciderSimulator
-from .portfolio import Portfolio
 from .performance_analyzer import PerformanceAnalyzer
 from .visualizer import BacktestVisualizer
 
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
+
+
 class BacktestEngine:
     """
-    Main backtest orchestrator
-    Runs full backtest simulation with sector diversification
+    Enhanced backtest engine with dynamic position sizing
     """
     
-    def __init__(self, 
-                 config_overrides: Optional[Dict] = None,
-                 constituents_path: Optional[str] = None):
+    def __init__(
+        self,
+        config_overrides: Optional[Dict] = None,
+        constituents_path: Optional[str] = None
+    ):
         """
         Initialize backtest engine
         
         Args:
-            config_overrides: Optional dict to override config.py settings
-            constituents_path: Path to constituents.csv with sector data
+            config_overrides: Optional config overrides
+            constituents_path: Path to constituents CSV
         """
-        self.config = self._load_config(config_overrides)
+        # Merge config
+        self.config = self._build_config(config_overrides)
         
-        print("=" * 80)
-        print("BACKTEST ENGINE - Enhanced 10-Year Analysis with Sector Diversification")
-        print("=" * 80)
-        print(f"Period: {self.config['start_date']} to {self.config['end_date']}")
-        print(f"Initial Capital: ${self.config['initial_cash']:,.2f}")
-        print(f"Max Positions: {self.config['max_positions']}")
-        print(f"Position Size: ${self.config['position_size']:,.2f}")
-        print("=" * 80)
-        print("")
+        # Extract key config
+        self.start_date = self.config.get('start_date', BACKTEST_START)
+        self.end_date = self.config.get('end_date', BACKTEST_END)
+        self.initial_cash = self.config.get('initial_cash', INITIAL_CASH)
         
-        # Load constituents if provided
-        self.constituents = None
-        if constituents_path:
-            try:
-                self.constituents = pd.read_csv(constituents_path)
-                print(f"[Engine] ✓ Loaded constituents: {len(self.constituents)} tickers")
-                
-                # Check for sector column
-                sector_col = None
-                for col in ['Sector', 'GICS Sector', 'sector', 'gics_sector']:
-                    if col in self.constituents.columns:
-                        sector_col = col
-                        break
-                
-                if sector_col:
-                    print(f"[Engine] ✓ Sector data available: {self.constituents[sector_col].nunique()} unique sectors")
-                    if ENABLE_SECTOR_DIVERSIFICATION:
-                        print(f"[Engine] ✓ Sector diversification enabled (max {MAX_POSITIONS_PER_SECTOR} per sector)")
-                else:
-                    print(f"[Engine] ⚠ No sector column found in constituents")
-            except Exception as e:
-                print(f"[Engine] ⚠ Could not load constituents: {e}")
+        # Constituents
+        self.constituents_path = constituents_path or UNIVERSE_CSV
         
-        # Initialize components
-        self._init_components()
+        # Print header
+        self._print_header()
+        
+        # Components (initialized in setup)
+        self.data_loader = None
+        self.portfolio = None
+        self.regime_calc = None
+        self.seasonality_calc = None
+        self.ml_generator = None
+        self.auto_decider = None
+        self.analyzer = None
+        self.visualizer = None
+        
+        # Universe storage
+        self.universe_tickers = []
+        self.universe_df = None
+        
+        # Preloaded data
+        self.stock_prices_cache = {}
+        self.macro_prices_cache = {}
+        
+        # Results
+        self.results = None
     
-    def _load_config(self, overrides: Optional[Dict]) -> Dict:
-        """Load configuration"""
-        cfg = {
+    
+    def _build_config(self, overrides: Optional[Dict]) -> Dict:
+        """Build configuration from globals + overrides"""
+        config = {
             'start_date': BACKTEST_START,
             'end_date': BACKTEST_END,
             'initial_cash': INITIAL_CASH,
-            'max_positions': MAX_POSITIONS,
-            'position_size': POSITION_SIZE,
-            'gate_alpha': GATE_ALPHA,
-            'universe_csv': UNIVERSE_CSV,
-            'stock_price_cache': STOCK_PRICE_CACHE,
-            'macro_price_cache': MACRO_PRICE_CACHE,
-            'vintage_dir': VINTAGE_DIR,
-            'output_dir': OUTPUT_DIR,
-            'regime_strategies': REGIME_STRATEGIES,
-            'entry_method': ENTRY_METHOD,
-            'slippage_pct': SLIPPAGE_PCT,
-            'benchmarks': BENCHMARKS,
-            'enable_sector_diversification': ENABLE_SECTOR_DIVERSIFICATION,
-            'max_positions_per_sector': MAX_POSITIONS_PER_SECTOR,
+            'POSITION_SIZE_METHOD': POSITION_SIZE_METHOD,
+            'POSITION_SIZE_PCT': POSITION_SIZE_PCT,
+            'POSITION_SIZE_FIXED': POSITION_SIZE_FIXED,
+            'MIN_POSITION_SIZE': MIN_POSITION_SIZE,
+            'MAX_POSITION_SIZE': MAX_POSITION_SIZE,
+            'MAX_POSITION_PCT': MAX_POSITION_PCT,
+            'MAX_POSITIONS': MAX_POSITIONS,
+            'GATE_ALPHA': GATE_ALPHA,
+            'REGIME_STRATEGIES': REGIME_STRATEGIES,
+            'SECTOR_STRATEGIES': SECTOR_STRATEGIES,
+            'SECTOR_MAX_POSITIONS': SECTOR_MAX_POSITIONS,
+            'ADAPTIVE_POSITION_SIZING': ADAPTIVE_POSITION_SIZING,
+            'ENABLE_SECTOR_DIVERSIFICATION': ENABLE_SECTOR_DIVERSIFICATION,
+            'USE_STOP_LOSS': USE_STOP_LOSS,
+            'USE_TAKE_PROFIT': USE_TAKE_PROFIT,
+            'SLIPPAGE_PCT': SLIPPAGE_PCT,
+            'save_plots': SAVE_PLOTS,
         }
         
         if overrides:
-            cfg.update(overrides)
+            config.update(overrides)
         
-        return cfg
+        return config
     
-    def _init_components(self):
-        """Initialize all backtest components"""
-        print("[1/7] Initializing data loader...")
+    
+    def _print_header(self):
+        """Print backtest header"""
+        print("\n" + "="*80)
+        print(f"BACKTEST ENGINE - Version {CONFIG_VERSION}")
+        print(f"Enhanced with Dynamic Position Sizing & Sector Optimization")
+        print("="*80)
+        print(f"Period: {self.start_date} to {self.end_date}")
+        print(f"Initial Capital: ${self.initial_cash:,.2f}")
+        print(f"Max Positions: {self.config['MAX_POSITIONS']}")
+        
+        if self.config['POSITION_SIZE_METHOD'] == 'percentage':
+            print(f"Position Sizing: DYNAMIC {self.config['POSITION_SIZE_PCT']*100:.1f}% of portfolio")
+        else:
+            print(f"Position Sizing: FIXED ${self.config['POSITION_SIZE_FIXED']:,.2f}")
+        
+        print(f"Gate Alpha: {self.config['GATE_ALPHA']:.2f}")
+        
+        if self.config.get('ADAPTIVE_POSITION_SIZING', {}).get('enabled'):
+            print(f"Adaptive Sizing: ENABLED")
+        
+        print("="*80 + "\n")
+    
+    
+    def setup(self):
+        """Initialize all components"""
+        logger.info("[Engine] Initializing components...")
+        
+        # 1. Data Loader
+        logger.info("[1/7] Initializing data loader...")
         self.data_loader = BacktestDataLoader(
-            stock_price_cache=self.config['stock_price_cache'],
-            macro_price_cache=self.config['macro_price_cache'],
-            vintage_dir=self.config['vintage_dir']
+            stock_price_cache=STOCK_PRICE_CACHE,
+            macro_price_cache=MACRO_PRICE_CACHE,
+            vintage_dir=VINTAGE_DIR
         )
         
-        print("[2/7] Loading universe...")
-        self.universe = self.data_loader.load_universe(self.config['universe_csv'])
+        # 2. Load universe
+        logger.info("[2/7] Loading universe...")
+        self.universe_tickers = self.data_loader.load_universe(self.constituents_path)
         
-        print("[3/7] Preloading stock prices...")
-        # Load stock prices with 1 year lookback for momentum calculation
-        lookback_start = self.config['start_date'] - timedelta(days=365)
-        self.stock_prices = self.data_loader.preload_all_stock_prices(
-            self.universe, 
-            lookback_start,
-            self.config['end_date']
+        # Load universe DF for sector mapping
+        import pandas as pd
+        self.universe_df = pd.read_csv(self.constituents_path)
+        
+        # Extract sector mapping
+        sector_mapping = {}
+        if 'Sector' in self.universe_df.columns:
+            ticker_col = None
+            for col in ['Ticker', 'Symbol', 'ticker', 'symbol']:
+                if col in self.universe_df.columns:
+                    ticker_col = col
+                    break
+            
+            if ticker_col:
+                sector_mapping = dict(zip(
+                    self.universe_df[ticker_col],
+                    self.universe_df['Sector']
+                ))
+                logger.info(f"[Engine] ✓ Loaded sector mapping for {len(sector_mapping)} tickers")
+        
+        # 3. Preload stock data
+        logger.info("[3/7] Preloading stock prices...")
+        self.stock_prices_cache = self.data_loader.preload_all_stock_prices(
+            self.universe_tickers,
+            self.start_date,
+            self.end_date
         )
         
-        print("[4/7] Preloading macro prices...")
-        # Use ^VIX (Yahoo Finance format)
-        macro_symbols = ['SPY', 'QQQ', 'IWM', 'GLD', 'TLT', 'HYG', 'LQD', '^VIX']
-        self.macro_prices = self.data_loader.preload_all_macro_prices(
+        # 4. Preload macro data
+        logger.info("[4/7] Preloading macro prices...")
+        macro_symbols = ['SPY', 'QQQ', 'TLT', 'GLD', 'VIX', 'HYG', 'LQD', 'DIA']
+        self.macro_prices_cache = self.data_loader.preload_all_macro_prices(
             macro_symbols,
-            self.config['start_date'],
-            self.config['end_date']
+            self.start_date,
+            self.end_date
         )
         
-        print("[5/7] Initializing calculators...")
-        self.regime_calc = RegimeCalculator(self.macro_prices)
-        self.seasonality_calc = SeasonalityCalculator(lookback_years=SEASONALITY_LOOKBACK_YEARS)
+        # 5. Initialize calculators - KORJATTU JÄRJESTYS
+        logger.info("[5/7] Initializing calculators...")
+        
+        # 5a. Regime calculator (needs macro_prices)
+        self.regime_calc = RegimeCalculator(self.macro_prices_cache)
+        
+        # 5b. Seasonality calculator (standalone)
+        self.seasonality_calc = SeasonalityCalculator(
+            lookback_years=SEASONALITY_LOOKBACK_YEARS
+        )
+        
+        # 5c. ML generator (needs seasonality_calc) - KORJATTU
         self.ml_generator = MLSignalGenerator(self.seasonality_calc)
-        self.auto_decider = AutoDeciderSimulator(self.config['regime_strategies'])
         
-        print("[6/7] Initializing portfolio...")
-        # Pass constituents to portfolio for sector tracking
+        # 5d. Auto decider (needs config)
+        self.auto_decider = AutoDeciderSimulator(self.config)
+        
+        # 6. Initialize portfolio
+        logger.info("[6/7] Initializing portfolio...")
         self.portfolio = Portfolio(
-            self.config['initial_cash'],
-            constituents=self.constituents
+            initial_cash=self.initial_cash,
+            config=self.config,
+            sector_mapping=sector_mapping
         )
         
-        print("[7/7] Initializing analyzer...")
-        # Pass constituents to analyzer for sector analysis
-        self.analyzer = PerformanceAnalyzer(constituents=self.constituents)
+        # 7. Initialize analyzer
+        logger.info("[7/7] Initializing analyzer...")
+        self.analyzer = PerformanceAnalyzer()
         
-        self.visualizer = BacktestVisualizer(
-            output_dir=self.config['output_dir'],
-            dpi=PLOT_DPI
-        )
+        # 8. Visualizer (lazy init)
+        output_dir = self.config.get('output_dir', OUTPUT_DIR)
+        plots_dir = os.path.join(output_dir, 'plots')
+        self.visualizer = BacktestVisualizer(plots_dir)
         
-        print("[OK] All components initialized\n")
+        logger.info("[OK] All components initialized\n")
+    
     
     def run(self) -> Dict:
         """
-        Run full backtest
+        Run the backtest
         
         Returns:
-            dict with results
+            Results dictionary
         """
-        print("=" * 80)
-        print("RUNNING BACKTEST")
-        print("=" * 80)
+        logger.info("\n" + "="*80)
+        logger.info("RUNNING BACKTEST")
+        logger.info("="*80)
         
         # Get trading days
         trading_days = self.data_loader.get_trading_days(
-            self.config['start_date'],
-            self.config['end_date']
+            self.start_date,
+            self.end_date
         )
         
-        print(f"Total trading days: {len(trading_days)}")
-        print(f"Expected years: {len(trading_days) / 252:.1f}\n")
+        total_days = len(trading_days)
+        years = (self.end_date - self.start_date).days / 365.25
         
-        # Track regime history
-        regime_history = []
+        logger.info(f"Total trading days: {total_days}")
+        logger.info(f"Expected years: {years:.1f}\n")
         
-        # Run day-by-day simulation
-        for i, current_date in enumerate(tqdm(trading_days, desc="Simulating")):
-            
-            # 1. Calculate regime
-            regime_data = self.regime_calc.calculate_regime(current_date)
-            regime_history.append(regime_data)
-            
-            regime = regime_data['regime']
-            
-            # 2. Get regime strategy (for min_hold_days)
-            regime_strategy = self.config['regime_strategies'].get(
-                regime, 
-                self.config['regime_strategies']['NEUTRAL_BULLISH']
-            )
-            min_hold_days = regime_strategy.get('min_hold_days', 0)
-            
-            # 3. Generate ML signals (candidates)
-            candidates = self.ml_generator.generate_signals(
-                target_date=current_date,
-                stock_prices=self.stock_prices,
-                regime=regime,
-                gate_alpha=self.config['gate_alpha']
-            )
-            
-            # NEW: Apply sector diversification filter if enabled
-            if self.config['enable_sector_diversification'] and not candidates.empty:
-                candidates = self._apply_sector_filter(candidates)
-            
-            # 4. Make trading decisions (auto_decider logic)
-            portfolio_state = self.portfolio.get_state()
-            
-            decisions = self.auto_decider.decide_trades(
-                target_date=current_date,
-                candidates_df=candidates,
-                portfolio_state=portfolio_state,
-                regime=regime,
-                cash=self.portfolio.cash
-            )
-            
-            # 5. Execute SELL orders first (from regime exits)
-            for sell in decisions['sell']:
-                ticker = sell['ticker']
-                # Get exit price (close of current day + slippage)
-                exit_price = self._get_exit_price(ticker, current_date)
-                if exit_price:
-                    self.portfolio.sell(ticker, current_date, exit_price, sell['reason'])
-            
-            # 6. Check SL/TP triggers (intraday)
-            intraday_prices = self._get_intraday_prices(current_date)
-            sl_tp_exits = self.portfolio.check_exits(
-                current_date, 
-                intraday_prices,
-                regime=regime,
-                min_hold_days=min_hold_days
-            )
-            
-            # 7. Execute BUY orders
-            for buy in decisions['buy']:
-                entry_price = self._get_entry_price(buy, current_date)
-                
-                self.portfolio.buy(
-                    ticker=buy['ticker'],
-                    date=current_date,
-                    entry_price=entry_price,
-                    shares=buy['shares'],
-                    stop_loss=buy['stop_loss'],
-                    take_profit=buy['take_profit'],
-                    reason=buy['reason']
-                )
-            
-            # 8. Update position prices (end of day)
-            eod_prices = self._get_eod_prices(current_date)
-            self.portfolio.update_prices(current_date, eod_prices)
-            
-            # 9. Record daily value
-            self.portfolio.record_daily_value(current_date)
+        # Progress bar
+        pbar = tqdm(
+            trading_days,
+            desc="Simulating",
+            unit="day",
+            disable=not SHOW_PROGRESS_BAR
+        )
         
-        print("\n[OK] Simulation complete\n")
+        # Main simulation loop
+        for current_date in pbar:
+            self._simulate_day(current_date)
+        
+        pbar.close()
+        logger.info("\n[OK] Simulation complete\n")
         
         # Analyze results
-        print("Analyzing results...")
-        
-        equity_curve = self.portfolio.get_equity_curve()
-        trades_history = self.portfolio.get_trades_history()
-        regime_df = pd.DataFrame(regime_history)
-        
-        # Load benchmark prices
-        benchmark_prices = {}
-        for bench in self.config['benchmarks']:
-            if bench in self.macro_prices:
-                benchmark_prices[bench] = self.macro_prices[bench]
-        
-        analysis = self.analyzer.analyze(
-            portfolio_equity_curve=equity_curve,
-            trades_history=trades_history,
-            regime_history=regime_df,
-            benchmark_prices=benchmark_prices
-        )
-        
-        print("[OK] Analysis complete\n")
+        logger.info("Analyzing results...")
+        self.results = self._analyze_results()
+        logger.info("[OK] Analysis complete\n")
         
         # Create visualizations
         if self.config.get('save_plots', True):
-            print("Creating visualizations...")
-            
-            # Add timestamp to output folder (HHMMSS format)
-            timestamp = datetime.now().strftime("%H%M%S")
-            output_dir_full = os.path.join(
-                self.config['output_dir'],
-                f"{self.config['start_date'].strftime('%Y-%m-%d')}_{self.config['end_date'].strftime('%Y-%m-%d')}_{timestamp}"
-            )
-            
-            viz = BacktestVisualizer(output_dir_full, dpi=150)
-            viz.create_all_plots(
-                equity_curve=equity_curve,
-                trades_history=trades_history,
-                regime_history=regime_df,
-                benchmark_prices=benchmark_prices,
-                analysis=analysis
-            )
-            print("[OK] Visualizations complete\n")
+            logger.info("Creating visualizations...")
+            self._create_visualizations()
+            logger.info("[OK] Visualizations complete\n")
         
         # Save results
-        self._save_results(equity_curve, trades_history, regime_df, analysis)
+        logger.info("Saving results...")
+        output_path = self._save_results()
+        logger.info(f"[OK] Results saved to: {output_path}\n")
+        
+        # Print summary
+        self._print_summary()
+        
+        return self.results
+    
+    
+    def _simulate_day(self, current_date: pd.Timestamp):
+        """
+        Simulate one trading day
+        
+        Args:
+            current_date: Current date
+        """
+        # Convert to date object if needed
+        if isinstance(current_date, pd.Timestamp):
+            current_date = current_date.date()
+        
+        # Get current prices for all positions
+        current_prices = {}
+        for symbol in list(self.portfolio.positions.keys()):
+            price_data = self.get_stock_price(symbol, current_date)
+            if price_data is not None and 'close' in price_data:
+                current_prices[symbol] = price_data['close']
+        
+        # Update portfolio value
+        self.portfolio.update_market_value(pd.Timestamp(current_date), current_prices)
+        
+        # Calculate regime
+        macro_data = self.get_macro_data(current_date)
+        regime_result = self.regime_calc.calculate_regime(macro_data)
+
+        # Extract regime name (RegimeCalculator palauttaa dict:in)
+        if isinstance(regime_result, dict):
+             regime = regime_result.get('regime', 'NEUTRAL_BULLISH')
+        else:
+             regime = regime_result if regime_result else 'NEUTRAL_BULLISH'
+
+        regime_strategy = self.auto_decider.get_regime_strategy(regime)
+
+
+        
+        # Check exits
+        for symbol in list(self.portfolio.positions.keys()):
+            if symbol not in current_prices:
+                continue
+            
+            position = self.portfolio.positions[symbol]
+            current_price = current_prices[symbol]
+            
+            # Get ATR for stop/TP calculation
+            price_history = self.get_stock_price_history(
+                symbol,
+                current_date,
+                lookback=20
+            )
+            atr = self._calculate_atr(price_history) if price_history is not None else None
+            
+            # Get current score
+            score_data = self._calculate_score(symbol, current_date)
+            score_long = score_data['score_long'] if score_data else 0.0
+            
+            # Check if should exit
+            should_exit, reason = self.auto_decider.should_exit(
+                symbol,
+                position,
+                current_price,
+                pd.Timestamp(current_date),
+                score_long,
+                regime,
+                atr
+            )
+            
+            if should_exit:
+                self.portfolio.close_position(
+                    symbol,
+                    pd.Timestamp(current_date),
+                    current_price,
+                    reason
+                )
+        
+        # Check entries (if we have capacity)
+        for ticker in self.universe_tickers:
+            # Skip if already have position
+            if ticker in self.portfolio.positions:
+                continue
+            
+            # Get sector
+            sector = None
+            if self.universe_df is not None:
+                ticker_rows = self.universe_df[
+                    self.universe_df.apply(
+                        lambda row: str(row.get('Ticker', row.get('Symbol', ''))).upper() == ticker.upper(),
+                        axis=1
+                    )
+                ]
+                if not ticker_rows.empty and 'Sector' in ticker_rows.columns:
+                    sector = ticker_rows.iloc[0]['Sector']
+            
+            # Check if can open position
+            if not self.portfolio.can_open_position(sector):
+                continue
+            
+            # Get price data
+            price_data = self.get_stock_price(ticker, current_date)
+            if price_data is None or 'close' not in price_data:
+                continue
+            
+            current_price = price_data['close']
+            
+            # Calculate score
+            score_data = self._calculate_score(ticker, current_date)
+            if not score_data:
+                continue
+            
+            score_long = score_data['score_long']
+            volatility = score_data.get('volatility', None)
+            
+            # Check if should enter
+            should_enter = self.auto_decider.should_enter(
+                ticker,
+                score_long,
+                regime,
+                sector,
+                volatility
+            )
+            
+            if should_enter:
+                self.portfolio.open_position(
+                    ticker,
+                    pd.Timestamp(current_date),
+                    current_price,
+                    regime_strategy,
+                    sector,
+                    entry_reason="NEW_CANDIDATE"
+                )
+    
+    
+    def get_stock_price(self, symbol: str, date: date) -> Optional[Dict]:
+        """Get stock price for a specific date"""
+        if symbol not in self.stock_prices_cache:
+            return None
+        
+        df = self.stock_prices_cache[symbol]
+        
+        # Find row for this date
+        matching = df[df['date'] == date]
+        
+        if matching.empty:
+            return None
+        
+        row = matching.iloc[0]
+        return {
+            'close': row['close'],
+            'open': row.get('open', row['close']),
+            'high': row.get('high', row['close']),
+            'low': row.get('low', row['close']),
+        }
+    
+    
+    def get_stock_price_history(
+        self,
+        symbol: str,
+        end_date: date,
+        lookback: int = 252
+    ) -> Optional[pd.DataFrame]:
+        """Get stock price history"""
+        if symbol not in self.stock_prices_cache:
+            return None
+        
+        df = self.stock_prices_cache[symbol].copy()
+        
+        # Filter up to end_date
+        df = df[df['date'] <= end_date]
+        
+        # Get last N rows
+        if len(df) > lookback:
+            df = df.iloc[-lookback:]
+        
+        return df if not df.empty else None
+    
+    
+    def get_macro_data(self, date: date) -> Dict:
+        """Get macro data for regime calculation"""
+        macro_data = {}
+        
+        for symbol, df in self.macro_prices_cache.items():
+            matching = df[df['date'] == date]
+            if not matching.empty:
+                macro_data[symbol] = matching.iloc[0]['close']
+        
+        return macro_data
+    
+    
+    def _calculate_score(
+        self,
+        symbol: str,
+        date: date
+    ) -> Optional[Dict]:
+        """Calculate ML/seasonality score for symbol"""
+        try:
+            # Get price history
+            price_history = self.get_stock_price_history(
+                symbol,
+                date,
+                lookback=252  # 1 year
+            )
+            
+            if price_history is None or len(price_history) < 60:
+                return None
+            
+            # Calculate seasonality
+            seasonality_score = self.seasonality_calc.calculate_seasonality(
+                symbol,
+                pd.Timestamp(date),
+                price_history
+            )
+            
+            # Calculate momentum
+            momentum = self.ml_generator.calculate_momentum(price_history)
+            
+            # Calculate volatility
+            returns = price_history['close'].pct_change().dropna()
+            volatility = returns.std() * np.sqrt(252) if len(returns) > 0 else 0.0
+            
+            # Combine scores (simple blend for now)
+            score_long = (seasonality_score * 0.6 + momentum * 0.4)
+            
+            return {
+                'score_long': score_long,
+                'seasonality': seasonality_score,
+                'momentum': momentum,
+                'volatility': volatility,
+            }
+        
+        except Exception as e:
+            logger.debug(f"Error calculating score for {symbol}: {e}")
+            return None
+    
+    
+    def _calculate_atr(self, price_history: pd.DataFrame, period: int = 14) -> Optional[float]:
+        """Calculate Average True Range"""
+        try:
+            if len(price_history) < period + 1:
+                return None
+            
+            high = price_history['high']
+            low = price_history['low']
+            close = price_history['close']
+            
+            tr1 = high - low
+            tr2 = abs(high - close.shift())
+            tr3 = abs(low - close.shift())
+            
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(period).mean().iloc[-1]
+            
+            return atr if not pd.isna(atr) else None
+        
+        except:
+            return None
+    
+    
+    def _analyze_results(self) -> Dict:
+        """Analyze backtest results"""
+        equity_curve = self.portfolio.get_equity_curve()
+        trades_history = self.portfolio.get_trades_history()
+        
+        # Get benchmark data
+        benchmark_data = {}
+        for benchmark in BENCHMARKS:
+            if benchmark in self.macro_prices_cache:
+                benchmark_data[benchmark] = self.macro_prices_cache[benchmark]
+        
+        # Run analysis
+        analysis = self.analyzer.analyze(
+            equity_curve,
+            trades_history,
+            benchmark_data,
+            self.config
+        )
         
         return {
             'equity_curve': equity_curve,
             'trades_history': trades_history,
-            'regime_history': regime_df,
-            'analysis': analysis
+            'analysis': analysis,
+            'config': self.config,
         }
     
-    def _apply_sector_filter(self, candidates: pd.DataFrame) -> pd.DataFrame:
-        """
-        NEW: Apply sector diversification filter to candidates
-        
-        Args:
-            candidates: ML candidates DataFrame
-        
-        Returns:
-            Filtered candidates
-        """
-        if candidates.empty:
-            return candidates
-        
-        # Get current sector exposure
-        sector_exposure = self.portfolio.get_sector_exposure()
-        
-        # Add sector to candidates
-        candidates = candidates.copy()
-        candidates['sector'] = candidates['ticker'].apply(lambda x: self.portfolio.get_sector(x))
-        
-        # Filter out sectors that are at max capacity
-        max_per_sector = self.config['max_positions_per_sector']
-        
-        def can_add_sector(sector):
-            current_count = sector_exposure.get(sector, 0)
-            return current_count < max_per_sector
-        
-        candidates['can_add'] = candidates['sector'].apply(can_add_sector)
-        filtered = candidates[candidates['can_add']].copy()
-        
-        # Drop helper columns
-        filtered = filtered.drop(columns=['sector', 'can_add'])
-        
-        return filtered
     
-    def _get_entry_price(self, buy_decision: Dict, current_date: date) -> float:
-        """
-        Get entry price with gap/slippage
+    def _create_visualizations(self):
+        """Create all visualizations"""
+        if not self.results:
+            return
         
-        Args:
-            buy_decision: Buy decision dict
-            current_date: Current date
+        equity_curve = self.results['equity_curve']
+        trades_history = self.results['trades_history']
+        analysis = self.results['analysis']
         
-        Returns:
-            Adjusted entry price
-        """
-        base_price = buy_decision['entry']
-        
-        if self.config['entry_method'] == 'T_open_with_gap':
-            # Simulate realistic gap: ±1-2% random
-            gap_pct = np.random.uniform(-0.02, 0.02)
-            entry_price = base_price * (1 + gap_pct)
-        elif self.config['entry_method'] == 'T_open':
-            entry_price = base_price
-        else:  # T-1_close
-            entry_price = base_price
-        
-        # Add slippage
-        entry_price *= (1 + self.config['slippage_pct'])
-        
-        return entry_price
-    
-    def _get_exit_price(self, ticker: str, current_date: date) -> Optional[float]:
-        """Get exit price (close + slippage)"""
-        if ticker not in self.stock_prices:
-            return None
-        
-        prices = self.stock_prices[ticker]
-        row = prices[prices['date'] == current_date]
-        
-        if row.empty:
-            return None
-        
-        close = row.iloc[0]['close']
-        
-        # Subtract slippage on exit
-        exit_price = close * (1 - self.config['slippage_pct'])
-        
-        return exit_price
-    
-    def _get_intraday_prices(self, current_date: date) -> Dict[str, Dict[str, float]]:
-        """Get intraday high/low for SL/TP checks"""
-        intraday = {}
-        
-        for pos in self.portfolio.positions:
-            ticker = pos['ticker']
-            
-            if ticker not in self.stock_prices:
-                continue
-            
-            prices = self.stock_prices[ticker]
-            row = prices[prices['date'] == current_date]
-            
-            if row.empty:
-                continue
-            
-            intraday[ticker] = {
-                'high': row.iloc[0]['high'],
-                'low': row.iloc[0]['low']
-            }
-        
-        return intraday
-    
-    def _get_eod_prices(self, current_date: date) -> Dict[str, float]:
-        """Get end-of-day prices for all positions"""
-        eod = {}
-        
-        for pos in self.portfolio.positions:
-            ticker = pos['ticker']
-            
-            if ticker not in self.stock_prices:
-                continue
-            
-            prices = self.stock_prices[ticker]
-            row = prices[prices['date'] == current_date]
-            
-            if not row.empty:
-                eod[ticker] = row.iloc[0]['close']
-        
-        return eod
-    
-    def _save_results(self, equity_curve: pd.DataFrame, 
-                     trades: pd.DataFrame,
-                     regime_history: pd.DataFrame,
-                     analysis: Dict):
-        """Save all results to disk"""
-        print("Saving results...")
-        
-        # Add timestamp to output folder (HHMMSS format)
-        timestamp = datetime.now().strftime("%H%M%S")
-        output_dir = os.path.join(
-            self.config['output_dir'],
-            f"{self.config['start_date'].strftime('%Y-%m-%d')}_{self.config['end_date'].strftime('%Y-%m-%d')}_{timestamp}"
+        self.visualizer.create_all_plots(
+            equity_curve,
+            trades_history,
+            analysis
         )
-        
+    
+    
+    def _save_results(self) -> str:
+        """Save all results to disk"""
+        # Create output directory
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        output_dir = os.path.join(
+            OUTPUT_DIR,
+            f"{self.start_date}_{self.end_date}_{timestamp}"
+        )
         os.makedirs(output_dir, exist_ok=True)
         
-        # Save config
-        config_copy = self.config.copy()
-        config_copy['start_date'] = str(config_copy['start_date'])
-        config_copy['end_date'] = str(config_copy['end_date'])
+        # Save equity curve
+        equity_path = os.path.join(output_dir, 'equity_curve.csv')
+        self.results['equity_curve'].to_csv(equity_path, index=False)
         
-        with open(os.path.join(output_dir, 'config_used.json'), 'w') as f:
-            json.dump(config_copy, f, indent=2)
+        # Save trades
+        trades_path = os.path.join(output_dir, 'trades_history.csv')
+        self.results['trades_history'].to_csv(trades_path, index=False)
         
-        # Save CSVs
-        equity_curve.to_csv(os.path.join(output_dir, 'equity_curve.csv'), index=False)
-        trades.to_csv(os.path.join(output_dir, 'trades_history.csv'), index=False)
-        regime_history.to_csv(os.path.join(output_dir, 'regime_history.csv'), index=False)
+        # Save analysis results
+        analysis = self.results['analysis']
         
-        # Save regime breakdown
-        if 'regime_breakdown' in analysis and not analysis['regime_breakdown'].empty:
-            analysis['regime_breakdown'].to_csv(os.path.join(output_dir, 'regime_breakdown.csv'), index=False)
+        # Yearly breakdown
+        if 'yearly_breakdown' in analysis and analysis['yearly_breakdown']:
+            yearly_path = os.path.join(output_dir, 'yearly_breakdown.csv')
+            pd.DataFrame(analysis['yearly_breakdown']).to_csv(yearly_path, index=False)
         
-        # Save sector breakdown
-        if 'sector_breakdown' in analysis and not analysis['sector_breakdown'].empty:
-            analysis['sector_breakdown'].to_csv(os.path.join(output_dir, 'sector_breakdown.csv'), index=False)
+        # Sector breakdown
+        if 'sector_breakdown' in analysis and analysis['sector_breakdown']:
+            sector_path = os.path.join(output_dir, 'sector_breakdown.csv')
+            pd.DataFrame(analysis['sector_breakdown']).to_csv(sector_path, index=False)
         
-        # NEW: Save yearly breakdown
-        if 'yearly_breakdown' in analysis and not analysis['yearly_breakdown'].empty:
-            analysis['yearly_breakdown'].to_csv(os.path.join(output_dir, 'yearly_breakdown.csv'), index=False)
+        # Regime breakdown
+        if 'regime_breakdown' in analysis and analysis['regime_breakdown']:
+            regime_path = os.path.join(output_dir, 'regime_breakdown.csv')
+            pd.DataFrame(analysis['regime_breakdown']).to_csv(regime_path, index=False)
         
-        # Save hold time analysis
-        if 'hold_time_analysis' in analysis:
-            hold_time_data = analysis['hold_time_analysis']
-            if 'hold_time_by_regime_bucket' in hold_time_data and not hold_time_data['hold_time_by_regime_bucket'].empty:
-                hold_time_data['hold_time_by_regime_bucket'].to_csv(
-                    os.path.join(output_dir, 'hold_time_analysis.csv'), index=False
-                )
-        
-        # Save regime transitions
-        if 'regime_transitions' in analysis and not analysis['regime_transitions'].empty:
-            analysis['regime_transitions'].to_csv(os.path.join(output_dir, 'regime_transitions.csv'), index=False)
-        
-        # Save monthly/yearly returns
+        # Monthly returns
         if 'monthly_returns' in analysis and not analysis['monthly_returns'].empty:
-            analysis['monthly_returns'].to_csv(os.path.join(output_dir, 'monthly_returns.csv'), index=False)
+            monthly_path = os.path.join(output_dir, 'monthly_returns.csv')
+            analysis['monthly_returns'].to_csv(monthly_path)
         
-        if 'yearly_returns' in analysis and not analysis['yearly_returns'].empty:
-            analysis['yearly_returns'].to_csv(os.path.join(output_dir, 'yearly_returns.csv'), index=False)
+        # Performance summary (text)
+        summary_path = os.path.join(output_dir, 'performance_summary.txt')
+        with open(summary_path, 'w') as f:
+            f.write(self._generate_summary_text())
         
-        # Save summary text
-        summary_text = self.analyzer.generate_summary_text(analysis)
-        with open(os.path.join(output_dir, 'performance_summary.txt'), 'w') as f:
-            f.write(summary_text)
+        # Save config
+        config_path = os.path.join(output_dir, 'config.txt')
+        with open(config_path, 'w') as f:
+            f.write(f"Backtest Configuration - Version {CONFIG_VERSION}\n")
+            f.write(f"Date: {CONFIG_DATE}\n\n")
+            for key, value in self.config.items():
+                if not key.startswith('_'):
+                    f.write(f"{key}: {value}\n")
         
-        print(f"[OK] Results saved to: {output_dir}\n")
-        print(summary_text)
-
-
-# Main entry point
-if __name__ == "__main__":
-    engine = BacktestEngine()
-    results = engine.run()
+        return output_dir
+    
+    
+    def _generate_summary_text(self) -> str:
+        """Generate performance summary text"""
+        analysis = self.results['analysis']
+        pm = analysis.get('portfolio_metrics', {})
+        
+        lines = []
+        lines.append("="*80)
+        lines.append(f"BACKTEST PERFORMANCE SUMMARY - Version {CONFIG_VERSION}")
+        lines.append("="*80)
+        lines.append("")
+        
+        # Portfolio performance
+        lines.append("PORTFOLIO PERFORMANCE:")
+        ec = self.results['equity_curve']
+        lines.append(f"  Initial Value:       ${ec.iloc[0]['total_value']:,.2f}")
+        lines.append(f"  Final Value:         ${ec.iloc[-1]['total_value']:,.2f}")
+        lines.append(f"  Total Return:        {pm.get('total_return', 0):.2f}%")
+        lines.append(f"  CAGR:                {pm.get('cagr', 0):.2f}%")
+        lines.append(f"  Sharpe Ratio:        {pm.get('sharpe_ratio', 0):.3f}")
+        lines.append(f"  Sortino Ratio:       {pm.get('sortino_ratio', 0):.3f}")
+        lines.append(f"  Calmar Ratio:        {pm.get('calmar_ratio', 0):.3f}")
+        lines.append(f"  Max Drawdown:        {pm.get('max_drawdown', 0):.2f}%")
+        lines.append(f"  Max DD Duration:     {pm.get('max_dd_duration', 0)} days")
+        lines.append(f"  Volatility (Ann):    {pm.get('volatility', 0)*100:.2f}%")
+        lines.append("")
+        
+        # Trade statistics
+        lines.append("TRADE STATISTICS:")
+        tm = analysis.get('trade_metrics', {})
+        lines.append(f"  Total Trades:        {tm.get('total_trades', 0)}")
+        lines.append(f"  Winning Trades:      {tm.get('winning_trades', 0)}")
+        lines.append(f"  Win Rate:            {tm.get('win_rate', 0):.2f}%")
+        lines.append(f"  Avg Win:             {tm.get('avg_win', 0):.2f}%")
+        lines.append(f"  Avg Loss:            {tm.get('avg_loss', 0):.2f}%")
+        lines.append(f"  Profit Factor:       {tm.get('profit_factor', 0):.3f}")
+        lines.append(f"  Avg Hold Time:       {tm.get('avg_hold_time', 0):.1f} days")
+        lines.append("")
+        
+        # Benchmark comparison
+        if 'benchmark_comparison' in analysis:
+            lines.append("BENCHMARK COMPARISON:")
+            for benchmark, metrics in analysis['benchmark_comparison'].items():
+                lines.append(f"  vs {benchmark}:")
+                lines.append(f"    Benchmark Return:    {metrics.get('benchmark_return', 0):.2f}%")
+                lines.append(f"    Portfolio Return:    {metrics.get('portfolio_return', 0):.2f}%")
+                lines.append(f"    Outperformance:      {metrics.get('outperformance', 0):+.2f}%")
+                lines.append(f"    Alpha:               {metrics.get('alpha', 0):.2f}%")
+                lines.append(f"    Beta:                {metrics.get('beta', 0):.3f}")
+            lines.append("")
+        
+        # Yearly breakdown
+        if 'yearly_breakdown' in analysis and analysis['yearly_breakdown']:
+            lines.append("YEARLY PERFORMANCE:")
+            lines.append("-"*80)
+            lines.append(f"{'Year':<8} {'Return %':<12} {'Sharpe':<10} {'Max DD %':<12} {'Trades'}")
+            lines.append("-"*80)
+            for year_data in analysis['yearly_breakdown']:
+                lines.append(
+                    f"{year_data['year']:<8} "
+                    f"{year_data['return_pct']:>10.2f}% "
+                    f"{year_data['sharpe']:>9.3f} "
+                    f"{year_data['max_dd']:>10.2f}% "
+                    f"{year_data['num_trades']:>7}"
+                )
+            lines.append("")
+        
+        # Sector breakdown (top 5)
+        if 'sector_breakdown' in analysis and analysis['sector_breakdown']:
+            lines.append("Top 5 Sectors by Performance:")
+            lines.append("-"*80)
+            sector_df = pd.DataFrame(analysis['sector_breakdown'])
+            if not sector_df.empty:
+                top_sectors = sector_df.nlargest(5, 'total_return_pct')
+                for _, row in top_sectors.iterrows():
+                    lines.append(
+                        f"  {row['sector']:<30} "
+                        f"Return: {row['total_return_pct']:>8.2f}%  "
+                        f"Trades: {row['num_trades']:>4}  "
+                        f"Win Rate: {row['win_rate']:>6.2f}%"
+                    )
+            lines.append("")
+        
+        lines.append("="*80)
+        
+        return "\n".join(lines)
+    
+    
+    def _print_summary(self):
+        """Print summary to console"""
+        print("\n" + self._generate_summary_text())
