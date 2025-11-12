@@ -1,0 +1,56 @@
+================================================================================
+BACKTEST PERFORMANCE SUMMARY - 10-YEAR ANALYSIS
+================================================================================
+
+PORTFOLIO PERFORMANCE:
+  Initial Value:       $99,500.95
+  Final Value:         $430,296.77
+  Total Return:        332.45%
+  CAGR:                14.45%
+  Sharpe Ratio:        1.605
+  Sortino Ratio:       2.141
+  Calmar Ratio:        1.920
+  Max Drawdown:        -7.53%
+  Max DD Duration:     137 days
+  Volatility (Ann):    7.76%
+
+TRADE STATISTICS:
+  Total Trades:        3336
+  Winning Trades:      1604
+  Win Rate:            48.08%
+  Avg Win:             9.85%
+  Avg Loss:            -4.73%
+  Profit Factor:       1.804
+  Avg Hold Time:       16.8 days
+
+BENCHMARK COMPARISON:
+  vs SPY:
+    Benchmark Return:    292.17%
+    Portfolio Return:    332.45%
+    Outperformance:      40.29%
+    Alpha:               11.30%
+    Beta:                0.177
+  vs QQQ:
+    Benchmark Return:    542.46%
+    Portfolio Return:    332.45%
+    Outperformance:      -210.01%
+    Alpha:               11.20%
+    Beta:                0.134
+
+YEARLY PERFORMANCE:
+--------------------------------------------------------------------------------
+Year     Return %     Sharpe     Max DD %     Trades    
+--------------------------------------------------------------------------------
+2015          22.79%    1.806       -5.12%      246
+2016          40.11%    3.077       -4.22%      217
+2017          29.65%    3.962       -3.41%      100
+2018          12.29%    2.116       -4.37%      234
+2019          11.08%    1.890       -2.96%      298
+2020          13.25%    1.455       -7.53%      333
+2021          12.60%    2.500       -2.84%      379
+2022           2.12%    0.558       -2.49%      365
+2023           7.06%    1.283       -4.38%      373
+2024           6.59%    1.174       -2.50%      422
+2025           3.25%    0.809       -2.15%      369
+
+================================================================================
