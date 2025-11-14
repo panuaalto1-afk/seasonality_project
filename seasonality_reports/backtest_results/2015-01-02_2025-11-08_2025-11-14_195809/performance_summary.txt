@@ -1,0 +1,64 @@
+================================================================================
+BACKTEST PERFORMANCE SUMMARY - Version 2.0
+================================================================================
+
+PORTFOLIO PERFORMANCE:
+  Initial Value:       $100,000.00
+  Final Value:         $367,128.47
+  Total Return:        267.13%
+  CAGR:                12.74%
+  Sharpe Ratio:        0.880
+  Sortino Ratio:       0.076
+  Calmar Ratio:        0.867
+  Max Drawdown:        -14.70%
+  Max DD Duration:     276 days
+  Volatility (Ann):    12.22%
+
+TRADE STATISTICS:
+  Total Trades:        1238
+  Winning Trades:      588
+  Win Rate:            47.50%
+  Avg Win:             15.94%
+  Avg Loss:            -9.36%
+  Profit Factor:       1.519
+  Avg Hold Time:       42.1 days
+
+BENCHMARK COMPARISON:
+  vs SPY:
+    Benchmark Return:    349.03%
+    Portfolio Return:    267.13%
+    Outperformance:      -81.90%
+    Alpha:               -1.08%
+    Beta:                0.007
+  vs QQQ:
+    Benchmark Return:    669.43%
+    Portfolio Return:    267.13%
+    Outperformance:      -402.31%
+    Alpha:               -6.33%
+    Beta:                0.007
+
+YEARLY PERFORMANCE:
+--------------------------------------------------------------------------------
+Year     Return %     Sharpe     Max DD %     Trades
+--------------------------------------------------------------------------------
+2015           2.96%     0.397      -9.42%      70
+2016          19.47%     1.960      -4.30%      49
+2017           6.59%     0.949      -5.13%      27
+2018          -3.91%    -0.328     -12.96%      66
+2019          18.82%     2.150      -5.22%      68
+2020          27.34%     1.411     -11.12%     150
+2021          19.18%     1.409      -6.31%     100
+2022          -8.53%    -0.613     -14.39%     152
+2023          25.85%     1.808     -11.06%     166
+2024          25.99%     1.677     -10.10%     194
+2025          10.80%     0.938     -11.26%     196
+
+Top 5 Sectors by Performance:
+--------------------------------------------------------------------------------
+  Insurance                      Return:    17.22%  Trades:    1  Win Rate: 100.00%
+  Conglomerate                   Return:    16.18%  Trades:    1  Win Rate: 100.00%
+  Clothing industry              Return:    13.67%  Trades:    3  Win Rate:  66.67%
+  Managed health care            Return:    10.78%  Trades:    3  Win Rate:  66.67%
+  Telecommunications             Return:    10.16%  Trades:    3  Win Rate:  33.33%
+
+================================================================================
