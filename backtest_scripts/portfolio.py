@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import logging
 
-from config import (
+from .config import (
     POSITION_SIZE_METHOD, POSITION_SIZE_PCT, POSITION_SIZE_FIXED,
     MIN_POSITION_SIZE, MAX_POSITION_SIZE, MAX_POSITION_PCT,
     USE_STOP_LOSS, USE_TAKE_PROFIT,

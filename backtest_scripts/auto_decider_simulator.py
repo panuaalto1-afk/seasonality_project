@@ -9,7 +9,7 @@ from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timedelta
 import logging
 
-from config import (
+from .config import (
     REGIME_MAX_POSITIONS, DEFAULT_MAX_POSITIONS,
     SECTOR_MAX_POSITIONS, ENABLE_SECTOR_DIVERSIFICATION,
     SECTOR_BLACKLIST, GATE_ALPHA,
