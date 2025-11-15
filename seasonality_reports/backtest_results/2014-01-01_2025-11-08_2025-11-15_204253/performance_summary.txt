@@ -1,0 +1,61 @@
+================================================================================
+BACKTEST PERFORMANCE SUMMARY - Optimized v3.3
+================================================================================
+
+PORTFOLIO PERFORMANCE:
+  Initial Value:       $100,000.00
+  Final Value:         $911,279.34
+  Total Return:        811.28%
+  CAGR:                20.51%
+  Sharpe Ratio:        1.258
+  Sortino Ratio:       1.808
+  Calmar Ratio:        0.981
+  Max Drawdown:        -20.89%
+  Max DD Duration:     389 days
+  Volatility (Ann):    15.86%
+
+TRADE STATISTICS:
+  Total Trades:        687
+  Winning Trades:      257
+  Losing Trades:       430
+  Win Rate:            37.41%
+  Avg Win:             25.84%
+  Avg Loss:            -7.70%
+  Profit Factor:       1.753
+  Expectancy:          4.85%
+  Avg Hold Time:       35.1 days
+
+YEARLY PERFORMANCE:
+--------------------------------------------------------------------------------
+Year     Return %   Sharpe   Max DD %   Trades
+--------------------------------------------------------------------------------
+  2014       0.28%    1.002       0.00%        0
+  2015      17.27%    1.124      -9.71%       45
+  2016      20.03%    1.089     -13.90%       12
+  2017      22.04%    2.010      -3.98%       12
+  2018      -2.25%   -0.018     -20.89%       26
+  2019      32.43%    2.205      -6.68%       47
+  2020      55.52%    2.333     -12.71%      101
+  2021      26.37%    1.193     -11.83%       79
+  2022      -1.69%    0.024     -11.02%       67
+  2023      32.82%    1.704     -12.38%       84
+  2024      49.04%    2.309     -13.17%       92
+  2025       6.18%    0.620     -16.79%      122
+
+Top 5 Sectors by Performance:
+--------------------------------------------------------------------------------
+  Information Technology         Return: 296,623.92  Trades:  182  Win Rate:  38.46%
+  Energy                         Return: 155,380.68  Trades:   30  Win Rate:  56.67%
+  Technology                     Return: 139,328.96  Trades:  109  Win Rate:  39.45%
+  Communication Services         Return: 108,554.56  Trades:   61  Win Rate:  45.90%
+  Industrials                    Return:  81,329.65  Trades:   84  Win Rate:  39.29%
+
+================================================================================
+
+Optimizations Applied (v3.3 - 2025-11-15):
+  - Seasonality caching (50-100x speedup)
+  - Fixed progress bar (single line)
+  - Reduced logging (every 50 days)
+  - Fixed duplicate header detection
+  - KeyboardInterrupt handling
+================================================================================
