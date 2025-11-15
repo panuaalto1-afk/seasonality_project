@@ -10,7 +10,7 @@ from datetime import date
 # ============================================================================
 # BACKTEST PERIOD - 10 YEARS + 1 YEAR WARM-UP
 # ============================================================================
-BACKTEST_START = date(2023, 1, 1)  # CHANGED: Was 2023-01-01
+BACKTEST_START = date(2014, 1, 1)  # CHANGED: Was 2023-01-01
 BACKTEST_END = date(2025, 11, 8)    # Same
 INITIAL_CASH = 100000.0
 
@@ -43,8 +43,8 @@ DEFAULT_MAX_POSITIONS = 8  # Fallback if regime unknown
 # ============================================================================
 # SIGNAL FILTERING - MORE TRADES
 # ============================================================================
-GATE_ALPHA = 0.15  # CHANGED: 0.15 (was 0.10) = top 15% signals
-MIN_SCORE_LONG = 12.0  # CHANGED: 12.0 (was 0.10) = lower threshold
+GATE_ALPHA = 0.20  # CHANGED: 0.15 (was 0.10) = top 15% signals
+MIN_SCORE_LONG = 8.0  # CHANGED: 12.0 (was 0.10) = lower threshold
 
 # ============================================================================
 # SECTOR FILTERING - LESS RESTRICTIVE
