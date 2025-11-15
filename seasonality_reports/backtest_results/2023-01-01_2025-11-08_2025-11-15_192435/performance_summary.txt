@@ -1,0 +1,52 @@
+================================================================================
+BACKTEST PERFORMANCE SUMMARY - Optimized v3.3
+================================================================================
+
+PORTFOLIO PERFORMANCE:
+  Initial Value:       $100,000.00
+  Final Value:         $162,803.03
+  Total Return:        62.80%
+  CAGR:                18.69%
+  Sharpe Ratio:        1.098
+  Sortino Ratio:       1.357
+  Calmar Ratio:        0.819
+  Max Drawdown:        -22.82%
+  Max DD Duration:     101 days
+  Volatility (Ann):    16.96%
+
+TRADE STATISTICS:
+  Total Trades:        214
+  Winning Trades:      85
+  Losing Trades:       129
+  Win Rate:            39.72%
+  Avg Win:             20.63%
+  Avg Loss:            -8.00%
+  Profit Factor:       1.540
+  Expectancy:          3.37%
+  Avg Hold Time:       17.5 days
+
+YEARLY PERFORMANCE:
+--------------------------------------------------------------------------------
+Year     Return %   Sharpe   Max DD %   Trades
+--------------------------------------------------------------------------------
+  2023       0.00%    0.000       0.00%        0
+  2024      43.85%    1.787     -13.34%       99
+  2025      13.10%    0.823     -22.82%      115
+
+Top 5 Sectors by Performance:
+--------------------------------------------------------------------------------
+  Information Technology         Return:  51,201.92  Trades:   88  Win Rate:  46.59%
+  Financials                     Return:  11,596.52  Trades:   27  Win Rate:  37.04%
+  Consumer Discretionary         Return:   7,137.50  Trades:   18  Win Rate:  44.44%
+  Energy                         Return:   5,489.04  Trades:    2  Win Rate: 100.00%
+  Industrials                    Return:   1,932.60  Trades:   19  Win Rate:  36.84%
+
+================================================================================
+
+Optimizations Applied (v3.3 - 2025-11-15):
+  - Seasonality caching (50-100x speedup)
+  - Fixed progress bar (single line)
+  - Reduced logging (every 50 days)
+  - Fixed duplicate header detection
+  - KeyboardInterrupt handling
+================================================================================

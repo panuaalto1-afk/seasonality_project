@@ -1,0 +1,101 @@
+Backtest Configuration - Optimized v3.3
+Date: 2025-11-15 19:24:35
+
+============================================================
+BACKTEST PERIOD
+============================================================
+start_date: 2023-01-01
+end_date: 2025-11-08
+initial_cash: 100000.0
+
+============================================================
+POSITION SIZING - AGGRESSIVE (Dynamic)
+============================================================
+POSITION_SIZE_METHOD: percentage
+POSITION_SIZE_PCT: 0.08 (8%)
+POSITION_SIZE_FIXED: 5000
+MIN_POSITION_SIZE: 1000.0
+MAX_POSITION_SIZE: 50000.0
+MAX_POSITION_PCT: 0.1
+
+============================================================
+PORTFOLIO LIMITS - REGIME-BASED
+============================================================
+BULL_STRONG         : 12 positions
+BULL_WEAK           : 10 positions
+NEUTRAL_BULLISH     : 8 positions
+NEUTRAL_BEARISH     : 6 positions
+BEAR_WEAK           : 4 positions
+BEAR_STRONG         : 2 positions
+CRISIS              : 0 positions
+
+============================================================
+SIGNAL FILTERING
+============================================================
+GATE_ALPHA: 0.15
+MIN_SCORE_LONG: 5.0
+
+============================================================
+SECTOR FILTERING
+============================================================
+BLACKLISTED SECTORS:
+  - Utilities
+
+SECTOR MAX POSITIONS:
+  Financials                    : 4
+  Utilities                     : 3
+  Information Technology        : 4
+  Energy                        : 3
+  Real Estate                   : 3
+  Consumer Discretionary        : 3
+  Industrials                   : 3
+  Consumer Staples              : 2
+  Materials                     : 2
+  Health Care                   : 2
+  Communication Services        : 2
+  Default                       : 2
+
+============================================================
+RISK MANAGEMENT
+============================================================
+Stop Loss Multipliers (ATR-based):
+  BULL_STRONG         : 1.5x ATR
+  BULL_WEAK           : 1.5x ATR
+  NEUTRAL_BULLISH     : 2.0x ATR
+  NEUTRAL_BEARISH     : 2.0x ATR
+  BEAR_WEAK           : 1.5x ATR
+  BEAR_STRONG         : 1.0x ATR
+  CRISIS              : 1.0x ATR
+
+Take Profit Multipliers (ATR-based):
+  BULL_STRONG         : 6.0x ATR
+  BULL_WEAK           : 5.0x ATR
+  NEUTRAL_BULLISH     : 4.0x ATR
+  NEUTRAL_BEARISH     : 3.0x ATR
+  BEAR_WEAK           : 2.5x ATR
+  BEAR_STRONG         : 2.0x ATR
+  CRISIS              : 1.5x ATR
+
+============================================================
+TRANSACTION COSTS
+============================================================
+SLIPPAGE_PCT: 0.001 (0.10%)
+COMMISSION_PCT: 0.001 (0.10%)
+TOTAL_COST_PER_SIDE: 0.002 (0.20%)
+
+============================================================
+EXECUTION SETTINGS
+============================================================
+ENTRY_METHOD: open_with_gap
+EXIT_METHOD: intraday_check
+GAP_RANGE: -2.0% to 2.0%
+
+============================================================
+OPTIMIZATIONS v3.3 (2025-11-15 16:45 UTC)
+============================================================
+- Seasonality caching (50-100x speedup)
+- Fixed progress bar (single line update)
+- Reduced logging (every 50 days vs 20)
+- Fixed duplicate header detection (ticker row)
+- KeyboardInterrupt handling
+- Expected 10y backtest time: 2-3 hours (was 4-5 days)
