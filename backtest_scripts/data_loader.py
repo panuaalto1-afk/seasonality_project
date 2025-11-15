@@ -1,386 +1,326 @@
-# backtest_scripts/data_loader.py
 """
-Data Loader for Backtesting
-Loads historical stock prices, macro ETF prices, and vintage seasonality data
+Data Loader - Efficient data loading and caching
+Handles price data, universe, and regime indicators
 """
 
-import os
-import glob
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional, Tuple
-from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
+import logging
 
-class BacktestDataLoader:
+logger = logging.getLogger(__name__)
+
+
+class DataLoader:
     """
-    Centralized data loader for backtest
-    Handles stock prices, macro ETFs, and vintage seasonality data
+    Loads and caches data for backtest.
+    
+    Responsibilities:
+    - Load universe (constituents)
+    - Load stock price data
+    - Load regime indicator prices
+    - Build trading calendar
+    - Data validation
     """
     
-    def __init__(self, 
-                 stock_price_cache: str,
-                 macro_price_cache: str,
-                 vintage_dir: str):
+    def __init__(self):
+        """Initialize data loader."""
+        self.price_cache = {}
+        
+    def load_universe(self, constituents_path: Path) -> pd.DataFrame:
         """
-        Initialize data loader
+        Load universe of stocks from constituents CSV.
         
-        Args:
-            stock_price_cache: Path to stock prices (e.g., runs/.../price_cache)
-            macro_price_cache: Path to macro ETF prices
-            vintage_dir: Path to vintage seasonality data
+        Expected columns:
+        - ticker (required)
+        - sector (optional)
+        - industry (optional)
         """
-        self.stock_price_cache = stock_price_cache
-        self.macro_price_cache = macro_price_cache
-        self.vintage_dir = vintage_dir
+        logger.info(f"Loading universe from {constituents_path}")
         
-        # Cache loaded data
-        self._stock_prices_cache = {}
-        self._macro_prices_cache = {}
-        self._vintage_cache = {}
+        if not constituents_path.exists():
+            raise FileNotFoundError(f"Constituents file not found: {constituents_path}")
         
-        print(f"[DataLoader] Initialized")
-        print(f"  Stock prices: {stock_price_cache}")
-        print(f"  Macro prices: {macro_price_cache}")
-        print(f"  Vintage data: {vintage_dir}")
+        df = pd.read_csv(constituents_path)
+        
+        # Normalize column names
+        df.columns = [c.lower().strip() for c in df.columns]
+        
+        # Ensure ticker column exists
+        if 'ticker' not in df.columns:
+            # Try common alternatives
+            for alt in ['symbol', 'code', 'tkr']:
+                if alt in df.columns:
+                    df['ticker'] = df[alt]
+                    break
+        
+        if 'ticker' not in df.columns:
+            raise ValueError("Constituents CSV must have 'ticker' column")
+        
+        # Ensure sector column (fill Unknown if missing)
+        if 'sector' not in df.columns:
+            df['sector'] = 'Unknown'
+        
+        # Clean tickers
+        df['ticker'] = df['ticker'].str.upper().str.strip()
+        
+        # Remove duplicates
+        df = df.drop_duplicates(subset=['ticker'])
+        
+        logger.info(f"Loaded {len(df)} tickers")
+        
+        return df
     
-    def load_universe(self, universe_csv: str, max_size: Optional[int] = None) -> List[str]:
+    def read_price_csv(self, file_path: Path) -> Optional[pd.DataFrame]:
         """
-        Load stock universe from CSV
+        Read a single price CSV file.
         
-        Args:
-            universe_csv: Path to constituents CSV
-            max_size: Optional limit on universe size
-        
-        Returns:
-            List of ticker symbols
+        Expected columns (flexible):
+        - Date/Datetime
+        - Open
+        - High
+        - Low
+        - Close/Adj Close
         """
-        print(f"[DataLoader] Loading universe from: {universe_csv}")
-        
-        df = pd.read_csv(universe_csv)
-        
-        # Find ticker column
-        cols = {c.lower(): c for c in df.columns}
-        ticker_col = None
-        for k in ["ticker", "symbol", "ric"]:
-            if k in cols:
-                ticker_col = cols[k]
-                break
-        
-        if ticker_col is None:
-            ticker_col = df.columns[0]
-        
-        tickers = df[ticker_col].astype(str).str.strip().str.upper().tolist()
-        tickers = [t for t in tickers if t and t != 'NAN']
-        
-        if max_size:
-            tickers = tickers[:max_size]
-        
-        print(f"[DataLoader] Loaded {len(tickers)} tickers")
-        return tickers
-    
-    def load_stock_prices(self, ticker: str, 
-                          start_date: Optional[date] = None,
-                          end_date: Optional[date] = None) -> Optional[pd.DataFrame]:
-        """
-        Load historical stock prices
-        
-        Args:
-            ticker: Stock ticker
-            start_date: Optional start date filter
-            end_date: Optional end date filter
-        
-        Returns:
-            DataFrame with columns: date, open, high, low, close, volume (if available)
-        """
-        # Check cache
-        cache_key = f"{ticker}_{start_date}_{end_date}"
-        if cache_key in self._stock_prices_cache:
-            return self._stock_prices_cache[cache_key]
-        
-        # Find CSV file
-        patterns = [
-            os.path.join(self.stock_price_cache, f"{ticker}.csv"),
-            os.path.join(self.stock_price_cache, f"{ticker.upper()}.csv"),
-            os.path.join(self.stock_price_cache, f"{ticker.lower()}.csv"),
-        ]
-        
-        path = None
-        for p in patterns:
-            if os.path.isfile(p):
-                path = p
-                break
-        
-        if path is None:
-            return None
-        
         try:
-            df = pd.read_csv(path)
+            # Try different encodings
+            for encoding in ['utf-8', 'utf-8-sig', 'cp1252']:
+                try:
+                    df = pd.read_csv(file_path, encoding=encoding)
+                    break
+                except:
+                    continue
+            else:
+                return None
             
             # Normalize column names
-            cols = {c.lower(): c for c in df.columns}
+            df.columns = [c.lower().strip().replace(' ', '_') for c in df.columns]
             
             # Find date column
             date_col = None
-            for k in ['date', 'time', 'datetime', 'timestamp']:
-                if k in cols:
-                    date_col = cols[k]
+            for col in ['date', 'datetime', 'timestamp']:
+                if col in df.columns:
+                    date_col = col
                     break
             
             if date_col is None:
                 return None
             
-            # Find price columns
-            open_col = cols.get('open')
-            high_col = cols.get('high')
-            low_col = cols.get('low')
+            # Parse dates
+            df['date'] = pd.to_datetime(df[date_col], errors='coerce')
+            df = df.dropna(subset=['date'])
             
-            close_col = None
-            for k in ['adj close', 'adj_close', 'close', 'last', 'price']:
-                if k in cols:
-                    close_col = cols[k]
-                    break
+            # Find OHLC columns
+            rename_map = {}
             
-            volume_col = cols.get('volume')
+            for target, candidates in [
+                ('open', ['open']),
+                ('high', ['high']),
+                ('low', ['low']),
+                ('close', ['close', 'adj_close', 'adjclose', 'adj close']),
+            ]:
+                for cand in candidates:
+                    if cand in df.columns:
+                        rename_map[cand] = target
+                        break
             
-            if close_col is None:
+            df = df.rename(columns=rename_map)
+            
+            # Ensure we have OHLC
+            required = ['open', 'high', 'low', 'close']
+            if not all(col in df.columns for col in required):
                 return None
             
-            # Build output DataFrame
-            out_cols = {'date': date_col, 'close': close_col}
-            if open_col:
-                out_cols['open'] = open_col
-            if high_col:
-                out_cols['high'] = high_col
-            if low_col:
-                out_cols['low'] = low_col
-            if volume_col:
-                out_cols['volume'] = volume_col
+            # Select and convert
+            df = df[['date', 'open', 'high', 'low', 'close']].copy()
             
-            df = df[list(out_cols.values())].rename(columns={v: k for k, v in out_cols.items()})
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
             
-            # Parse date
-            df['date'] = pd.to_datetime(df['date']).dt.date
+            df = df.dropna()
             
-            # Convert to numeric
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            # Remove NaNs
-            df = df.dropna(subset=['close'])
+            if df.empty:
+                return None
             
             # Sort by date
             df = df.sort_values('date').reset_index(drop=True)
             
-            # Fill missing OHLC if needed
-            if 'open' not in df.columns:
-                df['open'] = df['close']
-            if 'high' not in df.columns:
-                df['high'] = df['close']
-            if 'low' not in df.columns:
-                df['low'] = df['close']
-            
-            # Filter by date range
-            if start_date:
-                df = df[df['date'] >= start_date]
-            if end_date:
-                df = df[df['date'] <= end_date]
-            
-            # Cache
-            self._stock_prices_cache[cache_key] = df
+            # Remove duplicates (keep last)
+            df = df.drop_duplicates(subset=['date'], keep='last')
             
             return df
-        
+            
         except Exception as e:
-            print(f"[WARN] Failed to load {ticker}: {e}")
+            logger.debug(f"Error reading {file_path.name}: {str(e)}")
             return None
     
-    def load_macro_prices(self, symbol: str,
-                         start_date: Optional[date] = None,
-                         end_date: Optional[date] = None) -> Optional[pd.DataFrame]:
+    def load_price_data(
+        self,
+        tickers: List[str],
+        price_cache_dir: Path,
+        start_date: datetime,
+        end_date: datetime
+    ) -> Dict[str, pd.DataFrame]:
         """
-        Load macro ETF prices (for regime detection)
+        Load price data for all tickers.
         
-        Args:
-            symbol: ETF symbol (SPY, QQQ, VIX, etc.)
-            start_date: Optional start date
-            end_date: Optional end date
-        
-        Returns:
-            DataFrame with columns: date, close
+        Returns dict: {ticker: DataFrame with OHLC}
         """
-        cache_key = f"macro_{symbol}_{start_date}_{end_date}"
-        if cache_key in self._macro_prices_cache:
-            return self._macro_prices_cache[cache_key]
+        logger.info(f"Loading price data from {price_cache_dir}")
         
-        path = os.path.join(self.macro_price_cache, f"{symbol}.csv")
+        price_data = {}
+        failed_tickers = []
         
-        if not os.path.isfile(path):
-            return None
+        for ticker in tickers:
+            # Try different file name formats
+            possible_names = [
+                f"{ticker}.csv",
+                f"{ticker.replace('-', '.')}.csv",
+                f"{ticker.replace('.', '-')}.csv",
+            ]
+            
+            df = None
+            for name in possible_names:
+                file_path = price_cache_dir / name
+                if file_path.exists():
+                    df = self.read_price_csv(file_path)
+                    if df is not None:
+                        break
+            
+            if df is None:
+                failed_tickers.append(ticker)
+                continue
+            
+            # Filter to date range
+            df = df[(df['date'] >= start_date) & (df['date'] <= end_date)]
+            
+            if len(df) < 60:  # Require at least 60 days
+                failed_tickers.append(ticker)
+                continue
+            
+            price_data[ticker] = df
         
-        try:
-            df = pd.read_csv(path)
-            
-            cols = {c.lower(): c for c in df.columns}
-            date_col = cols.get('date')
-            
-            close_col = None
-            for k in ['adj close', 'adj_close', 'close', 'price']:
-                if k in cols:
-                    close_col = cols[k]
-                    break
-            
-            if date_col is None or close_col is None:
-                return None
-            
-            df = df[[date_col, close_col]].rename(columns={date_col: 'date', close_col: 'close'})
-            df['date'] = pd.to_datetime(df['date']).dt.date
-            df['close'] = pd.to_numeric(df['close'], errors='coerce')
-            df = df.dropna().sort_values('date').reset_index(drop=True)
-            
-            if start_date:
-                df = df[df['date'] >= start_date]
-            if end_date:
-                df = df[df['date'] <= end_date]
-            
-            self._macro_prices_cache[cache_key] = df
-            return df
+        if failed_tickers:
+            logger.warning(f"Failed to load {len(failed_tickers)} tickers")
+            if len(failed_tickers) <= 10:
+                logger.warning(f"Failed tickers: {', '.join(failed_tickers)}")
         
-        except Exception as e:
-            print(f"[WARN] Failed to load macro {symbol}: {e}")
-            return None
+        logger.info(f"Successfully loaded {len(price_data)} tickers")
+        
+        return price_data
     
-    def load_vintage_seasonality(self, ticker: str) -> Dict[str, pd.DataFrame]:
+    def load_regime_prices(
+        self,
+        regime_cache_dir: Path,
+        start_date: datetime,
+        end_date: datetime
+    ) -> Dict[str, pd.DataFrame]:
         """
-        Load vintage seasonality data for ticker
+        Load price data for regime indicators.
         
-        Args:
-            ticker: Stock ticker
-        
-        Returns:
-            Dict with keys: 'segments_up', 'segments_down', 'vintage_10y', 'seasonality_week'
+        Required tickers:
+        - SPY, QQQ, IWM (equity)
+        - ^SPX, ^VIX (market)
+        - GLD, TLT (safe havens)
+        - HYG, LQD (credit)
         """
-        if ticker in self._vintage_cache:
-            return self._vintage_cache[ticker]
+        logger.info(f"Loading regime prices from {regime_cache_dir}")
         
-        result = {}
+        regime_tickers = [
+            'SPY', 'QQQ', 'IWM',
+            '^SPX', '^VIX',
+            'GLD', 'TLT',
+            'HYG', 'LQD',
+        ]
         
-        # Load segments_up
-        path_up = os.path.join(self.vintage_dir, f"{ticker}_segments_up.csv")
-        if os.path.isfile(path_up):
-            try:
-                result['segments_up'] = pd.read_csv(path_up)
-            except:
-                pass
+        regime_prices = {}
         
-        # Load segments_down
-        path_down = os.path.join(self.vintage_dir, f"{ticker}_segments_down.csv")
-        if os.path.isfile(path_down):
-            try:
-                result['segments_down'] = pd.read_csv(path_down)
-            except:
-                pass
-        
-        # Load vintage_10y
-        path_vintage = os.path.join(self.vintage_dir, f"{ticker}_vintage_10y.csv")
-        if os.path.isfile(path_vintage):
-            try:
-                result['vintage_10y'] = pd.read_csv(path_vintage)
-            except:
-                pass
-        
-        # Load seasonality_week
-        path_week = os.path.join(self.vintage_dir, f"{ticker}_seasonality_week.csv")
-        if os.path.isfile(path_week):
-            try:
-                result['seasonality_week'] = pd.read_csv(path_week)
-            except:
-                pass
-        
-        self._vintage_cache[ticker] = result
-        return result
-    
-    def preload_all_stock_prices(self, tickers: List[str], 
-                                 start_date: date, 
-                                 end_date: date) -> Dict[str, pd.DataFrame]:
-        """
-        Preload all stock prices into memory (for speed)
-        
-        Args:
-            tickers: List of tickers
-            start_date: Backtest start
-            end_date: Backtest end
-        
-        Returns:
-            Dict mapping ticker → DataFrame
-        """
-        print(f"[DataLoader] Preloading {len(tickers)} stock prices...")
-        
-        prices = {}
-        loaded = 0
-        
-        for i, ticker in enumerate(tickers):
-            if (i + 1) % 50 == 0:
-                print(f"  Progress: {i+1}/{len(tickers)}")
+        for ticker in regime_tickers:
+            # Try different file formats
+            possible_names = [
+                f"{ticker}.csv",
+                f"{ticker.replace('^', '')}.csv",
+            ]
             
-            df = self.load_stock_prices(ticker, start_date, end_date)
-            if df is not None and len(df) > 0:
-                prices[ticker] = df
-                loaded += 1
+            df = None
+            for name in possible_names:
+                file_path = regime_cache_dir / name
+                if file_path.exists():
+                    df = self.read_price_csv(file_path)
+                    if df is not None:
+                        break
+            
+            if df is None:
+                logger.warning(f"Could not load regime ticker: {ticker}")
+                continue
+            
+            # Filter to date range (with buffer for calculations)
+            buffer_start = start_date - timedelta(days=365)
+            df = df[(df['date'] >= buffer_start) & (df['date'] <= end_date)]
+            
+            regime_prices[ticker] = df
         
-        print(f"[DataLoader] Preloaded {loaded}/{len(tickers)} successfully")
-        return prices
+        logger.info(f"Loaded {len(regime_prices)} regime indicators")
+        
+        return regime_prices
     
-    def preload_all_macro_prices(self, symbols: List[str],
-                                 start_date: date,
-                                 end_date: date) -> Dict[str, pd.DataFrame]:
+    def build_trading_calendar(
+        self,
+        price_data: Dict[str, pd.DataFrame],
+        start_date: datetime,
+        end_date: datetime
+    ) -> List[datetime]:
         """
-        Preload all macro ETF prices
+        Build trading calendar from actual trading days in data.
         
-        Args:
-            symbols: List of macro symbols (SPY, QQQ, etc.)
-            start_date: Backtest start
-            end_date: Backtest end
-        
-        Returns:
-            Dict mapping symbol → DataFrame
+        Uses union of all dates from price data.
         """
-        print(f"[DataLoader] Preloading {len(symbols)} macro prices...")
+        all_dates = set()
         
-        prices = {}
-        for symbol in symbols:
-            df = self.load_macro_prices(symbol, start_date, end_date)
-            if df is not None:
-                prices[symbol] = df
+        for df in price_data.values():
+            dates = df['date'].dt.normalize()
+            all_dates.update(dates)
         
-        print(f"[DataLoader] Preloaded {len(prices)}/{len(symbols)} macro prices")
-        return prices
+        # Filter to range
+        trading_days = sorted([
+            d for d in all_dates
+            if start_date <= d <= end_date
+        ])
+        
+        return trading_days
     
-    def get_trading_days(self, start_date: date, end_date: date, 
-                        reference_ticker: str = 'SPY') -> List[date]:
+    def validate_data(self, price_data: Dict[str, pd.DataFrame]) -> Dict[str, List[str]]:
         """
-        Get list of trading days (using SPY as reference)
+        Validate loaded price data.
         
-        Args:
-            start_date: Start date
-            end_date: End date
-            reference_ticker: Ticker to use as trading calendar (default SPY)
-        
-        Returns:
-            List of trading dates
+        Returns dict with issues found.
         """
-        # Load reference prices (from macro cache, as SPY is there)
-        df = self.load_macro_prices(reference_ticker, start_date, end_date)
+        issues = {
+            'missing_data': [],
+            'short_history': [],
+            'price_errors': [],
+        }
         
-        if df is None or df.empty:
-            # Fallback: all weekdays
-            print(f"[WARN] Could not load {reference_ticker} for trading calendar, using weekdays")
-            dates = []
-            current = start_date
-            while current <= end_date:
-                if current.weekday() < 5:  # Monday-Friday
-                    dates.append(current)
-                current += timedelta(days=1)
-            return dates
+        for ticker, df in price_data.items():
+            # Check for gaps
+            date_diffs = df['date'].diff()
+            large_gaps = date_diffs[date_diffs > timedelta(days=14)]
+            if len(large_gaps) > 5:
+                issues['missing_data'].append(ticker)
+            
+            # Check history length
+            if len(df) < 252:  # Less than 1 year
+                issues['short_history'].append(ticker)
+            
+            # Check for price errors (e.g., zeros, negatives)
+            if (df[['open', 'high', 'low', 'close']] <= 0).any().any():
+                issues['price_errors'].append(ticker)
+            
+            # Check for unrealistic moves (>50% in one day)
+            daily_return = df['close'].pct_change()
+            if (daily_return.abs() > 0.5).any():
+                issues['price_errors'].append(ticker)
         
-        return df['date'].tolist()
+        return issues

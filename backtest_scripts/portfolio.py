@@ -1,446 +1,720 @@
-# backtest_scripts/portfolio.py
 """
-Portfolio Management with Dynamic Position Sizing
-Handles position tracking, entry/exit, and P/L calculation
-
-UPDATED: 2025-11-12 15:19 UTC
-CHANGES:
-  - Dynamic position sizing based on portfolio value
-  - Sector-specific position limits
-  - Adaptive position sizing (drawdown/Sharpe/volatility)
-  - Enhanced position tracking
+Portfolio Management - Aggressive 6% Dynamic Position Sizing (FULL VERSION)
+Handles position tracking, risk management, and execution
+Matches live system portfolio logic with enhanced features
 """
 
 import pandas as pd
 import numpy as np
-from typing import Dict, Optional, Tuple
-import logging
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
 from datetime import datetime
+import logging
+
+from config import (
+    POSITION_SIZE_METHOD, POSITION_SIZE_PCT, POSITION_SIZE_FIXED,
+    MIN_POSITION_SIZE, MAX_POSITION_SIZE, MAX_POSITION_PCT,
+    USE_STOP_LOSS, USE_TAKE_PROFIT,
+    REGIME_STOP_LOSS_MULTIPLIER, REGIME_TAKE_PROFIT_MULTIPLIER,
+    DEFAULT_STOP_MULTIPLIER, DEFAULT_TP_MULTIPLIER,
+    SLIPPAGE_PCT, COMMISSION_PCT, TOTAL_COST_PER_SIDE,
+    REGIME_MIN_HOLD_DAYS, DEFAULT_MIN_HOLD_DAYS,
+)
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class Position:
+    """
+    Represents an open position.
+    
+    Tracks:
+    - Entry details (date, price, shares)
+    - Risk management (SL, TP)
+    - Performance tracking (highest/lowest, unrealized P&L)
+    - Context (regime, sector, score)
+    """
+    ticker: str
+    entry_date: datetime
+    entry_price: float
+    shares: int
+    stop_loss: float
+    take_profit: float
+    regime: str
+    sector: str
+    atr: float
+    score: float
+    days_held: int = 0
+    highest_price: float = 0.0
+    lowest_price: float = 0.0
+    unrealized_pnl: float = 0.0
+    unrealized_pnl_pct: float = 0.0
+    max_unrealized_gain: float = 0.0
+    max_unrealized_loss: float = 0.0
+    
+    def __post_init__(self):
+        """Initialize tracking fields."""
+        self.highest_price = self.entry_price
+        self.lowest_price = self.entry_price
+    
+    def update_tracking(self, current_price: float):
+        """Update position tracking with current price."""
+        self.highest_price = max(self.highest_price, current_price)
+        self.lowest_price = min(self.lowest_price, current_price)
+        
+        # Unrealized P&L
+        self.unrealized_pnl = (current_price - self.entry_price) * self.shares
+        self.unrealized_pnl_pct = (current_price / self.entry_price - 1) * 100
+        
+        # Track max gains/losses
+        gain = (self.highest_price / self.entry_price - 1) * 100
+        loss = (self.lowest_price / self.entry_price - 1) * 100
+        
+        self.max_unrealized_gain = max(self.max_unrealized_gain, gain)
+        self.max_unrealized_loss = min(self.max_unrealized_loss, loss)
+    
+    def get_position_value(self, current_price: float) -> float:
+        """Get current position value."""
+        return self.shares * current_price
+    
+    def get_cost_basis(self) -> float:
+        """Get original cost basis."""
+        return self.shares * self.entry_price
+    
+    def distance_to_stop_loss(self, current_price: float) -> float:
+        """Get distance to stop loss in percentage."""
+        return (current_price / self.stop_loss - 1) * 100 if self.stop_loss > 0 else 999
+    
+    def distance_to_take_profit(self, current_price: float) -> float:
+        """Get distance to take profit in percentage."""
+        return (self.take_profit / current_price - 1) * 100 if current_price > 0 else 999
+
+
 class Portfolio:
     """
-    Portfolio manager with dynamic position sizing
+    Portfolio manager with aggressive 6% dynamic position sizing.
+    
+    Key Features:
+    - 6% position sizing (grows with portfolio)
+    - Regime-based SL/TP (tight stops, high targets)
+    - Intraday SL/TP checks
+    - Transaction costs (0.6% per side)
+    - Position tracking and analytics
+    - Risk metrics calculation
+    
+    Matches live system with backtest-specific enhancements
     """
     
-    def __init__(
-        self,
-        initial_cash: float,
-        config: dict,
-        sector_mapping: Optional[Dict[str, str]] = None
-    ):
-        """
-        Initialize portfolio
-        
-        Args:
-            initial_cash: Starting capital
-            config: Configuration dictionary
-            sector_mapping: Dict mapping ticker -> sector
-        """
+    def __init__(self, initial_cash: float):
+        """Initialize portfolio."""
         self.initial_cash = initial_cash
         self.cash = initial_cash
-        self.config = config
-        self.sector_mapping = sector_mapping or {}
-        
-        # Portfolio state
-        self.positions = {}  # symbol -> position dict
-        self.equity_curve = []
-        self.trades_history = []
+        self.positions: Dict[str, Position] = {}
+        self.closed_positions: List[Dict] = []
+        self.equity_history: List[Dict] = []
         
         # Performance tracking
-        self.total_value = initial_cash
         self.peak_value = initial_cash
-        self.current_drawdown = 0.0
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.total_commissions = 0.0
+        self.total_slippage_cost = 0.0
         
-        # Rolling metrics for adaptive sizing
-        self.recent_returns = []  # Last 60 days
-        self.rolling_sharpe = 0.0
-        self.rolling_volatility = 0.0
-        
-        # Position sizing config
-        self.position_method = config.get('POSITION_SIZE_METHOD', 'percentage')
-        self.position_pct = config.get('POSITION_SIZE_PCT', 0.05)
-        self.position_fixed = config.get('POSITION_SIZE_FIXED', 5000.0)
-        self.min_position = config.get('MIN_POSITION_SIZE', 1000.0)
-        self.max_position = config.get('MAX_POSITION_SIZE', 50000.0)
-        self.max_position_pct = config.get('MAX_POSITION_PCT', 0.10)
-        
-        # Adaptive sizing config
-        self.adaptive_config = config.get('ADAPTIVE_POSITION_SIZING', {})
-        
-        # Sector limits
-        self.sector_max = config.get('SECTOR_MAX_POSITIONS', {})
-        self.sector_strategies = config.get('SECTOR_STRATEGIES', {})
-        
-        # Slippage
-        self.slippage = config.get('SLIPPAGE_PCT', 0.001)
-        
-        logger.info(f"[Portfolio] Initialized with ${initial_cash:,.2f}")
-        if self.position_method == 'percentage':
-            logger.info(f"[Portfolio] Using DYNAMIC position sizing: {self.position_pct*100:.1f}% per position")
-        else:
-            logger.info(f"[Portfolio] Using FIXED position sizing: ${self.position_fixed:,.2f} per position")
-        
-        if sector_mapping:
-            logger.info(f"[Portfolio] Loaded sector mapping for {len(sector_mapping)} tickers")
+    def get_total_value(self, current_prices: Dict[str, float]) -> float:
+        """Calculate total portfolio value (cash + positions)."""
+        position_value = sum(
+            pos.shares * current_prices.get(pos.ticker, pos.entry_price)
+            for pos in self.positions.values()
+        )
+        return self.cash + position_value
     
+    def get_position_value(self, ticker: str, current_price: float) -> float:
+        """Get current value of a specific position."""
+        if ticker not in self.positions:
+            return 0.0
+        pos = self.positions[ticker]
+        return pos.get_position_value(current_price)
+    
+    def get_positions_value(self, current_prices: Dict[str, float]) -> float:
+        """Get total value of all positions."""
+        return sum(
+            pos.shares * current_prices.get(pos.ticker, pos.entry_price)
+            for pos in self.positions.values()
+        )
+    
+    def get_exposure_pct(self, current_prices: Dict[str, float]) -> float:
+        """Get portfolio exposure as percentage."""
+        total_value = self.get_total_value(current_prices)
+        if total_value == 0:
+            return 0
+        positions_value = self.get_positions_value(current_prices)
+        return (positions_value / total_value) * 100
     
     def calculate_position_size(
         self,
-        symbol: str,
-        regime_multiplier: float = 1.0,
-        sector: Optional[str] = None
+        current_portfolio_value: float,
+        regime: str,
+        sector: str,
+        score: float
     ) -> float:
         """
-        Calculate dynamic position size
+        Calculate position size - AGGRESSIVE 6% DYNAMIC.
         
-        Args:
-            symbol: Stock ticker
-            regime_multiplier: Multiplier from regime strategy
-            sector: Sector name (optional)
+        Formula: 6% of current portfolio value
+        Caps: $1k minimum, $50k maximum, 10% of portfolio maximum
         
-        Returns:
-            Position size in dollars
+        This ensures:
+        - Position size grows with portfolio (compound effect)
+        - Risk per trade stays constant (6%)
+        - Prevents over-concentration (10% max)
         """
-        # Base position size
-        if self.position_method == 'percentage':
-            base_size = self.total_value * self.position_pct
-        else:
-            base_size = self.position_fixed
+        if POSITION_SIZE_METHOD == 'fixed':
+            base_size = POSITION_SIZE_FIXED
+        else:  # 'percentage'
+            base_size = current_portfolio_value * POSITION_SIZE_PCT
         
-        # Apply regime multiplier
-        position_size = base_size * regime_multiplier
+        # Apply minimum
+        base_size = max(base_size, MIN_POSITION_SIZE)
         
-        # Apply sector-specific boost
-        if sector and sector in self.sector_strategies:
-            sector_boost = self.sector_strategies[sector].get('position_size_boost', 1.0)
-            position_size *= sector_boost
+        # Apply maximum (both absolute and percentage)
+        max_size_abs = MAX_POSITION_SIZE
+        max_size_pct = current_portfolio_value * MAX_POSITION_PCT
+        base_size = min(base_size, max_size_abs, max_size_pct)
         
-        # Apply adaptive adjustments
-        if self.adaptive_config.get('enabled', False):
-            position_size = self._apply_adaptive_sizing(position_size)
-        
-        # Enforce limits
-        position_size = max(self.min_position, position_size)
-        position_size = min(self.max_position, position_size)
-        position_size = min(self.total_value * self.max_position_pct, position_size)
-        
-        return position_size
+        return base_size
     
+    def calculate_stop_loss(
+        self,
+        entry_price: float,
+        atr: float,
+        regime: str
+    ) -> float:
+        """
+        Calculate stop loss - AGGRESSIVE (TIGHT).
+        
+        Uses regime-specific multipliers:
+        - BULL_STRONG: 0.5x ATR (very tight, let winners run)
+        - BULL_WEAK: 0.6x ATR
+        - NEUTRAL_BULLISH: 0.7x ATR
+        - NEUTRAL_BEARISH: 0.8x ATR
+        - BEAR_WEAK: 0.9x ATR
+        - BEAR_STRONG: 1.0x ATR (wider in bear markets)
+        
+        Safety: Never allow SL below 30% loss
+        """
+        multiplier = REGIME_STOP_LOSS_MULTIPLIER.get(
+            regime,
+            DEFAULT_STOP_MULTIPLIER
+        )
+        
+        stop_distance = atr * multiplier
+        stop_loss = entry_price - stop_distance
+        
+        # Safety floor: never below 30% loss
+        min_stop = entry_price * 0.70
+        stop_loss = max(stop_loss, min_stop)
+        
+        # Ensure stop is below entry
+        if stop_loss >= entry_price:
+            stop_loss = entry_price * 0.95  # 5% stop as fallback
+        
+        return stop_loss
     
-    def _apply_adaptive_sizing(self, position_size: float) -> float:
+    def calculate_take_profit(
+        self,
+        entry_price: float,
+        atr: float,
+        regime: str
+    ) -> float:
         """
-        Apply adaptive position sizing adjustments
+        Calculate take profit - AGGRESSIVE (HIGH).
         
-        Args:
-            position_size: Base position size
+        Uses regime-specific multipliers:
+        - BULL_STRONG: 4.0x ATR (very high, capture big moves)
+        - BULL_WEAK: 3.5x ATR
+        - NEUTRAL_BULLISH: 3.0x ATR
+        - NEUTRAL_BEARISH: 2.5x ATR
+        - BEAR_WEAK: 2.0x ATR
+        - BEAR_STRONG: 1.5x ATR (take profits faster in bear)
         
-        Returns:
-            Adjusted position size
+        Minimum: 10% profit target
         """
-        multiplier = 1.0
+        multiplier = REGIME_TAKE_PROFIT_MULTIPLIER.get(
+            regime,
+            DEFAULT_TP_MULTIPLIER
+        )
         
-        # 1. Drawdown reduction
-        dd_config = self.adaptive_config.get('drawdown_reduction', {})
-        if dd_config.get('enabled', False):
-            for dd_threshold, dd_mult in sorted(dd_config.get('thresholds', {}).items()):
-                if abs(self.current_drawdown) >= dd_threshold:
-                    multiplier = min(multiplier, dd_mult)
+        tp_distance = atr * multiplier
+        take_profit = entry_price + tp_distance
         
-        # 2. Sharpe boost
-        sharpe_config = self.adaptive_config.get('sharpe_boost', {})
-        if sharpe_config.get('enabled', False) and self.rolling_sharpe > 0:
-            for sharpe_threshold, sharpe_mult in sorted(sharpe_config.get('thresholds', {}).items(), reverse=True):
-                if self.rolling_sharpe >= sharpe_threshold:
-                    multiplier = max(multiplier, sharpe_mult)
-                    break
+        # Ensure minimum 10% profit target
+        min_tp = entry_price * 1.10
+        take_profit = max(take_profit, min_tp)
         
-        # 3. Volatility reduction
-        vol_config = self.adaptive_config.get('volatility_reduction', {})
-        if vol_config.get('enabled', False):
-            vol_threshold = vol_config.get('threshold', 0.04)
-            if self.rolling_volatility > vol_threshold:
-                multiplier *= vol_config.get('multiplier', 0.8)
-        
-        return position_size * multiplier
+        return take_profit
     
-    
-    def can_open_position(self, sector: Optional[str] = None) -> bool:
-        """
-        Check if we can open a new position
-        
-        Args:
-            sector: Sector name (for sector limits)
-        
-        Returns:
-            True if position can be opened
-        """
-        # Check total position limit
-        max_pos = self.config.get('MAX_POSITIONS', 20)
-        if len(self.positions) >= max_pos:
+    def can_open_position(
+        self,
+        ticker: str,
+        max_positions: int,
+        sector_positions: Dict[str, int],
+        sector: str,
+        sector_max: int
+    ) -> bool:
+        """Check if we can open a new position."""
+        # Already have position in this ticker
+        if ticker in self.positions:
             return False
         
-        # Check sector-specific limit
-        if sector and self.config.get('ENABLE_SECTOR_DIVERSIFICATION', False):
-            sector_max = self.sector_max.get(sector, self.sector_max.get('Default', 4))
-            current_sector_count = sum(
-                1 for pos in self.positions.values() 
-                if pos.get('sector') == sector
-            )
-            if current_sector_count >= sector_max:
-                return False
+        # At max total positions
+        if len(self.positions) >= max_positions:
+            return False
+        
+        # At max positions for this sector
+        current_sector_count = sector_positions.get(sector, 0)
+        if current_sector_count >= sector_max:
+            return False
         
         return True
-    
     
     def open_position(
         self,
-        symbol: str,
-        date: pd.Timestamp,
+        ticker: str,
+        date: datetime,
         price: float,
-        regime_strategy: dict,
-        sector: Optional[str] = None,
-        entry_reason: str = "NEW_CANDIDATE"
-    ) -> bool:
+        regime: str,
+        sector: str,
+        atr: float,
+        score: float,
+        current_prices: Dict[str, float]
+    ) -> Optional[Dict]:
         """
-        Open a new position with dynamic sizing
+        Open a new position with 6% dynamic sizing.
         
-        Args:
-            symbol: Stock ticker
-            date: Entry date
-            price: Entry price
-            regime_strategy: Current regime strategy dict
-            sector: Sector name
-            entry_reason: Reason for entry
+        Process:
+        1. Calculate current portfolio value
+        2. Calculate position size (6% of portfolio)
+        3. Calculate shares to buy
+        4. Apply slippage and commission
+        5. Calculate SL/TP levels
+        6. Create position object
+        7. Deduct cash
+        8. Return trade record
         
-        Returns:
-            True if position opened successfully
+        Returns trade record if successful, None otherwise.
         """
-        if not self.can_open_position(sector):
-            return False
-        
-        if symbol in self.positions:
-            logger.warning(f"Position for {symbol} already exists")
-            return False
+        # Calculate current portfolio value
+        portfolio_value = self.get_total_value(current_prices)
         
         # Calculate position size
-        regime_mult = regime_strategy.get('position_size_multiplier', 1.0)
-        target_value = self.calculate_position_size(symbol, regime_mult, sector)
-        
-        # Apply slippage to entry price
-        entry_price = price * (1 + self.slippage)
-        
-        # Calculate shares
-        shares = int(target_value / entry_price)
-        
-        if shares == 0:
-            logger.warning(f"Cannot open position for {symbol}: insufficient capital")
-            return False
-        
-        # Actual cost
-        actual_cost = shares * entry_price
-        
-        if actual_cost > self.cash:
-            logger.warning(f"Cannot open position for {symbol}: insufficient cash")
-            return False
-        
-        # Deduct cash
-        self.cash -= actual_cost
-        
-        # Get sector-specific parameters
-        sector_params = self.sector_strategies.get(sector, self.sector_strategies.get('Default', {}))
-        
-        # Store position
-        self.positions[symbol] = {
-            'symbol': symbol,
-            'sector': sector,
-            'entry_date': date,
-            'entry_price': entry_price,
-            'shares': shares,
-            'cost_basis': actual_cost,
-            'entry_reason': entry_reason,
-            'regime': regime_strategy.get('name', 'UNKNOWN'),
-            'stop_multiplier': regime_strategy.get('stop_multiplier', 1.0),
-            'tp_multiplier': regime_strategy.get('tp_multiplier', 2.0),
-            'min_hold_days': regime_strategy.get('min_hold_days', 14),
-            # Sector-specific overrides
-            'sector_tp_mult': sector_params.get('tp_multiplier'),
-            'sector_sl_mult': sector_params.get('sl_multiplier'),
-            'sector_min_hold': sector_params.get('min_hold_days'),
-        }
-        
-        logger.debug(
-            f"[Portfolio] OPEN {symbol} @ ${entry_price:.2f} "
-            f"x {shares} shares = ${actual_cost:.2f} "
-            f"({sector or 'N/A'}) [{entry_reason}]"
+        position_size = self.calculate_position_size(
+            portfolio_value, regime, sector, score
         )
         
-        return True
+        # Calculate shares
+        shares = int(position_size / price)
+        if shares <= 0:
+            logger.debug(f"Cannot open {ticker}: shares=0 (size=${position_size:.2f}, price=${price:.2f})")
+            return None
+        
+        # Calculate actual cost with slippage
+        actual_entry_price = price * (1 + SLIPPAGE_PCT)
+        cost = shares * actual_entry_price
+        commission = cost * COMMISSION_PCT
+        total_cost = cost + commission
+        
+        # Check if we have enough cash
+        if total_cost > self.cash:
+            # Try with reduced shares to fit available cash
+            max_shares = int((self.cash / (1 + COMMISSION_PCT)) / actual_entry_price)
+            if max_shares <= 0:
+                logger.debug(f"Cannot open {ticker}: insufficient cash (need ${total_cost:.2f}, have ${self.cash:.2f})")
+                return None
+            
+            shares = max_shares
+            cost = shares * actual_entry_price
+            commission = cost * COMMISSION_PCT
+            total_cost = cost + commission
+        
+        # Calculate SL/TP
+        stop_loss = self.calculate_stop_loss(actual_entry_price, atr, regime)
+        take_profit = self.calculate_take_profit(actual_entry_price, atr, regime)
+        
+        # Validate SL/TP
+        if stop_loss >= actual_entry_price or take_profit <= actual_entry_price:
+            logger.warning(f"Invalid SL/TP for {ticker}: SL={stop_loss:.2f}, Entry={actual_entry_price:.2f}, TP={take_profit:.2f}")
+            return None
+        
+        # Create position
+        position = Position(
+            ticker=ticker,
+            entry_date=date,
+            entry_price=actual_entry_price,
+            shares=shares,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            regime=regime,
+            sector=sector,
+            atr=atr,
+            score=score,
+        )
+        
+        # Deduct cash
+        self.cash -= total_cost
+        
+        # Add to positions
+        self.positions[ticker] = position
+        
+        # Update tracking
+        self.total_commissions += commission
+        self.total_slippage_cost += (actual_entry_price - price) * shares
+        
+        # Calculate position metrics
+        risk_dollars = (actual_entry_price - stop_loss) * shares
+        risk_pct = (actual_entry_price - stop_loss) / actual_entry_price * 100
+        reward_dollars = (take_profit - actual_entry_price) * shares
+        reward_pct = (take_profit - actual_entry_price) / actual_entry_price * 100
+        risk_reward_ratio = reward_dollars / risk_dollars if risk_dollars > 0 else 0
+        
+        # Return trade record
+        return {
+            'date': date,
+            'ticker': ticker,
+            'action': 'BUY',
+            'price': actual_entry_price,
+            'shares': shares,
+            'value': cost,
+            'commission': commission,
+            'slippage_cost': (actual_entry_price - price) * shares,
+            'total_cost': total_cost,
+            'regime': regime,
+            'sector': sector,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'atr': atr,
+            'score': score,
+            'portfolio_value': portfolio_value,
+            'cash_before': self.cash + total_cost,
+            'cash_after': self.cash,
+            'position_size_pct': (cost / portfolio_value * 100) if portfolio_value > 0 else 0,
+            'risk_dollars': risk_dollars,
+            'risk_pct': risk_pct,
+            'reward_dollars': reward_dollars,
+            'reward_pct': reward_pct,
+            'risk_reward_ratio': risk_reward_ratio,
+        }
     
+    def check_stops_intraday(
+        self,
+        ticker: str,
+        date: datetime,
+        high: float,
+        low: float,
+        close: float
+    ) -> Optional[Dict]:
+        """
+        Check if stop loss or take profit was hit intraday.
+        
+        Logic:
+        1. Check if low <= stop_loss → STOP_LOSS exit
+        2. Check if high >= take_profit → TAKE_PROFIT exit
+        3. Update position tracking (highest/lowest prices)
+        4. Increment days_held
+        
+        Note: SL checked before TP (conservative assumption)
+        
+        Returns trade record if position closed, None otherwise.
+        """
+        if ticker not in self.positions:
+            return None
+        
+        pos = self.positions[ticker]
+        
+        # Update tracking
+        pos.update_tracking(close)
+        pos.days_held += 1
+        
+        exit_price = None
+        exit_reason = None
+        
+        # Check stop loss first (use intraday low)
+        if USE_STOP_LOSS and low <= pos.stop_loss:
+            # Conservative: assume exit at stop loss price
+            exit_price = pos.stop_loss
+            exit_reason = 'STOP_LOSS'
+            
+            logger.debug(f"  SL triggered: {ticker} low={low:.2f} <= SL={pos.stop_loss:.2f}")
+        
+        # Check take profit (use intraday high)
+        elif USE_TAKE_PROFIT and high >= pos.take_profit:
+            # Conservative: assume exit at take profit price
+            exit_price = pos.take_profit
+            exit_reason = 'TAKE_PROFIT'
+            
+            logger.debug(f"  TP triggered: {ticker} high={high:.2f} >= TP={pos.take_profit:.2f}")
+        
+        if exit_price is not None:
+            return self.close_position(
+                ticker, date, exit_price, exit_reason
+            )
+        
+        return None
     
     def close_position(
         self,
-        symbol: str,
-        date: pd.Timestamp,
+        ticker: str,
+        date: datetime,
         price: float,
-        reason: str = "SIGNAL_EXIT"
-    ) -> Optional[Dict]:
+        reason: str
+    ) -> Dict:
         """
-        Close an existing position
+        Close a position.
         
-        Args:
-            symbol: Stock ticker
-            date: Exit date
-            price: Exit price
-            reason: Exit reason
+        Reasons: 
+        - 'STOP_LOSS': Stop loss triggered
+        - 'TAKE_PROFIT': Take profit triggered
+        - 'TIME_EXIT': Maximum hold time reached
+        - 'REGIME_EXIT': Regime change forced exit
+        - 'QUALITY_EXIT': Score deterioration
+        - 'EOD': End of backtest
         
-        Returns:
-            Trade result dict or None
+        Returns complete trade record with P&L and metrics.
         """
-        if symbol not in self.positions:
-            logger.warning(f"Cannot close {symbol}: position not found")
-            return None
+        if ticker not in self.positions:
+            raise ValueError(f"No position in {ticker}")
         
-        pos = self.positions[symbol]
+        pos = self.positions[ticker]
         
-        # Apply slippage to exit price
-        exit_price = price * (1 - self.slippage)
-        
-        # Calculate P/L
-        proceeds = pos['shares'] * exit_price
-        cost = pos['cost_basis']
-        pl = proceeds - cost
-        pl_pct = (pl / cost) * 100 if cost > 0 else 0
+        # Calculate exit with slippage (negative for sells)
+        actual_exit_price = price * (1 - SLIPPAGE_PCT)
+        proceeds = pos.shares * actual_exit_price
+        commission = proceeds * COMMISSION_PCT
+        net_proceeds = proceeds - commission
         
         # Add to cash
-        self.cash += proceeds
+        self.cash += net_proceeds
         
-        # Calculate hold time
-        hold_days = (date - pos['entry_date']).days
+        # Calculate P&L
+        cost_basis = pos.get_cost_basis()
+        pnl = net_proceeds - cost_basis
+        pnl_pct = (actual_exit_price / pos.entry_price - 1) * 100
         
-        # Record trade
+        # Calculate metrics
+        holding_period_return = pnl_pct
+        r_multiple = pnl / ((pos.entry_price - pos.stop_loss) * pos.shares) if pos.stop_loss > 0 else 0
+        
+        # Update tracking
+        self.total_trades += 1
+        if pnl > 0:
+            self.winning_trades += 1
+        self.total_commissions += commission
+        self.total_slippage_cost += abs(actual_exit_price - price) * pos.shares
+        
+        # Create comprehensive trade record
         trade = {
-            'ticker': symbol,
-            'sector': pos['sector'],
-            'entry_date': pos['entry_date'],
-            'exit_date': date,
-            'entry_price': pos['entry_price'],
-            'exit_price': exit_price,
-            'shares': pos['shares'],
-            'pl': pl,
-            'pl_pct': pl_pct,
-            'hold_days': hold_days,
-            'reason': reason,
-            'entry_reason': pos['entry_reason'],
-            'action': 'SELL',
             'date': date,
+            'ticker': ticker,
+            'action': 'SELL',
+            'price': actual_exit_price,
+            'shares': pos.shares,
+            'value': proceeds,
+            'commission': commission,
+            'slippage_cost': abs(actual_exit_price - price) * pos.shares,
+            'net_proceeds': net_proceeds,
+            
+            # Entry details
+            'entry_date': pos.entry_date,
+            'entry_price': pos.entry_price,
+            'cost_basis': cost_basis,
+            
+            # P&L
+            'pnl': pnl,
+            'pnl_pct': pnl_pct,
+            'holding_period_return': holding_period_return,
+            'r_multiple': r_multiple,
+            
+            # Risk metrics
+            'days_held': pos.days_held,
+            'reason': reason,
+            'stop_loss': pos.stop_loss,
+            'take_profit': pos.take_profit,
+            'highest_price': pos.highest_price,
+            'lowest_price': pos.lowest_price,
+            'max_unrealized_gain': pos.max_unrealized_gain,
+            'max_unrealized_loss': pos.max_unrealized_loss,
+            
+            # Context
+            'regime': pos.regime,
+            'sector': pos.sector,
+            'entry_score': pos.score,
+            'atr': pos.atr,
         }
         
-        self.trades_history.append(trade)
+        # Store closed position
+        self.closed_positions.append(trade)
         
-        # Remove position
-        del self.positions[symbol]
-        
-        logger.debug(
-            f"[Portfolio] CLOSE {symbol} @ ${exit_price:.2f} "
-            f"P/L: ${pl:.2f} ({pl_pct:+.2f}%) "
-            f"[{reason}]"
-        )
+        # Remove from positions
+        del self.positions[ticker]
         
         return trade
     
+    def check_minimum_hold(self, ticker: str, regime: str) -> bool:
+        """Check if position has been held for minimum days."""
+        if ticker not in self.positions:
+            return True
+        
+        pos = self.positions[ticker]
+        min_days = REGIME_MIN_HOLD_DAYS.get(regime, DEFAULT_MIN_HOLD_DAYS)
+        
+        return pos.days_held >= min_days
     
-    def update_market_value(self, date: pd.Timestamp, prices: Dict[str, float]):
-        """
-        Update portfolio value with current prices
+    def get_sector_positions(self) -> Dict[str, int]:
+        """Get count of positions per sector."""
+        sector_counts = {}
+        for pos in self.positions.values():
+            sector = pos.sector or 'Unknown'
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        return sector_counts
+    
+    def get_sector_exposure(self, current_prices: Dict[str, float]) -> Dict[str, float]:
+        """Get dollar exposure per sector."""
+        sector_exposure = {}
+        for pos in self.positions.values():
+            sector = pos.sector or 'Unknown'
+            value = pos.get_position_value(current_prices.get(pos.ticker, pos.entry_price))
+            sector_exposure[sector] = sector_exposure.get(sector, 0) + value
+        return sector_exposure
+    
+    def record_daily_value(
+        self,
+        date: datetime,
+        current_prices: Dict[str, float],
+        regime: str
+    ):
+        """Record daily portfolio value and metrics."""
+        total_value = self.get_total_value(current_prices)
+        positions_value = self.get_positions_value(current_prices)
         
-        Args:
-            date: Current date
-            prices: Dict of symbol -> price
-        """
-        # Calculate position values
-        position_value = 0.0
-        for symbol, pos in self.positions.items():
-            if symbol in prices:
-                position_value += pos['shares'] * prices[symbol]
+        # Update peak
+        if total_value > self.peak_value:
+            self.peak_value = total_value
         
-        # Total value
-        self.total_value = self.cash + position_value
+        # Calculate drawdown
+        drawdown = (total_value / self.peak_value - 1) * 100 if self.peak_value > 0 else 0
         
-        # Update drawdown
-        if self.total_value > self.peak_value:
-            self.peak_value = self.total_value
-            self.current_drawdown = 0.0
-        else:
-            self.current_drawdown = (self.total_value - self.peak_value) / self.peak_value
+        # Calculate exposure
+        exposure_pct = (positions_value / total_value * 100) if total_value > 0 else 0
         
-        # Update rolling metrics
-        self._update_rolling_metrics()
+        # Update position tracking
+        for pos in self.positions.values():
+            current_price = current_prices.get(pos.ticker, pos.entry_price)
+            pos.update_tracking(current_price)
         
-        # Record equity curve
-        self.equity_curve.append({
+        self.equity_history.append({
             'date': date,
+            'total_value': total_value,
             'cash': self.cash,
-            'position_value': position_value,
-            'total_value': self.total_value,
+            'positions_value': positions_value,
             'num_positions': len(self.positions),
-            'drawdown': self.current_drawdown,
+            'regime': regime,
+            'peak_value': self.peak_value,
+            'drawdown': drawdown,
+            'exposure_pct': exposure_pct,
         })
     
-    
-    def _update_rolling_metrics(self):
-        """
-        Update rolling performance metrics for adaptive sizing
-        """
-        if len(self.equity_curve) < 2:
-            return
-        
-        # Calculate daily return
-        prev_value = self.equity_curve[-2]['total_value']
-        curr_value = self.total_value
-        daily_return = (curr_value - prev_value) / prev_value if prev_value > 0 else 0
-        
-        # Store recent returns (60-day window)
-        self.recent_returns.append(daily_return)
-        if len(self.recent_returns) > 60:
-            self.recent_returns.pop(0)
-        
-        # Calculate rolling Sharpe (if enough data)
-        if len(self.recent_returns) >= 30:
-            returns = np.array(self.recent_returns)
-            self.rolling_volatility = np.std(returns) * np.sqrt(252)
-            
-            if self.rolling_volatility > 0:
-                mean_return = np.mean(returns) * 252
-                self.rolling_sharpe = mean_return / self.rolling_volatility
-            else:
-                self.rolling_sharpe = 0.0
-    
-    
     def get_equity_curve(self) -> pd.DataFrame:
-        """Get equity curve as DataFrame"""
-        return pd.DataFrame(self.equity_curve)
-    
+        """Get equity curve as DataFrame."""
+        return pd.DataFrame(self.equity_history)
     
     def get_trades_history(self) -> pd.DataFrame:
-        """Get trades history as DataFrame"""
-        return pd.DataFrame(self.trades_history)
+        """Get all closed trades as DataFrame."""
+        if not self.closed_positions:
+            return pd.DataFrame()
+        return pd.DataFrame(self.closed_positions)
     
+    def get_current_positions(self, current_prices: Dict[str, float] = None) -> pd.DataFrame:
+        """Get current open positions as DataFrame."""
+        if not self.positions:
+            return pd.DataFrame()
+        
+        if current_prices is None:
+            current_prices = {}
+        
+        positions_list = []
+        for ticker, pos in self.positions.items():
+            current_price = current_prices.get(ticker, pos.entry_price)
+            pos.update_tracking(current_price)
+            
+            positions_list.append({
+                'ticker': ticker,
+                'entry_date': pos.entry_date,
+                'entry_price': pos.entry_price,
+                'current_price': current_price,
+                'shares': pos.shares,
+                'cost_basis': pos.get_cost_basis(),
+                'current_value': pos.get_position_value(current_price),
+                'unrealized_pnl': pos.unrealized_pnl,
+                'unrealized_pnl_pct': pos.unrealized_pnl_pct,
+                'stop_loss': pos.stop_loss,
+                'take_profit': pos.take_profit,
+                'distance_to_sl': pos.distance_to_stop_loss(current_price),
+                'distance_to_tp': pos.distance_to_take_profit(current_price),
+                'days_held': pos.days_held,
+                'regime': pos.regime,
+                'sector': pos.sector,
+                'score': pos.score,
+            })
+        
+        return pd.DataFrame(positions_list)
     
-    def get_current_positions(self) -> Dict:
-        """Get current positions"""
-        return self.positions.copy()
-    
-    
-    def get_summary(self) -> Dict:
-        """Get portfolio summary"""
+    def get_summary_stats(self) -> Dict:
+        """Get portfolio summary statistics."""
+        trades_df = self.get_trades_history()
+        
+        if trades_df.empty:
+            return {
+                'total_trades': 0,
+                'winning_trades': 0,
+                'losing_trades': 0,
+                'win_rate': 0.0,
+                'avg_win_pct': 0.0,
+                'avg_loss_pct': 0.0,
+                'avg_win_dollars': 0.0,
+                'avg_loss_dollars': 0.0,
+                'profit_factor': 0.0,
+                'avg_hold_days': 0.0,
+                'total_commissions': self.total_commissions,
+                'total_slippage': self.total_slippage_cost,
+            }
+        
+        sell_trades = trades_df[trades_df['action'] == 'SELL']
+        wins = sell_trades[sell_trades['pnl'] > 0]
+        losses = sell_trades[sell_trades['pnl'] < 0]
+        
+        win_rate = len(wins) / len(sell_trades) * 100 if len(sell_trades) > 0 else 0
+        avg_win_pct = wins['pnl_pct'].mean() if len(wins) > 0 else 0
+        avg_loss_pct = losses['pnl_pct'].mean() if len(losses) > 0 else 0
+        avg_win_dollars = wins['pnl'].mean() if len(wins) > 0 else 0
+        avg_loss_dollars = losses['pnl'].mean() if len(losses) > 0 else 0
+        
+        total_wins = wins['pnl'].sum() if len(wins) > 0 else 0
+        total_losses = abs(losses['pnl'].sum()) if len(losses) > 0 else 1
+        profit_factor = total_wins / total_losses if total_losses > 0 else 0
+        
+        avg_hold_days = sell_trades['days_held'].mean() if len(sell_trades) > 0 else 0
+        
         return {
-            'total_value': self.total_value,
-            'cash': self.cash,
-            'num_positions': len(self.positions),
-            'current_drawdown': self.current_drawdown,
-            'rolling_sharpe': self.rolling_sharpe,
-            'rolling_volatility': self.rolling_volatility,
+            'total_trades': len(sell_trades),
+            'winning_trades': len(wins),
+            'losing_trades': len(losses),
+            'win_rate': win_rate,
+            'avg_win_pct': avg_win_pct,
+            'avg_loss_pct': avg_loss_pct,
+            'avg_win_dollars': avg_win_dollars,
+            'avg_loss_dollars': avg_loss_dollars,
+            'profit_factor': profit_factor,
+            'avg_hold_days': avg_hold_days,
+            'total_commissions': self.total_commissions,
+            'total_slippage': self.total_slippage_cost,
         }

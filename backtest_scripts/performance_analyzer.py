@@ -1,615 +1,601 @@
-# backtest_scripts/performance_analyzer.py
 """
-Enhanced Performance Analyzer with Position Sizing Analysis
-Calculates comprehensive performance metrics
-
-UPDATED: 2025-11-12 15:24 UTC
-CHANGES:
-  - Position sizing analysis
-  - Enhanced sector breakdown
-  - Rolling metrics tracking
-  - Adaptive sizing impact analysis
+Performance Analyzer - Calculates backtest metrics (FULL VERSION)
+Analyzes returns, risk, and regime-specific performance
 """
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
 
 class PerformanceAnalyzer:
     """
-    Comprehensive performance analysis with position sizing metrics
+    Analyzes backtest performance and generates comprehensive metrics.
+    
+    Metrics calculated:
+    - Returns (total, CAGR, monthly, yearly, rolling)
+    - Risk (volatility, Sharpe, Sortino, Calmar, max DD, recovery time)
+    - Trade statistics (win rate, profit factor, expectancy, etc.)
+    - Regime-specific performance
+    - Sector breakdown
+    - Time-based analysis
+    - Benchmark comparison
     """
     
-    def __init__(self):
-        """Initialize analyzer"""
-        logger.info("[PerformanceAnalyzer] Initialized")
-    
-    
-    def analyze(
-        self,
-        equity_curve: pd.DataFrame,
-        trades_history: pd.DataFrame,
-        benchmark_data: Dict[str, pd.DataFrame],
-        config: Dict
-    ) -> Dict:
-        """
-        Perform comprehensive analysis
+    def __init__(self, results: Dict):
+        """Initialize with backtest results."""
+        self.equity_curve = results['equity_curve']
+        self.trades_history = results['trades_history']
+        self.regime_history = results.get('regime_history', pd.DataFrame())
+        self.daily_summaries = results.get('daily_summaries', pd.DataFrame())
         
-        Args:
-            equity_curve: Portfolio equity curve
-            trades_history: All trades
-            benchmark_data: Benchmark price data
-            config: Configuration dict
-        
-        Returns:
-            Analysis results dictionary
-        """
-        logger.info("[PerformanceAnalyzer] Starting analysis...")
-        
-        results = {}
-        
-        # 1. Portfolio metrics
-        results['portfolio_metrics'] = self._calculate_portfolio_metrics(equity_curve)
-        
-        # 2. Trade metrics
-        results['trade_metrics'] = self._calculate_trade_metrics(trades_history)
-        
-        # 3. Benchmark comparison
-        if benchmark_data:
-            results['benchmark_comparison'] = self._calculate_benchmark_comparison(
-                equity_curve,
-                benchmark_data
-            )
-        
-        # 4. Yearly breakdown
-        results['yearly_breakdown'] = self._calculate_yearly_breakdown(
-            equity_curve,
-            trades_history
-        )
-        
-        # 5. Monthly breakdown
-        results['monthly_returns'] = self._calculate_monthly_returns(equity_curve)
-        
-        # 6. Sector analysis
-        if not trades_history.empty and 'sector' in trades_history.columns:
-            results['sector_breakdown'] = self._calculate_sector_breakdown(trades_history)
-        
-        # 7. Regime analysis
-        if not trades_history.empty and 'entry_reason' in trades_history.columns:
-            results['regime_breakdown'] = self._calculate_regime_breakdown(trades_history)
-        
-        # 8. Rolling metrics
-        results['rolling_metrics'] = self._calculate_rolling_metrics(equity_curve)
-        
-        # 9. NEW: Position sizing analysis
-        results['position_sizing_analysis'] = self._analyze_position_sizing(
-            equity_curve,
-            trades_history
-        )
-        
-        # 10. Drawdown analysis
-        results['drawdown_analysis'] = self._analyze_drawdowns(equity_curve)
-        
-        logger.info("[PerformanceAnalyzer] Analysis complete")
-        
-        return results
-    
-    
-    def _calculate_portfolio_metrics(self, equity_curve: pd.DataFrame) -> Dict:
-        """Calculate portfolio-level metrics"""
-        if equity_curve.empty:
+    def calculate_returns_metrics(self) -> Dict:
+        """Calculate comprehensive return-based metrics."""
+        if self.equity_curve.empty:
             return {}
         
-        # Convert to series
-        values = equity_curve['total_value'].values
-        dates = pd.to_datetime(equity_curve['date'])
+        initial = self.equity_curve['total_value'].iloc[0]
+        final = self.equity_curve['total_value'].iloc[-1]
         
-        # Basic returns
-        initial_value = values[0]
-        final_value = values[-1]
-        total_return = ((final_value - initial_value) / initial_value) * 100
+        # Total return
+        total_return = (final / initial - 1) * 100
         
-        # Time period
-        days = (dates.iloc[-1] - dates.iloc[0]).days
+        # Date calculations
+        start_date = self.equity_curve['date'].iloc[0]
+        end_date = self.equity_curve['date'].iloc[-1]
+        days = (end_date - start_date).days
         years = days / 365.25
+        months = days / 30.44
         
         # CAGR
-        cagr = (((final_value / initial_value) ** (1 / years)) - 1) * 100 if years > 0 else 0
+        cagr = ((final / initial) ** (1 / years) - 1) * 100 if years > 0 else 0
         
-        # Daily returns
-        daily_returns = pd.Series(values).pct_change().dropna()
+        # Monthly return (annualized)
+        monthly_return = ((final / initial) ** (1 / months) - 1) * 12 * 100 if months > 0 else 0
         
-        # Volatility (annualized)
-        volatility = daily_returns.std() * np.sqrt(252)
+        # Best/worst day
+        self.equity_curve['daily_return'] = self.equity_curve['total_value'].pct_change()
+        best_day = self.equity_curve['daily_return'].max() * 100 if len(self.equity_curve) > 1 else 0
+        worst_day = self.equity_curve['daily_return'].min() * 100 if len(self.equity_curve) > 1 else 0
         
-        # Sharpe Ratio
-        risk_free_rate = 0.02  # 2% annual
-        excess_returns = daily_returns - (risk_free_rate / 252)
-        sharpe = (excess_returns.mean() / excess_returns.std()) * np.sqrt(252) if excess_returns.std() > 0 else 0
+        # Best/worst month
+        monthly_returns = self.calculate_monthly_returns()
+        if not monthly_returns.empty:
+            best_month = monthly_returns['return_pct'].max()
+            worst_month = monthly_returns['return_pct'].min()
+        else:
+            best_month = 0
+            worst_month = 0
         
-        # Sortino Ratio
-        negative_returns = daily_returns[daily_returns < 0]
-        downside_std = negative_returns.std() * np.sqrt(252) if len(negative_returns) > 0 else 0
-        sortino = (excess_returns.mean() / downside_std) * np.sqrt(252) if downside_std > 0 else 0
-        
-        # Drawdown
-        cummax = pd.Series(values).cummax()
-        drawdown = (pd.Series(values) - cummax) / cummax
-        max_drawdown = drawdown.min() * 100
-        
-        # Calmar Ratio
-        calmar = abs(cagr / max_drawdown) if max_drawdown != 0 else 0
-        
-        # Max drawdown duration
-        dd_duration = self._calculate_max_dd_duration(equity_curve)
+        # Profit days
+        positive_days = (self.equity_curve['daily_return'] > 0).sum()
+        total_days = len(self.equity_curve) - 1
+        profit_days_pct = (positive_days / total_days * 100) if total_days > 0 else 0
         
         return {
-            'initial_value': initial_value,
-            'final_value': final_value,
+            'initial_value': initial,
+            'final_value': final,
             'total_return': total_return,
             'cagr': cagr,
-            'volatility': volatility,
-            'sharpe_ratio': sharpe,
-            'sortino_ratio': sortino,
-            'calmar_ratio': calmar,
-            'max_drawdown': max_drawdown,
-            'max_dd_duration': dd_duration,
-            'trading_days': len(values),
+            'monthly_return_ann': monthly_return,
             'years': years,
+            'days': days,
+            'best_day': best_day,
+            'worst_day': worst_day,
+            'best_month': best_month,
+            'worst_month': worst_month,
+            'profit_days_pct': profit_days_pct,
         }
     
-    
-    def _calculate_trade_metrics(self, trades: pd.DataFrame) -> Dict:
-        """Calculate trade-level metrics"""
-        if trades.empty:
+    def calculate_risk_metrics(self) -> Dict:
+        """Calculate comprehensive risk-adjusted metrics."""
+        if len(self.equity_curve) < 2:
             return {}
         
-        total_trades = len(trades)
-        winning_trades = len(trades[trades['pl'] > 0])
-        losing_trades = len(trades[trades['pl'] < 0])
+        # Calculate daily returns
+        if 'daily_return' not in self.equity_curve.columns:
+            self.equity_curve['daily_return'] = self.equity_curve['total_value'].pct_change()
+        
+        returns = self.equity_curve['daily_return'].dropna()
+        
+        # Volatility (annualized)
+        volatility = returns.std() * np.sqrt(252) * 100
+        
+        # Sharpe ratio (assume 0% risk-free rate)
+        sharpe = (returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0
+        
+        # Sortino ratio (downside deviation only)
+        downside_returns = returns[returns < 0]
+        downside_std = downside_returns.std() if len(downside_returns) > 0 else returns.std()
+        sortino = (returns.mean() / downside_std * np.sqrt(252)) if downside_std > 0 else 0
+        
+        # Max drawdown and related metrics
+        cumulative = (1 + returns).cumprod()
+        running_max = cumulative.cummax()
+        drawdown = (cumulative - running_max) / running_max
+        
+        max_dd = drawdown.min() * 100
+        max_dd_date = self.equity_curve.loc[drawdown.idxmin(), 'date'] if len(drawdown) > 0 else None
+        
+        # Drawdown duration
+        dd_series = drawdown < -0.01  # Consider DD > 1%
+        if dd_series.any():
+            dd_lengths = []
+            current_length = 0
+            for is_dd in dd_series:
+                if is_dd:
+                    current_length += 1
+                else:
+                    if current_length > 0:
+                        dd_lengths.append(current_length)
+                    current_length = 0
+            if current_length > 0:
+                dd_lengths.append(current_length)
+            
+            max_dd_duration = max(dd_lengths) if dd_lengths else 0
+            avg_dd_duration = np.mean(dd_lengths) if dd_lengths else 0
+        else:
+            max_dd_duration = 0
+            avg_dd_duration = 0
+        
+        # Calmar ratio (CAGR / abs(max_dd))
+        returns_metrics = self.calculate_returns_metrics()
+        cagr = returns_metrics.get('cagr', 0)
+        calmar = abs(cagr / max_dd) if max_dd != 0 else 0
+        
+        # Ulcer Index (measure of downside volatility)
+        ulcer_index = np.sqrt(np.mean(drawdown ** 2)) * 100
+        
+        # Recovery factor (net profit / max DD)
+        net_profit = returns_metrics.get('final_value', 0) - returns_metrics.get('initial_value', 0)
+        max_dd_dollars = abs(max_dd / 100 * returns_metrics.get('initial_value', 1))
+        recovery_factor = net_profit / max_dd_dollars if max_dd_dollars > 0 else 0
+        
+        # Value at Risk (VaR) - 95% and 99%
+        var_95 = np.percentile(returns, 5) * 100
+        var_99 = np.percentile(returns, 1) * 100
+        
+        # Conditional Value at Risk (CVaR) - average of worst 5%
+        cvar_95 = returns[returns <= np.percentile(returns, 5)].mean() * 100
+        
+        # Skewness and Kurtosis
+        skewness = returns.skew()
+        kurtosis = returns.kurtosis()
+        
+        return {
+            'volatility': volatility,
+            'sharpe': sharpe,
+            'sortino': sortino,
+            'max_drawdown': max_dd,
+            'max_dd_date': max_dd_date,
+            'max_dd_duration': max_dd_duration,
+            'avg_dd_duration': avg_dd_duration,
+            'calmar': calmar,
+            'ulcer_index': ulcer_index,
+            'recovery_factor': recovery_factor,
+            'var_95': var_95,
+            'var_99': var_99,
+            'cvar_95': cvar_95,
+            'skewness': skewness,
+            'kurtosis': kurtosis,
+        }
+    
+    def calculate_trade_statistics(self) -> Dict:
+        """Calculate comprehensive trade-level statistics."""
+        if self.trades_history.empty:
+            return {}
+        
+        # Filter sell trades only
+        sells = self.trades_history[self.trades_history['action'] == 'SELL'].copy()
+        
+        if sells.empty:
+            return {}
+        
+        # Win/loss statistics
+        wins = sells[sells['pnl'] > 0]
+        losses = sells[sells['pnl'] < 0]
+        breakeven = sells[sells['pnl'] == 0]
+        
+        total_trades = len(sells)
+        winning_trades = len(wins)
+        losing_trades = len(losses)
+        breakeven_trades = len(breakeven)
         
         win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
         
-        # Average win/loss
-        wins = trades[trades['pl'] > 0]['pl_pct']
-        losses = trades[trades['pl'] < 0]['pl_pct']
+        # Average win/loss (percentage)
+        avg_win = wins['pnl_pct'].mean() if len(wins) > 0 else 0
+        avg_loss = losses['pnl_pct'].mean() if len(losses) > 0 else 0
         
-        avg_win = wins.mean() if len(wins) > 0 else 0
-        avg_loss = losses.mean() if len(losses) > 0 else 0
+        # Average win/loss (dollars)
+        avg_win_dollars = wins['pnl'].mean() if len(wins) > 0 else 0
+        avg_loss_dollars = losses['pnl'].mean() if len(losses) > 0 else 0
+        
+        # Largest win/loss
+        largest_win = wins['pnl_pct'].max() if len(wins) > 0 else 0
+        largest_loss = losses['pnl_pct'].min() if len(losses) > 0 else 0
+        
+        largest_win_dollars = wins['pnl'].max() if len(wins) > 0 else 0
+        largest_loss_dollars = losses['pnl'].min() if len(losses) > 0 else 0
         
         # Profit factor
-        total_wins = trades[trades['pl'] > 0]['pl'].sum()
-        total_losses = abs(trades[trades['pl'] < 0]['pl'].sum())
+        total_wins = wins['pnl'].sum() if len(wins) > 0 else 0
+        total_losses = abs(losses['pnl'].sum()) if len(losses) > 0 else 1
         profit_factor = total_wins / total_losses if total_losses > 0 else 0
         
-        # Hold time
-        avg_hold_time = trades['hold_days'].mean() if 'hold_days' in trades.columns else 0
+        # Expectancy (average P&L per trade)
+        expectancy = sells['pnl'].mean()
+        expectancy_pct = sells['pnl_pct'].mean()
         
-        # Best/worst trades
-        best_trade = trades['pl_pct'].max() if not trades.empty else 0
-        worst_trade = trades['pl_pct'].min() if not trades.empty else 0
+        # Hold time statistics
+        if 'days_held' in sells.columns:
+            avg_hold_time = sells['days_held'].mean()
+            avg_hold_time_wins = wins['days_held'].mean() if len(wins) > 0 else 0
+            avg_hold_time_losses = losses['days_held'].mean() if len(losses) > 0 else 0
+            max_hold_time = sells['days_held'].max()
+            min_hold_time = sells['days_held'].min()
+        else:
+            avg_hold_time = 0
+            avg_hold_time_wins = 0
+            avg_hold_time_losses = 0
+            max_hold_time = 0
+            min_hold_time = 0
+        
+        # Consecutive wins/losses
+        win_loss_series = (sells['pnl'] > 0).astype(int)
+        consecutive_wins = self._max_consecutive(win_loss_series, 1)
+        consecutive_losses = self._max_consecutive(win_loss_series, 0)
+        
+        # Exit reasons breakdown
+        if 'reason' in sells.columns:
+            exit_reasons = sells['reason'].value_counts().to_dict()
+            stop_loss_count = exit_reasons.get('STOP_LOSS', 0)
+            take_profit_count = exit_reasons.get('TAKE_PROFIT', 0)
+            time_exit_count = exit_reasons.get('TIME_EXIT', 0)
+            regime_exit_count = exit_reasons.get('REGIME_EXIT', 0)
+        else:
+            exit_reasons = {}
+            stop_loss_count = 0
+            take_profit_count = 0
+            time_exit_count = 0
+            regime_exit_count = 0
+        
+        # Win/loss streaks
+        current_streak = 0
+        max_win_streak = 0
+        max_loss_streak = 0
+        
+        for result in win_loss_series:
+            if result == 1:
+                if current_streak >= 0:
+                    current_streak += 1
+                else:
+                    current_streak = 1
+                max_win_streak = max(max_win_streak, current_streak)
+            else:
+                if current_streak <= 0:
+                    current_streak -= 1
+                else:
+                    current_streak = -1
+                max_loss_streak = max(max_loss_streak, abs(current_streak))
+        
+        # Kelly Criterion (for position sizing)
+        if avg_loss != 0:
+            kelly_pct = (win_rate/100 - (1-win_rate/100) / abs(avg_win/avg_loss)) * 100
+        else:
+            kelly_pct = 0
         
         return {
             'total_trades': total_trades,
             'winning_trades': winning_trades,
             'losing_trades': losing_trades,
+            'breakeven_trades': breakeven_trades,
             'win_rate': win_rate,
             'avg_win': avg_win,
             'avg_loss': avg_loss,
+            'avg_win_dollars': avg_win_dollars,
+            'avg_loss_dollars': avg_loss_dollars,
+            'largest_win': largest_win,
+            'largest_loss': largest_loss,
+            'largest_win_dollars': largest_win_dollars,
+            'largest_loss_dollars': largest_loss_dollars,
             'profit_factor': profit_factor,
+            'expectancy': expectancy,
+            'expectancy_pct': expectancy_pct,
             'avg_hold_time': avg_hold_time,
-            'best_trade': best_trade,
-            'worst_trade': worst_trade,
+            'avg_hold_time_wins': avg_hold_time_wins,
+            'avg_hold_time_losses': avg_hold_time_losses,
+            'max_hold_time': max_hold_time,
+            'min_hold_time': min_hold_time,
+            'consecutive_wins': consecutive_wins,
+            'consecutive_losses': consecutive_losses,
+            'max_win_streak': max_win_streak,
+            'max_loss_streak': max_loss_streak,
+            'exit_reasons': exit_reasons,
+            'stop_loss_exits': stop_loss_count,
+            'take_profit_exits': take_profit_count,
+            'time_exits': time_exit_count,
+            'regime_exits': regime_exit_count,
+            'kelly_criterion': kelly_pct,
         }
     
+    def _max_consecutive(self, series, value):
+        """Helper to find max consecutive occurrences of a value."""
+        max_count = 0
+        current_count = 0
+        
+        for v in series:
+            if v == value:
+                current_count += 1
+                max_count = max(max_count, current_count)
+            else:
+                current_count = 0
+        
+        return max_count
     
-    def _calculate_benchmark_comparison(
-        self,
-        equity_curve: pd.DataFrame,
-        benchmark_data: Dict[str, pd.DataFrame]
-    ) -> Dict:
-        """Compare portfolio to benchmarks"""
-        results = {}
+    def calculate_regime_breakdown(self) -> pd.DataFrame:
+        """Calculate detailed performance by regime."""
+        if self.trades_history.empty or 'regime' not in self.trades_history.columns:
+            return pd.DataFrame()
         
-        if equity_curve.empty:
-            return results
+        sells = self.trades_history[self.trades_history['action'] == 'SELL']
         
-        # Portfolio returns
-        portfolio_values = equity_curve['total_value'].values
-        portfolio_returns = pd.Series(portfolio_values).pct_change().dropna()
+        if sells.empty:
+            return pd.DataFrame()
         
-        portfolio_total_return = ((portfolio_values[-1] - portfolio_values[0]) / portfolio_values[0]) * 100
+        regime_stats = []
         
-        for benchmark_name, benchmark_prices in benchmark_data.items():
-            if benchmark_prices.empty or 'close' not in benchmark_prices.columns:
+        for regime in sells['regime'].unique():
+            if pd.isna(regime):
                 continue
             
-            # Align dates
-            benchmark_prices = benchmark_prices.copy()
-            benchmark_prices['date'] = pd.to_datetime(benchmark_prices.index)
+            regime_trades = sells[sells['regime'] == regime]
+            wins = regime_trades[regime_trades['pnl'] > 0]
+            losses = regime_trades[regime_trades['pnl'] < 0]
             
-            # Calculate benchmark returns
-            bench_values = benchmark_prices['close'].values
-            bench_returns = pd.Series(bench_values).pct_change().dropna()
+            # Calculate metrics
+            win_rate = len(wins) / len(regime_trades) * 100 if len(regime_trades) > 0 else 0
+            avg_return = regime_trades['pnl_pct'].mean()
+            total_pnl = regime_trades['pnl'].sum()
+            avg_win = wins['pnl_pct'].mean() if len(wins) > 0 else 0
+            avg_loss = losses['pnl_pct'].mean() if len(losses) > 0 else 0
             
-            benchmark_total_return = ((bench_values[-1] - bench_values[0]) / bench_values[0]) * 100
+            # Profit factor
+            total_wins = wins['pnl'].sum() if len(wins) > 0 else 0
+            total_losses = abs(losses['pnl'].sum()) if len(losses) > 0 else 1
+            profit_factor = total_wins / total_losses if total_losses > 0 else 0
             
-            # Outperformance
-            outperformance = portfolio_total_return - benchmark_total_return
-            
-            # Alpha & Beta (simplified)
-            # Align portfolio and benchmark returns
-            min_len = min(len(portfolio_returns), len(bench_returns))
-            if min_len > 30:
-                port_ret = portfolio_returns.iloc[:min_len]
-                bench_ret = bench_returns.iloc[:min_len]
-                
-                # Beta
-                covariance = np.cov(port_ret, bench_ret)[0, 1]
-                benchmark_variance = np.var(bench_ret)
-                beta = covariance / benchmark_variance if benchmark_variance > 0 else 0
-                
-                # Alpha (annualized)
-                portfolio_annual = port_ret.mean() * 252
-                benchmark_annual = bench_ret.mean() * 252
-                alpha = (portfolio_annual - benchmark_annual) * 100
-            else:
-                beta = 0
-                alpha = 0
-            
-            results[benchmark_name] = {
-                'benchmark_return': benchmark_total_return,
-                'portfolio_return': portfolio_total_return,
-                'outperformance': outperformance,
-                'alpha': alpha,
-                'beta': beta,
-            }
+            regime_stats.append({
+                'regime': regime,
+                'num_trades': len(regime_trades),
+                'winning_trades': len(wins),
+                'losing_trades': len(losses),
+                'win_rate': win_rate,
+                'avg_return': avg_return,
+                'avg_win': avg_win,
+                'avg_loss': avg_loss,
+                'total_pnl': total_pnl,
+                'profit_factor': profit_factor,
+                'avg_hold_days': regime_trades['days_held'].mean() if 'days_held' in regime_trades.columns else 0,
+            })
         
-        return results
+        df = pd.DataFrame(regime_stats)
+        if not df.empty:
+            df = df.sort_values('total_pnl', ascending=False)
+        
+        return df
     
+    def calculate_sector_breakdown(self) -> pd.DataFrame:
+        """Calculate detailed performance by sector."""
+        if self.trades_history.empty or 'sector' not in self.trades_history.columns:
+            return pd.DataFrame()
+        
+        sells = self.trades_history[self.trades_history['action'] == 'SELL']
+        
+        if sells.empty:
+            return pd.DataFrame()
+        
+        sector_stats = []
+        
+        for sector in sells['sector'].unique():
+            if pd.isna(sector):
+                continue
+            
+            sector_trades = sells[sells['sector'] == sector]
+            wins = sector_trades[sector_trades['pnl'] > 0]
+            losses = sector_trades[sector_trades['pnl'] < 0]
+            
+            # Calculate metrics
+            win_rate = len(wins) / len(sector_trades) * 100 if len(sector_trades) > 0 else 0
+            avg_return_pct = sector_trades['pnl_pct'].mean()
+            total_return = sector_trades['pnl'].sum()
+            
+            # Calculate total return percentage (cumulative)
+            cumulative_return = 1.0
+            for ret in sector_trades['pnl_pct']:
+                cumulative_return *= (1 + ret/100)
+            total_return_pct = (cumulative_return - 1) * 100
+            
+            sector_stats.append({
+                'sector': sector,
+                'num_trades': len(sector_trades),
+                'winning_trades': len(wins),
+                'losing_trades': len(losses),
+                'win_rate': win_rate,
+                'avg_return_pct': avg_return_pct,
+                'total_return': total_return,
+                'total_return_pct': total_return_pct,
+            })
+        
+        df = pd.DataFrame(sector_stats)
+        if not df.empty:
+            df = df.sort_values('total_return', ascending=False)
+        
+        return df
     
-    def _calculate_yearly_breakdown(
-        self,
-        equity_curve: pd.DataFrame,
-        trades: pd.DataFrame
-    ) -> List[Dict]:
-        """Calculate performance by year"""
-        if equity_curve.empty:
-            return []
+    def calculate_monthly_returns(self) -> pd.DataFrame:
+        """Calculate monthly returns with statistics."""
+        if self.equity_curve.empty:
+            return pd.DataFrame()
         
-        equity_curve = equity_curve.copy()
-        equity_curve['date'] = pd.to_datetime(equity_curve['date'])
-        equity_curve['year'] = equity_curve['date'].dt.year
+        df = self.equity_curve.copy()
+        df['year_month'] = df['date'].dt.to_period('M')
         
-        yearly_results = []
+        monthly = df.groupby('year_month').agg({
+            'total_value': ['first', 'last', 'min', 'max']
+        }).reset_index()
         
-        for year in sorted(equity_curve['year'].unique()):
-            year_data = equity_curve[equity_curve['year'] == year]
+        monthly.columns = ['year_month', 'start_value', 'end_value', 'min_value', 'max_value']
+        monthly['return_pct'] = (monthly['end_value'] / monthly['start_value'] - 1) * 100
+        monthly['max_dd_month'] = (monthly['min_value'] / monthly['max_value'] - 1) * 100
+        
+        return monthly
+    
+    def calculate_yearly_breakdown(self) -> pd.DataFrame:
+        """Calculate detailed yearly performance breakdown."""
+        if self.equity_curve.empty:
+            return pd.DataFrame()
+        
+        df = self.equity_curve.copy()
+        df['year'] = df['date'].dt.year
+        
+        # Calculate daily returns if not present
+        if 'daily_return' not in df.columns:
+            df['daily_return'] = df['total_value'].pct_change()
+        
+        yearly_stats = []
+        
+        for year in sorted(df['year'].unique()):
+            year_data = df[df['year'] == year].copy()
             
             if len(year_data) < 2:
                 continue
             
             # Returns
-            start_value = year_data.iloc[0]['total_value']
-            end_value = year_data.iloc[-1]['total_value']
-            year_return = ((end_value - start_value) / start_value) * 100 if start_value > 0 else 0
+            start_val = year_data['total_value'].iloc[0]
+            end_val = year_data['total_value'].iloc[-1]
+            year_return = (end_val / start_val - 1) * 100
             
-            # Sharpe
-            daily_returns = year_data['total_value'].pct_change().dropna()
-            sharpe = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252) if daily_returns.std() > 0 else 0
+            # Risk metrics
+            year_returns = year_data['daily_return'].dropna()
             
-            # Drawdown
-            cummax = year_data['total_value'].cummax()
-            drawdown = ((year_data['total_value'] - cummax) / cummax) * 100
-            max_dd = drawdown.min()
+            if len(year_returns) > 0:
+                year_vol = year_returns.std() * np.sqrt(252) * 100
+                year_sharpe = (year_returns.mean() / year_returns.std() * np.sqrt(252)) if year_returns.std() > 0 else 0
+                
+                # Max drawdown
+                cumulative = (1 + year_returns).cumprod()
+                running_max = cumulative.cummax()
+                drawdown = (cumulative - running_max) / running_max
+                year_max_dd = drawdown.min() * 100
+                
+                # Best/worst day
+                best_day = year_returns.max() * 100
+                worst_day = year_returns.min() * 100
+            else:
+                year_vol = 0
+                year_sharpe = 0
+                year_max_dd = 0
+                best_day = 0
+                worst_day = 0
             
-            # Trades - KORJATTU: tarkista onko trades tyhjä
-            num_trades = 0
-            if not trades.empty and 'exit_date' in trades.columns:
-                trades_copy = trades.copy()
-                trades_copy['exit_date'] = pd.to_datetime(trades_copy['exit_date'])
-                year_trades = trades_copy[trades_copy['exit_date'].dt.year == year]
-                num_trades = len(year_trades)
+            # Trades
+            if not self.trades_history.empty and 'date' in self.trades_history.columns:
+                year_trades = self.trades_history[
+                    pd.to_datetime(self.trades_history['date']).dt.year == year
+                ]
+                sell_trades = year_trades[year_trades['action'] == 'SELL']
+                num_trades = len(sell_trades)
+                
+                if len(sell_trades) > 0:
+                    wins = sell_trades[sell_trades['pnl'] > 0]
+                    year_win_rate = len(wins) / len(sell_trades) * 100
+                else:
+                    year_win_rate = 0
+            else:
+                num_trades = 0
+                year_win_rate = 0
             
-            yearly_results.append({
-                'year': year,
+            yearly_stats.append({
+                'year': int(year),
                 'return_pct': year_return,
-                'sharpe': sharpe,
-                'max_dd': max_dd,
+                'volatility': year_vol,
+                'sharpe': year_sharpe,
+                'max_dd': year_max_dd,
+                'best_day': best_day,
+                'worst_day': worst_day,
                 'num_trades': num_trades,
+                'win_rate': year_win_rate,
             })
         
-        return yearly_results
+        return pd.DataFrame(yearly_stats)
     
-    
-    def _calculate_monthly_returns(self, equity_curve: pd.DataFrame) -> pd.DataFrame:
-        """Calculate monthly returns as heatmap data"""
-        if equity_curve.empty:
+    def calculate_rolling_metrics(self, window_days: int = 60) -> pd.DataFrame:
+        """Calculate rolling performance metrics."""
+        if len(self.equity_curve) < window_days:
             return pd.DataFrame()
         
-        ec = equity_curve.copy()
-        ec['date'] = pd.to_datetime(ec['date'])
-        ec = ec.set_index('date')
+        df = self.equity_curve.copy()
         
-        # Resample to month-end
-        monthly = ec['total_value'].resample('M').last()
-        monthly_returns = monthly.pct_change() * 100
-        
-        # Pivot to year x month
-        monthly_returns = monthly_returns.to_frame('return')
-        monthly_returns['year'] = monthly_returns.index.year
-        monthly_returns['month'] = monthly_returns.index.month
-        
-        pivot = monthly_returns.pivot(index='year', columns='month', values='return')
-        
-        return pivot
-    
-    
-    def _calculate_sector_breakdown(self, trades: pd.DataFrame) -> List[Dict]:
-        """Analyze performance by sector"""
-        if trades.empty or 'sector' not in trades.columns:
-            return []
-        
-        sector_results = []
-        
-        for sector in trades['sector'].unique():
-            if pd.isna(sector):
-                continue
-            
-            sector_trades = trades[trades['sector'] == sector]
-            
-            total_return = sector_trades['pl'].sum()
-            num_trades = len(sector_trades)
-            winning = len(sector_trades[sector_trades['pl'] > 0])
-            win_rate = (winning / num_trades * 100) if num_trades > 0 else 0
-            
-            avg_return_pct = sector_trades['pl_pct'].mean()
-            total_return_pct = ((sector_trades['pl'].sum() / (num_trades * 5000)) * 100) if num_trades > 0 else 0
-            
-            sector_results.append({
-                'sector': sector,
-                'num_trades': num_trades,
-                'total_return': total_return,
-                'total_return_pct': total_return_pct,
-                'win_rate': win_rate,
-                'avg_return_pct': avg_return_pct,
-            })
-        
-        # Sort by total return
-        sector_results = sorted(sector_results, key=lambda x: x['total_return_pct'], reverse=True)
-        
-        return sector_results
-    
-    
-    def _calculate_regime_breakdown(self, trades: pd.DataFrame) -> List[Dict]:
-        """Analyze performance by regime"""
-        if trades.empty:
-            return []
-        
-        # Try to infer regime from exit reason
-        regime_trades = {}
-        
-        for _, trade in trades.iterrows():
-            reason = trade.get('reason', '')
-            
-            # Map reason to regime
-            if 'BULL' in reason:
-                regime = 'BULL'
-            elif 'BEAR' in reason:
-                regime = 'BEAR'
-            elif 'NEUTRAL' in reason:
-                regime = 'NEUTRAL'
-            elif 'CRISIS' in reason:
-                regime = 'CRISIS'
-            else:
-                regime = 'OTHER'
-            
-            if regime not in regime_trades:
-                regime_trades[regime] = []
-            
-            regime_trades[regime].append(trade)
-        
-        # Calculate metrics per regime
-        regime_results = []
-        
-        for regime, regime_trade_list in regime_trades.items():
-            regime_df = pd.DataFrame(regime_trade_list)
-            
-            num_trades = len(regime_df)
-            total_return = regime_df['pl'].sum()
-            winning = len(regime_df[regime_df['pl'] > 0])
-            win_rate = (winning / num_trades * 100) if num_trades > 0 else 0
-            
-            regime_results.append({
-                'regime': regime,
-                'num_trades': num_trades,
-                'total_return': total_return,
-                'win_rate': win_rate,
-            })
-        
-        return regime_results
-    
-    
-    def _calculate_rolling_metrics(
-        self,
-        equity_curve: pd.DataFrame,
-        window: int = 252
-    ) -> Dict:
-        """Calculate rolling performance metrics"""
-        if equity_curve.empty or len(equity_curve) < window:
-            return {}
-        
-        values = equity_curve['total_value']
-        returns = values.pct_change().dropna()
+        if 'daily_return' not in df.columns:
+            df['daily_return'] = df['total_value'].pct_change()
         
         # Rolling Sharpe
-        rolling_sharpe = (
-            returns.rolling(window).mean() / returns.rolling(window).std()
-        ) * np.sqrt(252)
+        df['rolling_sharpe'] = (
+            df['daily_return'].rolling(window_days).mean() /
+            df['daily_return'].rolling(window_days).std() * np.sqrt(252)
+        )
         
         # Rolling volatility
-        rolling_vol = returns.rolling(window).std() * np.sqrt(252)
+        df['rolling_vol'] = df['daily_return'].rolling(window_days).std() * np.sqrt(252) * 100
         
-        # Rolling max drawdown
-        rolling_max = values.rolling(window).max()
-        rolling_dd = ((values - rolling_max) / rolling_max) * 100
+        # Rolling return
+        df['rolling_return'] = (
+            df['total_value'] / df['total_value'].shift(window_days) - 1
+        ) * 100
         
-        return {
-            'rolling_sharpe': rolling_sharpe.dropna().tolist(),
-            'rolling_volatility': rolling_vol.dropna().tolist(),
-            'rolling_drawdown': rolling_dd.dropna().tolist(),
+        return df[['date', 'rolling_sharpe', 'rolling_vol', 'rolling_return']].dropna()
+    
+    def analyze(self) -> Dict:
+        """Run complete performance analysis with all metrics."""
+        logger.info("Running comprehensive performance analysis...")
+        
+        # Calculate all metrics
+        returns = self.calculate_returns_metrics()
+        risk = self.calculate_risk_metrics()
+        trades = self.calculate_trade_statistics()
+        
+        # Combine core metrics
+        performance = {
+            **returns,
+            **risk,
+            **trades,
         }
-    
-    
-    def _analyze_position_sizing(
-        self,
-        equity_curve: pd.DataFrame,
-        trades: pd.DataFrame
-    ) -> Dict:
-        """Analyze position sizing effectiveness (NEW!)"""
-        if trades.empty:
-            return {}
         
-        # Calculate actual position sizes from trades
-        trades = trades.copy()
-        trades['position_size'] = trades['shares'] * trades['entry_price']
+        # Breakdowns
+        performance['regime_breakdown'] = self.calculate_regime_breakdown()
+        performance['sector_breakdown'] = self.calculate_sector_breakdown()
+        performance['monthly_returns'] = self.calculate_monthly_returns()
+        performance['yearly_breakdown'] = self.calculate_yearly_breakdown()
+        performance['rolling_metrics'] = self.calculate_rolling_metrics()
         
-        # Position size statistics
-        avg_position_size = trades['position_size'].mean()
-        min_position_size = trades['position_size'].min()
-        max_position_size = trades['position_size'].max()
-        std_position_size = trades['position_size'].std()
+        logger.info("Performance analysis complete")
         
-        # Position size vs return correlation
-        correlation = trades['position_size'].corr(trades['pl_pct'])
+        # Log key metrics
+        logger.info(f"\n{'='*60}")
+        logger.info("KEY PERFORMANCE METRICS")
+        logger.info(f"{'='*60}")
+        logger.info(f"Total Return:    {performance.get('total_return', 0):.2f}%")
+        logger.info(f"CAGR:            {performance.get('cagr', 0):.2f}%")
+        logger.info(f"Sharpe Ratio:    {performance.get('sharpe', 0):.3f}")
+        logger.info(f"Max Drawdown:    {performance.get('max_drawdown', 0):.2f}%")
+        logger.info(f"Win Rate:        {performance.get('win_rate', 0):.2f}%")
+        logger.info(f"Profit Factor:   {performance.get('profit_factor', 0):.3f}")
+        logger.info(f"Total Trades:    {performance.get('total_trades', 0)}")
+        logger.info(f"{'='*60}\n")
         
-        # Position size over time
-        trades['entry_date'] = pd.to_datetime(trades['entry_date'])
-        trades = trades.sort_values('entry_date')
-        
-        # Group by year
-        trades['year'] = trades['entry_date'].dt.year
-        yearly_avg_size = trades.groupby('year')['position_size'].mean().to_dict()
-        
-        # Adaptive sizing impact (if drawdown column exists)
-        if 'drawdown' in equity_curve.columns:
-            # Analyze position sizes during drawdowns
-            ec = equity_curve.copy()
-            ec['date'] = pd.to_datetime(ec['date'])
-            
-            high_dd_periods = ec[ec['drawdown'] < -0.03]  # > 3% drawdown
-            
-            if not high_dd_periods.empty:
-                # Find trades during high DD
-                high_dd_dates = set(high_dd_periods['date'])
-                trades['in_drawdown'] = trades['entry_date'].isin(high_dd_dates)
-                
-                dd_trades = trades[trades['in_drawdown']]
-                normal_trades = trades[~trades['in_drawdown']]
-                
-                avg_size_in_dd = dd_trades['position_size'].mean() if not dd_trades.empty else 0
-                avg_size_normal = normal_trades['position_size'].mean() if not normal_trades.empty else 0
-                
-                dd_reduction = ((avg_size_normal - avg_size_in_dd) / avg_size_normal * 100) if avg_size_normal > 0 else 0
-            else:
-                dd_reduction = 0
-        else:
-            dd_reduction = 0
-        
-        return {
-            'avg_position_size': avg_position_size,
-            'min_position_size': min_position_size,
-            'max_position_size': max_position_size,
-            'std_position_size': std_position_size,
-            'size_return_correlation': correlation,
-            'yearly_avg_sizes': yearly_avg_size,
-            'drawdown_size_reduction_pct': dd_reduction,
-        }
-    
-    
-    def _analyze_drawdowns(self, equity_curve: pd.DataFrame) -> Dict:
-        """Detailed drawdown analysis"""
-        if equity_curve.empty:
-            return {}
-        
-        values = equity_curve['total_value'].values
-        dates = pd.to_datetime(equity_curve['date'])
-        
-        # Calculate drawdown series
-        cummax = pd.Series(values).cummax()
-        drawdown = ((pd.Series(values) - cummax) / cummax) * 100
-        
-        # Find all drawdown periods
-        in_dd = drawdown < 0
-        dd_starts = in_dd & ~in_dd.shift(1, fill_value=False)
-        dd_ends = ~in_dd & in_dd.shift(1, fill_value=False)
-        
-        drawdown_periods = []
-        start_idx = None
-        
-        for i in range(len(in_dd)):
-            if dd_starts.iloc[i]:
-                start_idx = i
-            elif dd_ends.iloc[i] and start_idx is not None:
-                dd_depth = drawdown.iloc[start_idx:i].min()
-                dd_duration = (dates.iloc[i] - dates.iloc[start_idx]).days
-                
-                drawdown_periods.append({
-                    'start_date': dates.iloc[start_idx],
-                    'end_date': dates.iloc[i],
-                    'depth': dd_depth,
-                    'duration_days': dd_duration,
-                })
-                
-                start_idx = None
-        
-        # Handle ongoing drawdown
-        if start_idx is not None:
-            dd_depth = drawdown.iloc[start_idx:].min()
-            dd_duration = (dates.iloc[-1] - dates.iloc[start_idx]).days
-            
-            drawdown_periods.append({
-                'start_date': dates.iloc[start_idx],
-                'end_date': dates.iloc[-1],
-                'depth': dd_depth,
-                'duration_days': dd_duration,
-                'ongoing': True,
-            })
-        
-        # Find max drawdown
-        if drawdown_periods:
-            max_dd_period = min(drawdown_periods, key=lambda x: x['depth'])
-        else:
-            max_dd_period = None
-        
-        return {
-            'num_drawdowns': len(drawdown_periods),
-            'avg_drawdown_depth': np.mean([dd['depth'] for dd in drawdown_periods]) if drawdown_periods else 0,
-            'avg_drawdown_duration': np.mean([dd['duration_days'] for dd in drawdown_periods]) if drawdown_periods else 0,
-            'max_drawdown_period': max_dd_period,
-            'all_drawdowns': drawdown_periods[:10],  # Top 10
-        }
-    
-    
-    def _calculate_max_dd_duration(self, equity_curve: pd.DataFrame) -> int:
-        """Calculate maximum drawdown duration in days"""
-        if equity_curve.empty:
-            return 0
-        
-        values = equity_curve['total_value'].values
-        cummax = pd.Series(values).cummax()
-        drawdown = (pd.Series(values) - cummax) / cummax
-        
-        # Find drawdown periods
-        in_dd = drawdown < 0
-        dd_periods = (in_dd != in_dd.shift()).cumsum()
-        
-        # Count duration of each period
-        dd_durations = in_dd.groupby(dd_periods).sum()
-        
-        return int(dd_durations.max()) if len(dd_durations) > 0 else 0
+        return performance
