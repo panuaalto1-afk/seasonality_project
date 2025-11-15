@@ -1,0 +1,3 @@
+constituents.raw ei päivity backtestissä joten myöskään osakkeiden fundamenteista ei voi olla varma. Pitäisi saada jostakin historiatietoa miten ovat kehittyneet. Miten voisi olla mahdollista ajaa fundamenttitiedot tähän rinnalle ja mahdollisesti sulkea pois tuloksista sellaiset joissa tuo ei toteudu? Sen voisi ehkä tehdä erillisenä tarkasteluna sitten jälkeenpäin toteutuneista kaupoista osakkeiden fundamenttihistoriaa hakemalla. Tämä huoli onneksi osoittautui turhaksi. Vain noin 1.5 % vaikutusta tulokseen. 
+
+Seuraavan kierroksen tarkasteluun voisi ottaa mukaan sellaisen, että ostaisi vielä vähemmän osakkeita. Esim portfoliossa kerrallaan vain 5 osaketta tai vaihtoehtoisesti vain tietyn scoren yläpuolelle pääsevät osakkeet mukaan. Miten toimii eri regimeissä yms. 

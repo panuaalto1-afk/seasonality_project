@@ -1,463 +1,472 @@
-﻿# backtest_scripts/visualizer.py
-"""
-Visualization Module for Backtesting
-Creates plots and charts for backtest results
+﻿"""
+Backtest Visualizer - Creates plots and charts
+Generates comprehensive visualization suite
 """
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from matplotlib.gridspec import GridSpec
 import seaborn as sns
-from typing import Dict, Optional
-import os
+from pathlib import Path
+from typing import Dict, List, Optional
+import logging
+
+# Set style
+sns.set_style("darkgrid")
+plt.rcParams['figure.figsize'] = (14, 8)
+plt.rcParams['font.size'] = 10
+
+logger = logging.getLogger(__name__)
+
 
 class BacktestVisualizer:
     """
-    Create visualizations for backtest results
+    Creates visualizations for backtest results.
+    
+    Plots:
+    1. Equity curve
+    2. Drawdown chart
+    3. Monthly returns heatmap
+    4. Yearly returns bar chart
+    5. Regime performance
+    6. Sector performance
+    7. Trade distribution
+    8. Win/Loss analysis
     """
     
-    def __init__(self, output_dir: str, dpi: int = 150):
-        """
-        Initialize visualizer
-        
-        Args:
-            output_dir: Directory to save plots
-            dpi: Plot resolution
-        """
+    def __init__(self, results: Dict, output_dir: Path):
+        """Initialize visualizer with results."""
+        self.results = results
         self.output_dir = output_dir
-        self.dpi = dpi
-        self.plots_dir = os.path.join(output_dir, 'plots')
-        os.makedirs(self.plots_dir, exist_ok=True)
+        self.plots_dir = output_dir / "plots"
+        self.plots_dir.mkdir(exist_ok=True)
         
-        # Set style
-        plt.style.use('seaborn-v0_8-darkgrid')
-        sns.set_palette("husl")
-        
-        print(f"[Visualizer] Initialized (plots dir: {self.plots_dir})")
+        self.equity_curve = results['equity_curve']
+        self.trades_history = results['trades_history']
+        self.performance = results.get('performance', {})
     
-    def create_all_plots(self,
-                        equity_curve: pd.DataFrame,
-                        trades_history: pd.DataFrame,
-                        regime_history: pd.DataFrame,
-                        benchmark_prices: Dict[str, pd.DataFrame],
-                        analysis: Dict):
-        """
-        Create all visualization plots
+    def plot_equity_curve(self):
+        """Plot equity curve over time."""
+        logger.info("Creating equity curve plot...")
         
-        Args:
-            equity_curve: Portfolio daily values
-            trades_history: All trades
-            regime_history: Daily regime data
-            benchmark_prices: Benchmark price data
-            analysis: Performance analysis results
-        """
-        print("\n[Visualizer] Creating plots...")
-        
-        # 1. Equity Curve
-        self.plot_equity_curve(equity_curve, benchmark_prices)
-        
-        # 2. Drawdown Chart
-        self.plot_drawdown(equity_curve)
-        
-        # 3. Monthly Returns Heatmap
-        self.plot_monthly_returns_heatmap(analysis.get('monthly_returns'))
-        
-        # 4. Regime Performance
-        self.plot_regime_performance(analysis.get('regime_breakdown'))
-        
-        # 5. Trade Distribution
-        self.plot_trade_distribution(trades_history)
-        
-        # 6. Rolling Sharpe
-        self.plot_rolling_sharpe(equity_curve)
-        
-        # 7. Underwater Plot
-        self.plot_underwater(equity_curve)
-        
-        # 8. Trade Timeline
-        self.plot_trade_timeline(trades_history, equity_curve)
-        
-        print(f"[Visualizer] All plots saved to: {self.plots_dir}")
-    
-    def plot_equity_curve(self, equity_curve: pd.DataFrame, 
-                         benchmark_prices: Dict[str, pd.DataFrame]):
-        """Plot equity curve vs benchmarks"""
-        fig, ax = plt.subplots(figsize=(14, 7))
-        
-        equity_curve['date'] = pd.to_datetime(equity_curve['date'])
-        
-        # Normalize to 100 at start
-        start_value = equity_curve['total_value'].iloc[0]
-        normalized_portfolio = (equity_curve['total_value'] / start_value) * 100
-        
-        ax.plot(equity_curve['date'], normalized_portfolio, 
-                linewidth=2.5, label='Portfolio', color='#2E86AB')
-        
-        # Plot benchmarks
-        colors = ['#A23B72', '#F18F01']
-        for i, (name, prices) in enumerate(benchmark_prices.items()):
-            prices = prices.copy()
-            prices['date'] = pd.to_datetime(prices['date'])
-            
-            # Align with portfolio dates
-            merged = equity_curve[['date']].merge(prices[['date', 'close']], 
-                                                   on='date', how='left')
-            merged['close'] = merged['close'].fillna(method='ffill')
-            
-            start_bench = merged['close'].iloc[0]
-            normalized_bench = (merged['close'] / start_bench) * 100
-            
-            ax.plot(equity_curve['date'], normalized_bench, 
-                   linewidth=2, label=name, color=colors[i % len(colors)], alpha=0.7)
-        
-        ax.set_xlabel('Date', fontsize=12, fontweight='bold')
-        ax.set_ylabel('Value (Normalized to 100)', fontsize=12, fontweight='bold')
-        ax.set_title('Equity Curve vs Benchmarks', fontsize=16, fontweight='bold', pad=20)
-        ax.legend(loc='upper left', fontsize=11, framealpha=0.9)
-        ax.grid(True, alpha=0.3)
-        
-        # Format x-axis
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        plt.xticks(rotation=45)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.plots_dir, 'equity_curve.png'), 
-                   dpi=self.dpi, bbox_inches='tight')
-        plt.close()
-        
-        print("  ✓ equity_curve.png")
-    
-    def plot_drawdown(self, equity_curve: pd.DataFrame):
-        """Plot drawdown chart"""
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), 
-                                       gridspec_kw={'height_ratios': [2, 1]})
-        
-        equity_curve['date'] = pd.to_datetime(equity_curve['date'])
-        equity_curve['daily_return'] = equity_curve['total_value'].pct_change()
-        
-        # Cumulative returns
-        cumulative = (1 + equity_curve['daily_return'].fillna(0)).cumprod()
-        running_max = cumulative.cummax()
-        drawdown = (cumulative - running_max) / running_max
-        
-        # Top plot: Equity curve
-        ax1.plot(equity_curve['date'], equity_curve['total_value'], 
-                linewidth=2, color='#2E86AB')
-        ax1.fill_between(equity_curve['date'], equity_curve['total_value'], 
-                         alpha=0.3, color='#2E86AB')
-        ax1.set_ylabel('Portfolio Value (\$)', fontsize=12, fontweight='bold')
-        ax1.set_title('Portfolio Value & Drawdown', fontsize=16, fontweight='bold', pad=20)
-        ax1.grid(True, alpha=0.3)
-        
-        # Bottom plot: Drawdown
-        ax2.fill_between(equity_curve['date'], drawdown * 100, 0, 
-                        alpha=0.5, color='#C1121F', label='Drawdown')
-        ax2.plot(equity_curve['date'], drawdown * 100, 
-                linewidth=1.5, color='#780000')
-        ax2.set_xlabel('Date', fontsize=12, fontweight='bold')
-        ax2.set_ylabel('Drawdown (%)', fontsize=12, fontweight='bold')
-        ax2.grid(True, alpha=0.3)
-        
-        # Format x-axis
-        for ax in [ax1, ax2]:
-            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.plots_dir, 'drawdown.png'), 
-                   dpi=self.dpi, bbox_inches='tight')
-        plt.close()
-        
-        print("  ✓ drawdown.png")
-    
-    def plot_monthly_returns_heatmap(self, monthly_returns: Optional[pd.DataFrame]):
-        """Plot monthly returns heatmap"""
-        if monthly_returns is None or monthly_returns.empty:
-            return
-        
-        # Skip if less than 12 months
-        if len(monthly_returns) < 12:
-            print("  ⊘ monthly_returns_heatmap.png (skipped: < 12 months)")
-            return
-        
-        # Pivot to year x month matrix
-        pivot = monthly_returns.pivot(index='year', columns='month', values='return_pct')
-        
-        # Create heatmap
         fig, ax = plt.subplots(figsize=(14, 8))
         
-        sns.heatmap(pivot, annot=True, fmt='.1f', cmap='RdYlGn', center=0,
-                   linewidths=0.5, cbar_kws={'label': 'Return (%)'}, ax=ax)
+        df = self.equity_curve.copy()
+        df['date'] = pd.to_datetime(df['date'])
         
-        ax.set_title('Monthly Returns Heatmap', fontsize=16, fontweight='bold', pad=20)
-        ax.set_xlabel('Month', fontsize=12, fontweight='bold')
-        ax.set_ylabel('Year', fontsize=12, fontweight='bold')
+        # Plot equity
+        ax.plot(df['date'], df['total_value'], linewidth=2, label='Portfolio Value', color='#2E86AB')
         
-        # Month labels
-        month_labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-                       'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-        ax.set_xticklabels(month_labels)
+        # Add initial value line
+        initial = df['total_value'].iloc[0]
+        ax.axhline(y=initial, color='gray', linestyle='--', linewidth=1, alpha=0.5, label='Initial Value')
         
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.plots_dir, 'monthly_returns_heatmap.png'), 
-                   dpi=self.dpi, bbox_inches='tight')
-        plt.close()
-        
-        print("  ✓ monthly_returns_heatmap.png")
-    
-    def plot_regime_performance(self, regime_breakdown: Optional[pd.DataFrame]):
-        """Plot performance by regime"""
-        if regime_breakdown is None or regime_breakdown.empty:
-            return
-        
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        
-        # 1. Total return by regime
-        ax1 = axes[0, 0]
-        colors = ['#06A77D' if x > 0 else '#C1121F' 
-                 for x in regime_breakdown['total_return_pct']]
-        regime_breakdown.plot(x='regime', y='total_return_pct', kind='bar', 
-                             ax=ax1, color=colors, legend=False)
-        ax1.set_title('Total Return by Regime', fontsize=13, fontweight='bold')
-        ax1.set_xlabel('Regime', fontsize=11, fontweight='bold')
-        ax1.set_ylabel('Return (%)', fontsize=11, fontweight='bold')
-        ax1.axhline(0, color='black', linewidth=0.8, linestyle='--')
-        ax1.grid(True, alpha=0.3, axis='y')
-        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
-        
-        # 2. Sharpe ratio by regime
-        ax2 = axes[0, 1]
-        regime_breakdown.plot(x='regime', y='sharpe_ratio', kind='bar', 
-                             ax=ax2, color='#2E86AB', legend=False)
-        ax2.set_title('Sharpe Ratio by Regime', fontsize=13, fontweight='bold')
-        ax2.set_xlabel('Regime', fontsize=11, fontweight='bold')
-        ax2.set_ylabel('Sharpe Ratio', fontsize=11, fontweight='bold')
-        ax2.axhline(0, color='black', linewidth=0.8, linestyle='--')
-        ax2.grid(True, alpha=0.3, axis='y')
-        plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
-        
-        # 3. Win rate by regime
-        ax3 = axes[1, 0]
-        regime_breakdown.plot(x='regime', y='win_rate_pct', kind='bar', 
-                             ax=ax3, color='#F18F01', legend=False)
-        ax3.set_title('Win Rate by Regime', fontsize=13, fontweight='bold')
-        ax3.set_xlabel('Regime', fontsize=11, fontweight='bold')
-        ax3.set_ylabel('Win Rate (%)', fontsize=11, fontweight='bold')
-        ax3.axhline(50, color='black', linewidth=0.8, linestyle='--')
-        ax3.grid(True, alpha=0.3, axis='y')
-        plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45, ha='right')
-        
-        # 4. Number of trades by regime
-        ax4 = axes[1, 1]
-        regime_breakdown.plot(x='regime', y='trades_count', kind='bar', 
-                             ax=ax4, color='#A23B72', legend=False)
-        ax4.set_title('Trades Count by Regime', fontsize=13, fontweight='bold')
-        ax4.set_xlabel('Regime', fontsize=11, fontweight='bold')
-        ax4.set_ylabel('Number of Trades', fontsize=11, fontweight='bold')
-        ax4.grid(True, alpha=0.3, axis='y')
-        plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45, ha='right')
-        
-        plt.suptitle('Performance Breakdown by Market Regime', 
-                    fontsize=16, fontweight='bold', y=0.995)
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.plots_dir, 'regime_performance.png'), 
-                   dpi=self.dpi, bbox_inches='tight')
-        plt.close()
-        
-        print("  ✓ regime_performance.png")
-    
-    def plot_trade_distribution(self, trades: pd.DataFrame):
-        """Plot trade distribution statistics"""
-        if trades.empty:
-            return
-        
-        sell_trades = trades[trades['action'] == 'SELL'].copy()
-        
-        if sell_trades.empty:
-            return
-        
-        fig = plt.figure(figsize=(16, 10))
-        gs = GridSpec(2, 3, figure=fig)
-        
-        # 1. P/L distribution
-        ax1 = fig.add_subplot(gs[0, 0])
-        ax1.hist(sell_trades['pl_pct'], bins=50, color='#2E86AB', alpha=0.7, edgecolor='black')
-        ax1.axvline(0, color='red', linewidth=2, linestyle='--')
-        ax1.set_xlabel('P/L (%)', fontsize=11, fontweight='bold')
-        ax1.set_ylabel('Frequency', fontsize=11, fontweight='bold')
-        ax1.set_title('P/L Distribution', fontsize=13, fontweight='bold')
-        ax1.grid(True, alpha=0.3)
-        
-        # 2. Hold time distribution
-        ax2 = fig.add_subplot(gs[0, 1])
-        ax2.hist(sell_trades['hold_days'], bins=50, color='#F18F01', alpha=0.7, edgecolor='black')
-        ax2.set_xlabel('Hold Time (days)', fontsize=11, fontweight='bold')
-        ax2.set_ylabel('Frequency', fontsize=11, fontweight='bold')
-        ax2.set_title('Hold Time Distribution', fontsize=13, fontweight='bold')
-        ax2.grid(True, alpha=0.3)
-        
-        # 3. Exit reason breakdown
-        ax3 = fig.add_subplot(gs[0, 2])
-        exit_counts = sell_trades['reason'].value_counts()
-        ax3.pie(exit_counts.values, labels=exit_counts.index, autopct='%1.1f%%',
-               startangle=90, colors=sns.color_palette("husl", len(exit_counts)))
-        ax3.set_title('Exit Reasons', fontsize=13, fontweight='bold')
-        
-        # 4. Wins vs Losses over time
-        ax4 = fig.add_subplot(gs[1, :])
-        sell_trades['date'] = pd.to_datetime(sell_trades['date'])
-        sell_trades = sell_trades.sort_values('date')
-        sell_trades['cumulative_pl'] = sell_trades['pl'].cumsum()
-        
-        wins = sell_trades[sell_trades['pl'] > 0]
-        losses = sell_trades[sell_trades['pl'] < 0]
-        
-        ax4.scatter(wins['date'], wins['cumulative_pl'], 
-                   color='green', alpha=0.6, s=50, label='Wins')
-        ax4.scatter(losses['date'], losses['cumulative_pl'], 
-                   color='red', alpha=0.6, s=50, label='Losses')
-        ax4.plot(sell_trades['date'], sell_trades['cumulative_pl'], 
-                color='blue', linewidth=2, label='Cumulative P/L')
-        
-        ax4.set_xlabel('Date', fontsize=11, fontweight='bold')
-        ax4.set_ylabel('Cumulative P/L (\$)', fontsize=11, fontweight='bold')
-        ax4.set_title('Cumulative P/L Over Time', fontsize=13, fontweight='bold')
-        ax4.legend(loc='upper left', fontsize=10)
-        ax4.grid(True, alpha=0.3)
-        ax4.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45, ha='right')
-        
-        plt.suptitle('Trade Distribution Analysis', fontsize=16, fontweight='bold', y=0.995)
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.plots_dir, 'trade_distribution.png'), 
-                   dpi=self.dpi, bbox_inches='tight')
-        plt.close()
-        
-        print("  ✓ trade_distribution.png")
-    
-    def plot_rolling_sharpe(self, equity_curve: pd.DataFrame, window: int = 60):
-        """Plot rolling Sharpe ratio"""
-        equity_curve = equity_curve.copy()
-        equity_curve['date'] = pd.to_datetime(equity_curve['date'])
-        equity_curve['daily_return'] = equity_curve['total_value'].pct_change()
-        
-        # Rolling Sharpe (60-day window, annualized)
-        rolling_mean = equity_curve['daily_return'].rolling(window).mean()
-        rolling_std = equity_curve['daily_return'].rolling(window).std()
-        rolling_sharpe = (rolling_mean / rolling_std) * np.sqrt(252)
-        
-        fig, ax = plt.subplots(figsize=(14, 7))
-        
-        ax.plot(equity_curve['date'], rolling_sharpe, linewidth=2, color='#2E86AB')
-        ax.axhline(0, color='black', linewidth=1, linestyle='--')
-        ax.axhline(1, color='green', linewidth=1, linestyle=':', alpha=0.5, label='Sharpe = 1')
-        ax.axhline(2, color='darkgreen', linewidth=1, linestyle=':', alpha=0.5, label='Sharpe = 2')
-        
+        # Formatting
         ax.set_xlabel('Date', fontsize=12, fontweight='bold')
-        ax.set_ylabel(f'{window}-Day Rolling Sharpe Ratio', fontsize=12, fontweight='bold')
-        ax.set_title(f'Rolling Sharpe Ratio ({window}-Day Window)', fontsize=16, fontweight='bold', pad=20)
+        ax.set_ylabel('Portfolio Value ($)', fontsize=12, fontweight='bold')
+        ax.set_title('Portfolio Equity Curve - Aggressive Strategy', fontsize=14, fontweight='bold')
         ax.legend(loc='upper left', fontsize=10)
         ax.grid(True, alpha=0.3)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        plt.xticks(rotation=45)
+        
+        # Format y-axis as currency
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
+        
+        # Add performance text
+        final = df['total_value'].iloc[-1]
+        total_return = (final / initial - 1) * 100
+        
+        textstr = f'Initial: ${initial:,.0f}\nFinal: ${final:,.0f}\nReturn: {total_return:+.2f}%'
+        props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+        ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=11,
+                verticalalignment='top', bbox=props)
         
         plt.tight_layout()
-        plt.savefig(os.path.join(self.plots_dir, 'rolling_sharpe.png'), 
-                   dpi=self.dpi, bbox_inches='tight')
+        plt.savefig(self.plots_dir / 'equity_curve.png', dpi=150, bbox_inches='tight')
         plt.close()
         
-        print("  ✓ rolling_sharpe.png")
+        logger.info("Equity curve plot saved")
     
-    def plot_underwater(self, equity_curve: pd.DataFrame):
-        """Plot underwater (drawdown) chart"""
-        equity_curve = equity_curve.copy()
-        equity_curve['date'] = pd.to_datetime(equity_curve['date'])
-        equity_curve['daily_return'] = equity_curve['total_value'].pct_change()
+    def plot_drawdown(self):
+        """Plot drawdown chart."""
+        logger.info("Creating drawdown plot...")
         
-        cumulative = (1 + equity_curve['daily_return'].fillna(0)).cumprod()
+        fig, ax = plt.subplots(figsize=(14, 8))
+        
+        df = self.equity_curve.copy()
+        df['date'] = pd.to_datetime(df['date'])
+        
+        # Calculate drawdown
+        cumulative = df['total_value']
         running_max = cumulative.cummax()
-        drawdown = (cumulative - running_max) / running_max
+        drawdown = (cumulative - running_max) / running_max * 100
         
-        fig, ax = plt.subplots(figsize=(14, 7))
+        # Plot
+        ax.fill_between(df['date'], drawdown, 0, alpha=0.3, color='red', label='Drawdown')
+        ax.plot(df['date'], drawdown, linewidth=2, color='darkred')
         
-        ax.fill_between(equity_curve['date'], drawdown * 100, 0, 
-                       alpha=0.5, color='#C1121F')
-        ax.plot(equity_curve['date'], drawdown * 100, 
-               linewidth=1.5, color='#780000')
-        
+        # Formatting
         ax.set_xlabel('Date', fontsize=12, fontweight='bold')
         ax.set_ylabel('Drawdown (%)', fontsize=12, fontweight='bold')
-        ax.set_title('Underwater Plot (Drawdown from Peak)', fontsize=16, fontweight='bold', pad=20)
+        ax.set_title('Portfolio Drawdown', fontsize=14, fontweight='bold')
+        ax.legend(loc='lower left', fontsize=10)
         ax.grid(True, alpha=0.3)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        plt.xticks(rotation=45)
+        ax.axhline(y=0, color='black', linestyle='-', linewidth=1)
+        
+        # Add max drawdown line
+        max_dd = drawdown.min()
+        ax.axhline(y=max_dd, color='red', linestyle='--', linewidth=1, alpha=0.7)
+        ax.text(df['date'].iloc[-1], max_dd, f'  Max DD: {max_dd:.2f}%', 
+                verticalalignment='center', fontsize=10, color='red')
         
         plt.tight_layout()
-        plt.savefig(os.path.join(self.plots_dir, 'underwater.png'), 
-                   dpi=self.dpi, bbox_inches='tight')
+        plt.savefig(self.plots_dir / 'drawdown.png', dpi=150, bbox_inches='tight')
         plt.close()
         
-        print("  ✓ underwater.png")
+        logger.info("Drawdown plot saved")
     
-    def plot_trade_timeline(self, trades: pd.DataFrame, equity_curve: pd.DataFrame):
-        """Plot trade markers on equity curve"""
-        if trades.empty:
+    def plot_monthly_returns_heatmap(self):
+        """Plot monthly returns as heatmap."""
+        logger.info("Creating monthly returns heatmap...")
+        
+        monthly_df = self.performance.get('monthly_returns', pd.DataFrame())
+        
+        if monthly_df.empty:
+            logger.warning("No monthly returns data available")
             return
         
-        fig, ax = plt.subplots(figsize=(14, 7))
+        # Pivot for heatmap
+        monthly_df['year'] = monthly_df['year_month'].dt.year
+        monthly_df['month'] = monthly_df['year_month'].dt.month
         
-        equity_curve = equity_curve.copy()
-        equity_curve['date'] = pd.to_datetime(equity_curve['date'])
+        pivot = monthly_df.pivot(index='month', columns='year', values='return_pct')
         
-        # Plot equity curve
-        ax.plot(equity_curve['date'], equity_curve['total_value'], 
-               linewidth=2, color='#2E86AB', label='Portfolio Value')
+        # Create heatmap
+        fig, ax = plt.subplots(figsize=(12, 8))
         
-        # Mark trades
-        buy_trades = trades[trades['action'] == 'BUY'].copy()
-        sell_trades = trades[trades['action'] == 'SELL'].copy()
+        sns.heatmap(pivot, annot=True, fmt='.2f', cmap='RdYlGn', center=0,
+                    cbar_kws={'label': 'Return (%)'}, linewidths=0.5,
+                    vmin=-10, vmax=10, ax=ax)
         
-        if not buy_trades.empty:
-            buy_trades['date'] = pd.to_datetime(buy_trades['date'])
-            # Get portfolio value at buy dates
-            buy_with_value = buy_trades.merge(
-                equity_curve[['date', 'total_value']], 
-                on='date', how='left'
-            )
-            ax.scatter(buy_with_value['date'], buy_with_value['total_value'], 
-                      color='green', marker='^', s=100, alpha=0.6, label='Buy', zorder=5)
+        ax.set_xlabel('Year', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Month', fontsize=12, fontweight='bold')
+        ax.set_title('Monthly Returns Heatmap (%)', fontsize=14, fontweight='bold')
         
-        if not sell_trades.empty:
-            sell_trades['date'] = pd.to_datetime(sell_trades['date'])
-            sell_with_value = sell_trades.merge(
-                equity_curve[['date', 'total_value']], 
-                on='date', how='left'
-            )
-            # Color by profit/loss
-            wins = sell_with_value[sell_with_value['pl'] > 0]
-            losses = sell_with_value[sell_with_value['pl'] < 0]
-            
-            if not wins.empty:
-                ax.scatter(wins['date'], wins['total_value'], 
-                          color='darkgreen', marker='v', s=100, alpha=0.8, label='Sell (Win)', zorder=5)
-            if not losses.empty:
-                ax.scatter(losses['date'], losses['total_value'], 
-                          color='darkred', marker='v', s=100, alpha=0.8, label='Sell (Loss)', zorder=5)
-        
-        ax.set_xlabel('Date', fontsize=12, fontweight='bold')
-        ax.set_ylabel('Portfolio Value (\$)', fontsize=12, fontweight='bold')
-        ax.set_title('Trade Timeline on Equity Curve', fontsize=16, fontweight='bold', pad=20)
-        ax.legend(loc='upper left', fontsize=10)
-        ax.grid(True, alpha=0.3)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-        plt.xticks(rotation=45)
+        # Month names
+        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        ax.set_yticklabels(month_names, rotation=0)
         
         plt.tight_layout()
-        plt.savefig(os.path.join(self.plots_dir, 'trade_timeline.png'), 
-                   dpi=self.dpi, bbox_inches='tight')
+        plt.savefig(self.plots_dir / 'monthly_returns_heatmap.png', dpi=150, bbox_inches='tight')
         plt.close()
         
-        print("  ✓ trade_timeline.png")
-
+        logger.info("Monthly returns heatmap saved")
+    
+    def plot_yearly_returns(self):
+        """Plot yearly returns as bar chart."""
+        logger.info("Creating yearly returns plot...")
+        
+        yearly_df = self.performance.get('yearly_breakdown', pd.DataFrame())
+        
+        if yearly_df.empty:
+            logger.warning("No yearly breakdown data available")
+            return
+        
+        fig, ax = plt.subplots(figsize=(14, 8))
+        
+        # Bar chart
+        colors = ['green' if x > 0 else 'red' for x in yearly_df['return_pct']]
+        bars = ax.bar(yearly_df['year'], yearly_df['return_pct'], color=colors, alpha=0.7, edgecolor='black')
+        
+        # Add value labels on bars
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{height:.1f}%',
+                   ha='center', va='bottom' if height > 0 else 'top',
+                   fontsize=10, fontweight='bold')
+        
+        # Formatting
+        ax.set_xlabel('Year', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Annual Return (%)', fontsize=12, fontweight='bold')
+        ax.set_title('Yearly Returns', fontsize=14, fontweight='bold')
+        ax.axhline(y=0, color='black', linestyle='-', linewidth=1)
+        ax.grid(True, alpha=0.3, axis='y')
+        
+        plt.tight_layout()
+        plt.savefig(self.plots_dir / 'yearly_returns.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.info("Yearly returns plot saved")
+    
+    def plot_regime_performance(self):
+        """Plot performance by regime."""
+        logger.info("Creating regime performance plot...")
+        
+        regime_df = self.performance.get('regime_breakdown', pd.DataFrame())
+        
+        if regime_df.empty:
+            logger.warning("No regime breakdown data available")
+            return
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # Plot 1: Win rate by regime
+        regime_df_sorted = regime_df.sort_values('win_rate', ascending=False)
+        colors = plt.cm.RdYlGn(regime_df_sorted['win_rate'] / 100)
+        
+        ax1.barh(regime_df_sorted['regime'], regime_df_sorted['win_rate'], color=colors, edgecolor='black')
+        ax1.set_xlabel('Win Rate (%)', fontsize=12, fontweight='bold')
+        ax1.set_ylabel('Regime', fontsize=12, fontweight='bold')
+        ax1.set_title('Win Rate by Regime', fontsize=13, fontweight='bold')
+        ax1.axvline(x=50, color='black', linestyle='--', linewidth=1, alpha=0.5)
+        ax1.grid(True, alpha=0.3, axis='x')
+        
+        # Add value labels
+        for i, (regime, val) in enumerate(zip(regime_df_sorted['regime'], regime_df_sorted['win_rate'])):
+            ax1.text(val + 1, i, f'{val:.1f}%', va='center', fontsize=10)
+        
+        # Plot 2: Total P&L by regime
+        regime_df_sorted2 = regime_df.sort_values('total_pnl', ascending=False)
+        colors2 = ['green' if x > 0 else 'red' for x in regime_df_sorted2['total_pnl']]
+        
+        ax2.barh(regime_df_sorted2['regime'], regime_df_sorted2['total_pnl'], color=colors2, alpha=0.7, edgecolor='black')
+        ax2.set_xlabel('Total P&L ($)', fontsize=12, fontweight='bold')
+        ax2.set_ylabel('Regime', fontsize=12, fontweight='bold')
+        ax2.set_title('Total P&L by Regime', fontsize=13, fontweight='bold')
+        ax2.axvline(x=0, color='black', linestyle='-', linewidth=1)
+        ax2.grid(True, alpha=0.3, axis='x')
+        
+        # Add value labels
+        for i, (regime, val) in enumerate(zip(regime_df_sorted2['regime'], regime_df_sorted2['total_pnl'])):
+            ax2.text(val + 500 if val > 0 else val - 500, i, f'${val:,.0f}', 
+                    va='center', ha='left' if val > 0 else 'right', fontsize=10)
+        
+        plt.tight_layout()
+        plt.savefig(self.plots_dir / 'regime_performance.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.info("Regime performance plot saved")
+    
+    def plot_sector_performance(self):
+        """Plot performance by sector."""
+        logger.info("Creating sector performance plot...")
+        
+        sector_df = self.performance.get('sector_breakdown', pd.DataFrame())
+        
+        if sector_df.empty:
+            logger.warning("No sector breakdown data available")
+            return
+        
+        # Take top 15 sectors by total return
+        sector_df_top = sector_df.nlargest(15, 'total_return')
+        
+        fig, ax = plt.subplots(figsize=(14, 10))
+        
+        colors = ['green' if x > 0 else 'red' for x in sector_df_top['total_return']]
+        bars = ax.barh(sector_df_top['sector'], sector_df_top['total_return'], 
+                      color=colors, alpha=0.7, edgecolor='black')
+        
+        ax.set_xlabel('Total Return ($)', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Sector', fontsize=12, fontweight='bold')
+        ax.set_title('Top 15 Sectors by Total Return', fontsize=14, fontweight='bold')
+        ax.axvline(x=0, color='black', linestyle='-', linewidth=1)
+        ax.grid(True, alpha=0.3, axis='x')
+        
+        # Add value labels
+        for i, (sector, val, trades, wr) in enumerate(zip(
+            sector_df_top['sector'], 
+            sector_df_top['total_return'],
+            sector_df_top['num_trades'],
+            sector_df_top['win_rate']
+        )):
+            label = f'${val:,.0f} ({trades} trades, {wr:.0f}% WR)'
+            ax.text(val + 200 if val > 0 else val - 200, i, label,
+                   va='center', ha='left' if val > 0 else 'right', fontsize=9)
+        
+        plt.tight_layout()
+        plt.savefig(self.plots_dir / 'sector_performance.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.info("Sector performance plot saved")
+    
+    def plot_trade_distribution(self):
+        """Plot distribution of trade returns."""
+        logger.info("Creating trade distribution plot...")
+        
+        if self.trades_history.empty:
+            logger.warning("No trades history available")
+            return
+        
+        sells = self.trades_history[self.trades_history['action'] == 'SELL']
+        
+        if sells.empty or 'pnl_pct' not in sells.columns:
+            logger.warning("No sell trades with P&L data")
+            return
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # Histogram of returns
+        ax1.hist(sells['pnl_pct'], bins=50, edgecolor='black', alpha=0.7, color='steelblue')
+        ax1.axvline(x=0, color='red', linestyle='--', linewidth=2, label='Break-even')
+        ax1.axvline(x=sells['pnl_pct'].median(), color='orange', linestyle='--', linewidth=2, label='Median')
+        ax1.set_xlabel('Return (%)', fontsize=12, fontweight='bold')
+        ax1.set_ylabel('Frequency', fontsize=12, fontweight='bold')
+        ax1.set_title('Distribution of Trade Returns', fontsize=13, fontweight='bold')
+        ax1.legend(fontsize=10)
+        ax1.grid(True, alpha=0.3)
+        
+        # Cumulative distribution
+        sorted_returns = np.sort(sells['pnl_pct'])
+        cumulative = np.arange(1, len(sorted_returns) + 1) / len(sorted_returns) * 100
+        
+        ax2.plot(sorted_returns, cumulative, linewidth=2, color='steelblue')
+        ax2.axvline(x=0, color='red', linestyle='--', linewidth=2, label='Break-even')
+        ax2.set_xlabel('Return (%)', fontsize=12, fontweight='bold')
+        ax2.set_ylabel('Cumulative Probability (%)', fontsize=12, fontweight='bold')
+        ax2.set_title('Cumulative Distribution of Returns', fontsize=13, fontweight='bold')
+        ax2.legend(fontsize=10)
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(self.plots_dir / 'trade_distribution.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.info("Trade distribution plot saved")
+    
+    def plot_win_loss_analysis(self):
+        """Plot win/loss analysis."""
+        logger.info("Creating win/loss analysis plot...")
+        
+        if self.trades_history.empty:
+            logger.warning("No trades history available")
+            return
+        
+        sells = self.trades_history[self.trades_history['action'] == 'SELL']
+        
+        if sells.empty:
+            return
+        
+        wins = sells[sells['pnl'] > 0]
+        losses = sells[sells['pnl'] <= 0]
+        
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+        
+        # 1. Win/Loss count
+        counts = [len(wins), len(losses)]
+        labels = [f'Wins ({len(wins)})', f'Losses ({len(losses)})']
+        colors = ['green', 'red']
+        
+        ax1.pie(counts, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+        ax1.set_title('Win vs Loss Distribution', fontsize=13, fontweight='bold')
+        
+        # 2. Average win vs loss (absolute)
+        avg_win = wins['pnl'].mean() if len(wins) > 0 else 0
+        avg_loss = losses['pnl'].mean() if len(losses) > 0 else 0
+        
+        ax2.bar(['Avg Win', 'Avg Loss'], [avg_win, avg_loss], color=['green', 'red'], alpha=0.7, edgecolor='black')
+        ax2.set_ylabel('Average P&L ($)', fontsize=12, fontweight='bold')
+        ax2.set_title('Average Win vs Loss (Dollars)', fontsize=13, fontweight='bold')
+        ax2.axhline(y=0, color='black', linestyle='-', linewidth=1)
+        ax2.grid(True, alpha=0.3, axis='y')
+        
+        for i, (label, val) in enumerate(zip(['Avg Win', 'Avg Loss'], [avg_win, avg_loss])):
+            ax2.text(i, val + 50 if val > 0 else val - 50, f'${val:,.2f}',
+                    ha='center', va='bottom' if val > 0 else 'top', fontsize=10, fontweight='bold')
+        
+        # 3. Average win vs loss (percentage)
+        avg_win_pct = wins['pnl_pct'].mean() if len(wins) > 0 else 0
+        avg_loss_pct = losses['pnl_pct'].mean() if len(losses) > 0 else 0
+        
+        ax3.bar(['Avg Win', 'Avg Loss'], [avg_win_pct, avg_loss_pct], color=['green', 'red'], alpha=0.7, edgecolor='black')
+        ax3.set_ylabel('Average Return (%)', fontsize=12, fontweight='bold')
+        ax3.set_title('Average Win vs Loss (Percentage)', fontsize=13, fontweight='bold')
+        ax3.axhline(y=0, color='black', linestyle='-', linewidth=1)
+        ax3.grid(True, alpha=0.3, axis='y')
+        
+        for i, (label, val) in enumerate(zip(['Avg Win', 'Avg Loss'], [avg_win_pct, avg_loss_pct])):
+            ax3.text(i, val + 0.5 if val > 0 else val - 0.5, f'{val:.2f}%',
+                    ha='center', va='bottom' if val > 0 else 'top', fontsize=10, fontweight='bold')
+        
+        # 4. Hold time comparison
+        if 'days_held' in sells.columns:
+            avg_hold_win = wins['days_held'].mean() if len(wins) > 0 else 0
+            avg_hold_loss = losses['days_held'].mean() if len(losses) > 0 else 0
+            
+            ax4.bar(['Wins', 'Losses'], [avg_hold_win, avg_hold_loss], color=['green', 'red'], alpha=0.7, edgecolor='black')
+            ax4.set_ylabel('Average Hold Time (Days)', fontsize=12, fontweight='bold')
+            ax4.set_title('Hold Time: Wins vs Losses', fontsize=13, fontweight='bold')
+            ax4.grid(True, alpha=0.3, axis='y')
+            
+            for i, (label, val) in enumerate(zip(['Wins', 'Losses'], [avg_hold_win, avg_hold_loss])):
+                ax4.text(i, val + 0.5, f'{val:.1f} days',
+                        ha='center', va='bottom', fontsize=10, fontweight='bold')
+        
+        plt.tight_layout()
+        plt.savefig(self.plots_dir / 'win_loss_analysis.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.info("Win/loss analysis plot saved")
+    
+    def create_all_plots(self):
+        """Create all visualization plots."""
+        logger.info("\n" + "=" * 60)
+        logger.info("CREATING VISUALIZATIONS")
+        logger.info("=" * 60)
+        
+        plots_created = []
+        
+        try:
+            self.plot_equity_curve()
+            plots_created.append("Equity Curve")
+        except Exception as e:
+            logger.error(f"Error creating equity curve: {str(e)}")
+        
+        try:
+            self.plot_drawdown()
+            plots_created.append("Drawdown Chart")
+        except Exception as e:
+            logger.error(f"Error creating drawdown plot: {str(e)}")
+        
+        try:
+            self.plot_monthly_returns_heatmap()
+            plots_created.append("Monthly Returns Heatmap")
+        except Exception as e:
+            logger.error(f"Error creating monthly heatmap: {str(e)}")
+        
+        try:
+            self.plot_yearly_returns()
+            plots_created.append("Yearly Returns")
+        except Exception as e:
+            logger.error(f"Error creating yearly returns: {str(e)}")
+        
+        try:
+            self.plot_regime_performance()
+            plots_created.append("Regime Performance")
+        except Exception as e:
+            logger.error(f"Error creating regime plot: {str(e)}")
+        
+        try:
+            self.plot_sector_performance()
+            plots_created.append("Sector Performance")
+        except Exception as e:
+            logger.error(f"Error creating sector plot: {str(e)}")
+        
+        try:
+            self.plot_trade_distribution()
+            plots_created.append("Trade Distribution")
+        except Exception as e:
+            logger.error(f"Error creating trade distribution: {str(e)}")
+        
+        try:
+            self.plot_win_loss_analysis()
+            plots_created.append("Win/Loss Analysis")
+        except Exception as e:
+            logger.error(f"Error creating win/loss plot: {str(e)}")
+        
+        logger.info("\n" + "=" * 60)
+        logger.info(f"CREATED {len(plots_created)} PLOTS:")
+        for plot in plots_created:
+            logger.info(f"  ✓ {plot}")
+        logger.info(f"\nPlots saved to: {self.plots_dir}")
+        logger.info("=" * 60)

@@ -1,239 +1,329 @@
-# backtest_scripts/regime_calculator.py
 """
-Regime Calculator for Backtesting
-Replicates regime_detector.py logic for historical dates
+Regime Calculator - Historical Regime Detection
+Matches live regime_detector.py logic for backtesting
 """
 
 import pandas as pd
 import numpy as np
 from typing import Dict, Optional
-from datetime import date, timedelta
+from datetime import datetime, timedelta
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class RegimeCalculator:
     """
-    Calculate historical market regimes
-    Replicates regime_detector.py logic
+    Calculates market regime using historical data.
+    
+    Matches live regime_detector.py:
+    - 5 components (Equity, Volatility, Credit, Safe Haven, Breadth)
+    - 7 regime states
+    - Composite score calculation
+    
+    Key difference from live:
+    - Uses walk-forward approach (only data up to target_date)
+    - No future leak
     """
     
-    # Regime thresholds (from regime_detector.py)
-    REGIME_THRESHOLDS = {
-        'CRISIS': -1.0,
-        'BEAR_STRONG': -0.50,
-        'BEAR_WEAK': -0.25,
-        'NEUTRAL_BEARISH': -0.05,
-        'NEUTRAL_BULLISH': 0.05,
-        'BULL_WEAK': 0.25,
-        'BULL_STRONG': 0.50,
-    }
-    
-    # Component weights (from regime_detector.py)
-    COMPONENT_WEIGHTS = {
-        'equity': 0.35,
-        'volatility': 0.20,
-        'credit': 0.20,
-        'safe_haven': 0.15,
-        'breadth': 0.10,
-    }
-    
-    def __init__(self, macro_prices: Dict[str, pd.DataFrame]):
-        """
-        Initialize regime calculator
+    def __init__(self):
+        """Initialize regime calculator."""
+        self.lookback_short = 20   # Short-term (1 month)
+        self.lookback_medium = 60  # Medium-term (3 months)
+        self.lookback_long = 252   # Long-term (1 year)
         
-        Args:
-            macro_prices: Dict mapping symbol → DataFrame (preloaded macro prices)
-                         Expected symbols: SPY, QQQ, IWM, GLD, TLT, HYG, LQD, VIX/VIXM
-        """
-        self.macro_prices = macro_prices
-        
-        # Verify required symbols
-        required = ['SPY', 'QQQ', 'IWM', 'GLD', 'TLT', 'HYG', 'LQD']
-        missing = [s for s in required if s not in macro_prices]
-        
-        if missing:
-            print(f"[WARN] Missing macro prices: {missing}")
-        
-        print(f"[RegimeCalculator] Initialized with {len(macro_prices)} macro symbols")
-    
-    def calculate_regime(self, target_date: date) -> Dict:
-        """
-        Calculate market regime for a specific date
-        
-        Args:
-            target_date: Date to calculate regime for
-        
-        Returns:
-            dict: {
-                'regime': str (e.g., 'BULL_STRONG'),
-                'composite_score': float,
-                'components': dict,
-                'confidence': float
-            }
-        """
-        # Calculate all components
-        components = {
-            'equity': self._equity_signal(target_date),
-            'volatility': self._volatility_signal(target_date),
-            'credit': self._credit_signal(target_date),
-            'safe_haven': self._safe_haven_signal(target_date),
-            'breadth': self._breadth_signal(target_date),
+        # Component weights
+        self.weights = {
+            'equity': 0.35,
+            'volatility': 0.20,
+            'credit': 0.20,
+            'safe_haven': 0.15,
+            'breadth': 0.10,
         }
+    
+    def get_price_data(
+        self,
+        ticker: str,
+        regime_prices: Dict[str, pd.DataFrame],
+        target_date: datetime,
+        lookback_days: int = 252
+    ) -> Optional[pd.DataFrame]:
+        """Get price data up to target_date with lookback."""
+        if ticker not in regime_prices:
+            return None
         
-        # Composite score (weighted average)
-        composite = sum(
-            components[k] * self.COMPONENT_WEIGHTS[k]
-            for k in components.keys()
+        df = regime_prices[ticker]
+        
+        # Filter up to target_date
+        cutoff_date = target_date - timedelta(days=lookback_days)
+        df = df[(df['date'] >= cutoff_date) & (df['date'] <= target_date)]
+        
+        if len(df) < lookback_days // 2:
+            return None
+        
+        return df
+    
+    def calculate_momentum(self, df: pd.DataFrame, periods: List[int]) -> float:
+        """
+        Calculate momentum score from returns.
+        
+        Returns normalized score: -1 (bearish) to +1 (bullish)
+        """
+        if len(df) < max(periods):
+            return 0.0
+        
+        closes = df['close'].values
+        scores = []
+        
+        for period in periods:
+            if len(closes) < period:
+                continue
+            ret = (closes[-1] / closes[-period] - 1)
+            scores.append(ret)
+        
+        # Average return
+        avg_return = np.mean(scores) if scores else 0
+        
+        # Normalize to -1 to +1
+        # Typical range: -30% to +30%
+        normalized = np.clip(avg_return * 3, -1, 1)
+        
+        return normalized
+    
+    def calculate_equity_component(
+        self,
+        regime_prices: Dict[str, pd.DataFrame],
+        target_date: datetime
+    ) -> float:
+        """
+        Calculate equity momentum component.
+        
+        Uses: SPY (35%), QQQ (35%), IWM (30%)
+        """
+        tickers = ['SPY', 'QQQ', 'IWM']
+        weights = [0.35, 0.35, 0.30]
+        scores = []
+        
+        for ticker, weight in zip(tickers, weights):
+            df = self.get_price_data(ticker, regime_prices, target_date)
+            if df is None:
+                continue
+            
+            # Calculate momentum over multiple periods
+            mom = self.calculate_momentum(
+                df,
+                periods=[self.lookback_short, self.lookback_medium]
+            )
+            
+            scores.append(mom * weight)
+        
+        return sum(scores) if scores else 0.0
+    
+    def calculate_volatility_component(
+        self,
+        regime_prices: Dict[str, pd.DataFrame],
+        target_date: datetime
+    ) -> float:
+        """
+        Calculate volatility component.
+        
+        Uses: SPY realized volatility
+        High vol = bearish, Low vol = bullish
+        """
+        df = self.get_price_data('SPY', regime_prices, target_date)
+        if df is None:
+            return 0.0
+        
+        # Calculate 20-day realized volatility
+        returns = df['close'].pct_change().dropna()
+        
+        if len(returns) < self.lookback_short:
+            return 0.0
+        
+        recent_vol = returns.tail(self.lookback_short).std() * np.sqrt(252)
+        long_vol = returns.tail(self.lookback_long).std() * np.sqrt(252) if len(returns) >= self.lookback_long else recent_vol
+        
+        # High vol (>30%) = bearish (-1)
+        # Low vol (<15%) = bullish (+1)
+        if recent_vol > 0.30:
+            vol_score = -1.0
+        elif recent_vol < 0.15:
+            vol_score = 1.0
+        else:
+            # Linear interpolation
+            vol_score = 1.0 - (recent_vol - 0.15) / 0.15
+        
+        # Compare to long-term vol (increasing vol = bearish)
+        if long_vol > 0:
+            vol_change = (recent_vol - long_vol) / long_vol
+            vol_score -= vol_change * 0.5
+        
+        return np.clip(vol_score, -1, 1)
+    
+    def calculate_credit_component(
+        self,
+        regime_prices: Dict[str, pd.DataFrame],
+        target_date: datetime
+    ) -> float:
+        """
+        Calculate credit spread component.
+        
+        Uses: HYG (high yield) vs LQD (investment grade)
+        Narrowing spreads = bullish, Widening = bearish
+        """
+        hyg_df = self.get_price_data('HYG', regime_prices, target_date)
+        lqd_df = self.get_price_data('LQD', regime_prices, target_date)
+        
+        if hyg_df is None or lqd_df is None:
+            return 0.0
+        
+        # Calculate relative performance
+        hyg_ret = self.calculate_momentum(hyg_df, [self.lookback_short, self.lookback_medium])
+        lqd_ret = self.calculate_momentum(lqd_df, [self.lookback_short, self.lookback_medium])
+        
+        # HYG outperforming LQD = narrowing spreads = bullish
+        credit_score = (hyg_ret - lqd_ret) * 2  # Amplify difference
+        
+        return np.clip(credit_score, -1, 1)
+    
+    def calculate_safe_haven_component(
+        self,
+        regime_prices: Dict[str, pd.DataFrame],
+        target_date: datetime
+    ) -> float:
+        """
+        Calculate safe haven flows component.
+        
+        Uses: GLD (gold) and TLT (long-term treasuries)
+        Strong safe haven demand = bearish for equities
+        """
+        gld_df = self.get_price_data('GLD', regime_prices, target_date)
+        tlt_df = self.get_price_data('TLT', regime_prices, target_date)
+        
+        scores = []
+        
+        # Gold momentum (inverse relationship with equities)
+        if gld_df is not None:
+            gld_mom = self.calculate_momentum(gld_df, [self.lookback_short])
+            scores.append(-gld_mom * 0.6)  # Inverse and weighted
+        
+        # TLT momentum (inverse relationship with equities)
+        if tlt_df is not None:
+            tlt_mom = self.calculate_momentum(tlt_df, [self.lookback_short])
+            scores.append(-tlt_mom * 0.4)  # Inverse and weighted
+        
+        return sum(scores) if scores else 0.0
+    
+    def calculate_breadth_component(
+        self,
+        regime_prices: Dict[str, pd.DataFrame],
+        target_date: datetime
+    ) -> float:
+        """
+        Calculate market breadth component.
+        
+        Uses: SPY vs IWM correlation
+        High correlation = good breadth = bullish
+        Low/negative correlation = poor breadth = bearish
+        """
+        spy_df = self.get_price_data('SPY', regime_prices, target_date, lookback_days=120)
+        iwm_df = self.get_price_data('IWM', regime_prices, target_date, lookback_days=120)
+        
+        if spy_df is None or iwm_df is None:
+            return 0.0
+        
+        # Align dates
+        merged = pd.merge(
+            spy_df[['date', 'close']].rename(columns={'close': 'spy'}),
+            iwm_df[['date', 'close']].rename(columns={'close': 'iwm'}),
+            on='date'
         )
         
-        # Determine regime from composite score
-        regime = 'NEUTRAL_BULLISH'  # Default
-        for regime_name, threshold in sorted(self.REGIME_THRESHOLDS.items(), key=lambda x: x[1], reverse=True):
-            if composite >= threshold:
-                regime = regime_name
-                break
-        
-        # Calculate confidence (distance from nearest threshold)
-        confidence = abs(composite) * 100  # Simple heuristic
-        
-        return {
-            'regime': regime,
-            'composite_score': float(composite),
-            'components': components,
-            'confidence': float(confidence),
-            'date': target_date
-        }
-    
-    def _get_price_at_date(self, symbol: str, target_date: date, lookback_days: int = 0) -> Optional[float]:
-        """
-        Get price for symbol at specific date
-        
-        Args:
-            symbol: Macro symbol
-            target_date: Target date
-            lookback_days: If 0, get exact date. If > 0, get price N days before
-        
-        Returns:
-            Close price or None
-        """
-        if symbol not in self.macro_prices:
-            return None
-        
-        df = self.macro_prices[symbol]
-        
-        if lookback_days > 0:
-            target_date = target_date - timedelta(days=lookback_days)
-        
-        # Find closest date <= target_date
-        df_filtered = df[df['date'] <= target_date]
-        
-        if df_filtered.empty:
-            return None
-        
-        return float(df_filtered.iloc[-1]['close'])
-    
-    def _calculate_momentum(self, symbol: str, target_date: date, period: int = 60) -> float:
-        """
-        Calculate momentum (% change over period)
-        
-        Args:
-            symbol: Macro symbol
-            target_date: Target date
-            period: Lookback period in days
-        
-        Returns:
-            Momentum (fraction)
-        """
-        current_price = self._get_price_at_date(symbol, target_date)
-        past_price = self._get_price_at_date(symbol, target_date, lookback_days=period)
-        
-        if current_price is None or past_price is None or past_price == 0:
+        if len(merged) < 30:
             return 0.0
         
-        return (current_price / past_price) - 1
-    
-    def _equity_signal(self, target_date: date) -> float:
-        """
-        Equity signal: SPY, QQQ, IWM momentum
-        Positive = bullish, negative = bearish
-        """
-        symbols = ['SPY', 'QQQ', 'IWM']
-        momentums = []
+        # Calculate returns
+        merged['spy_ret'] = merged['spy'].pct_change()
+        merged['iwm_ret'] = merged['iwm'].pct_change()
+        merged = merged.dropna()
         
-        for sym in symbols:
-            mom = self._calculate_momentum(sym, target_date, period=60)
-            momentums.append(mom)
-        
-        if not momentums:
+        # Calculate rolling correlation
+        if len(merged) < 20:
             return 0.0
         
-        # Average momentum, normalized to ~[-1, 1]
-        avg_mom = np.mean(momentums)
-        return float(np.clip(avg_mom * 5, -1, 1))  # Scale to [-1, 1]
-    
-    def _volatility_signal(self, target_date: date) -> float:
-        """
-        Volatility signal: VIX level
-        High VIX = bearish (negative signal)
-        """
-        # Try VIX or VIXM
-        vix_symbols = ['VIX', 'VIXM']
+        corr = merged['spy_ret'].tail(20).corr(merged['iwm_ret'].tail(20))
         
-        current_vix = None
-        for sym in vix_symbols:
-            current_vix = self._get_price_at_date(sym, target_date)
-            if current_vix is not None:
-                break
-        
-        if current_vix is None:
-            return 0.0
-        
-        # VIX normalization:
-        # 10-15: Low vol (bullish) → +0.5
-        # 15-20: Normal → 0
-        # 20-30: Elevated (bearish) → -0.5
-        # 30+: High (very bearish) → -1.0
-        
-        if current_vix < 15:
-            return 0.5
-        elif current_vix < 20:
-            return 0.0
-        elif current_vix < 30:
-            return -0.5
+        # High correlation (>0.7) = bullish
+        # Low correlation (<0.3) = bearish
+        if corr > 0.7:
+            breadth_score = 1.0
+        elif corr < 0.3:
+            breadth_score = -1.0
         else:
-            return -1.0
+            # Linear interpolation
+            breadth_score = (corr - 0.3) / 0.4 * 2 - 1
+        
+        return np.clip(breadth_score, -1, 1)
     
-    def _credit_signal(self, target_date: date) -> float:
+    def calculate_regime(
+        self,
+        target_date: datetime,
+        regime_prices: Dict[str, pd.DataFrame]
+    ) -> Optional[Dict]:
         """
-        Credit signal: HYG/LQD spread
-        Widening spread = bearish (negative)
-        """
-        hyg_mom = self._calculate_momentum('HYG', target_date, period=60)
-        lqd_mom = self._calculate_momentum('LQD', target_date, period=60)
+        Calculate market regime for target_date.
         
-        spread = hyg_mom - lqd_mom
-        
-        # Positive spread (HYG outperforming) = bullish
-        return float(np.clip(spread * 10, -1, 1))
-    
-    def _safe_haven_signal(self, target_date: date) -> float:
+        Returns dict with:
+        - regime: str (7 states)
+        - score: float (composite)
+        - components: dict (individual scores)
         """
-        Safe haven signal: GLD, TLT
-        Strong safe haven = bearish equities (negative)
-        """
-        gld_mom = self._calculate_momentum('GLD', target_date, period=60)
-        tlt_mom = self._calculate_momentum('TLT', target_date, period=60)
-        
-        avg_mom = (gld_mom + tlt_mom) / 2
-        
-        # Strong safe haven momentum = bearish equities (inverted)
-        return float(np.clip(-avg_mom * 5, -1, 1))
-    
-    def _breadth_signal(self, target_date: date) -> float:
-        """
-        Breadth signal: Compare large cap (SPY) vs small cap (IWM)
-        Positive breadth: IWM outperforming (broad rally)
-        """
-        spy_mom = self._calculate_momentum('SPY', target_date, period=60)
-        iwm_mom = self._calculate_momentum('IWM', target_date, period=60)
-        
-        breadth = iwm_mom - spy_mom
-        return float(np.clip(breadth * 10, -1, 1))
+        try:
+            # Calculate all components
+            equity_score = self.calculate_equity_component(regime_prices, target_date)
+            vol_score = self.calculate_volatility_component(regime_prices, target_date)
+            credit_score = self.calculate_credit_component(regime_prices, target_date)
+            safe_haven_score = self.calculate_safe_haven_component(regime_prices, target_date)
+            breadth_score = self.calculate_breadth_component(regime_prices, target_date)
+            
+            # Calculate composite score
+            composite = (
+                equity_score * self.weights['equity'] +
+                vol_score * self.weights['volatility'] +
+                credit_score * self.weights['credit'] +
+                safe_haven_score * self.weights['safe_haven'] +
+                breadth_score * self.weights['breadth']
+            )
+            
+            # Map to regime
+            if composite >= 0.50:
+                regime = 'BULL_STRONG'
+            elif composite >= 0.25:
+                regime = 'BULL_WEAK'
+            elif composite >= 0.0:
+                regime = 'NEUTRAL_BULLISH'
+            elif composite >= -0.25:
+                regime = 'NEUTRAL_BEARISH'
+            elif composite >= -0.50:
+                regime = 'BEAR_WEAK'
+            elif composite >= -0.75:
+                regime = 'BEAR_STRONG'
+            else:
+                regime = 'CRISIS'
+            
+            return {
+                'date': target_date,
+                'regime': regime,
+                'composite_score': composite,
+                'components': {
+                    'equity': equity_score,
+                    'volatility': vol_score,
+                    'credit': credit_score,
+                    'safe_haven': safe_haven_score,
+                    'breadth': breadth_score,
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculating regime for {target_date}: {str(e)}")
+            return None
