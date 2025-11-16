@@ -1,0 +1,68 @@
+================================================================================
+BACKTEST PERFORMANCE SUMMARY - Optimized v3.3
+================================================================================
+
+PORTFOLIO PERFORMANCE:
+  Initial Value:       $100,000.00
+  Final Value:         $1,273,929.37
+  Total Return:        1173.93%
+  CAGR:                14.46%
+  Sharpe Ratio:        0.938
+  Sortino Ratio:       1.231
+  Calmar Ratio:        0.324
+  Max Drawdown:        -44.61%
+  Max DD Duration:     375 days
+  Volatility (Ann):    15.74%
+
+TRADE STATISTICS:
+  Total Trades:        732
+  Winning Trades:      265
+  Losing Trades:       467
+  Win Rate:            36.20%
+  Avg Win:             35.62%
+  Avg Loss:            -8.66%
+  Profit Factor:       1.822
+  Expectancy:          7.37%
+  Avg Hold Time:       54.7 days
+
+YEARLY PERFORMANCE:
+--------------------------------------------------------------------------------
+Year     Return %   Sharpe   Max DD %   Trades
+--------------------------------------------------------------------------------
+  2007       0.00%    0.000       0.00%        0
+  2008     -23.97%   -0.994     -38.10%       49
+  2009      51.73%    1.431     -25.18%       31
+  2010      37.79%    1.774     -12.89%       27
+  2011     -12.85%   -0.670     -20.79%       30
+  2012      31.86%    2.565      -5.71%        5
+  2013      48.07%    3.169      -4.01%       28
+  2014      19.24%    1.490      -8.13%       22
+  2015       4.94%    0.521      -7.03%       10
+  2016      19.57%    1.434      -6.00%       13
+  2017      26.84%    3.257      -2.75%       10
+  2018      -6.08%   -0.402     -16.93%       26
+  2019      32.31%    2.278      -6.82%       29
+  2020      13.85%    0.887     -17.07%       61
+  2021      19.72%    1.291      -7.40%       43
+  2022      -6.85%   -0.350     -11.17%       39
+  2023      22.43%    1.730      -8.44%       75
+  2024      18.07%    1.712      -6.17%      115
+  2025       0.18%    0.060     -11.65%      119
+
+Top 5 Sectors by Performance:
+--------------------------------------------------------------------------------
+  Financials                     Return: 233,430.89  Trades:   58  Win Rate:  46.55%
+  Consumer Discretionary         Return: 183,866.41  Trades:  117  Win Rate:  40.17%
+  Information Technology         Return: 179,825.48  Trades:  238  Win Rate:  32.35%
+  Materials                      Return: 158,730.04  Trades:   26  Win Rate:  42.31%
+  Technology                     Return: 153,828.26  Trades:   74  Win Rate:  39.19%
+
+================================================================================
+
+Optimizations Applied (v3.3 - 2025-11-15):
+  - Seasonality caching (50-100x speedup)
+  - Fixed progress bar (single line)
+  - Reduced logging (every 50 days)
+  - Fixed duplicate header detection
+  - KeyboardInterrupt handling
+================================================================================
